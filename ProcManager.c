@@ -1,9 +1,12 @@
-/*
+/* ============================================================================
+ * C Procedure Function Replacer - Replaces Functions with updated ones
+ *
  * Compile instructions (GCC / MinGW):
  * gcc -Os -s -mwindows -o ProcManager.exe ProcManager.c -lcomctl32 -lcomdlg32
  *
- * Release to Public domain
- */
+ * THIS WORK IS NOT FIT FOR ANY FUNCTION OR PURPOSE, COMES WITH NO WARRANTY,
+ * AND IS BEING RELEASED INTO THE PUBLIC DOMAIN.
+ * ============================================================================ */
 
 #include <windows.h>
 #include <commctrl.h>
@@ -47,6 +50,17 @@ int mruCount = 0;
 char* my_strdup(const char* s) {
     char* d = (char*)malloc(strlen(s) + 1);
     if (d) strcpy(d, s);
+    return d;
+}
+
+char* safe_strdup_newline(const char* s) {
+    int len = strlen(s);
+    int needsNewline = (len > 0 && s[len-1] != '\n');
+    char* d = (char*)malloc(len + (needsNewline ? 3 : 1));
+    if (d) {
+        strcpy(d, s);
+        if (needsNewline) strcat(d, "\r\n");
+    }
     return d;
 }
 
@@ -96,17 +110,53 @@ void ExtractMasmName(const char* line, char* procName) {
     }
 }
 
-int IsLikeCFunction(const char* line, char* procName) {
-    if (strstr(line, "if ") || strstr(line, "if(") || strstr(line, "for ") || strstr(line, "for(") ||
-        strstr(line, "while ") || strstr(line, "while(") || strstr(line, "switch ") ||
-        line[0] == '#' || strstr(line, "//") == line) {
+// Pre-processor strips comments/strings to avoid confusing the syntactical parsers
+void CleanLineForParsing(const char* line, char* cleanLine, int* globalInBlock) {
+    int i = 0, j = 0;
+    while (line[i]) {
+        if (*globalInBlock) {
+            if (line[i] == '*' && line[i+1] == '/') {
+                *globalInBlock = 0;
+                i += 2;
+            } else {
+                i++;
+            }
+        } else {
+            if (line[i] == '/' && line[i+1] == '*') {
+                *globalInBlock = 1;
+                i += 2;
+            } else if (line[i] == '/' && line[i+1] == '/') {
+                break; 
+            } else if (line[i] == '"' || line[i] == '\'') {
+                char q = line[i];
+                i++; 
+                while (line[i] && line[i] != q) {
+                    if (line[i] == '\\' && line[i+1]) i += 2;
+                    else i++;
+                }
+                if (line[i] == q) i++;
+            } else {
+                cleanLine[j++] = line[i++];
+            }
+        }
+    }
+    cleanLine[j] = '\0';
+}
+
+int IsLikeCFunction(const char* cleanLine, char* procName) {
+    const char* check = cleanLine;
+    while (*check == ' ' || *check == '\t') check++;
+    if (*check == '#' || *check == '\0') return 0;
+    
+    if (strstr(cleanLine, "if ") || strstr(cleanLine, "if(") || strstr(cleanLine, "for ") || strstr(cleanLine, "for(") ||
+        strstr(cleanLine, "while ") || strstr(cleanLine, "while(") || strstr(cleanLine, "switch ")) {
         
-        if (strstr(line, "=>") && strchr(line, '=')) {
-            const char* pEq = strchr(line, '=');
+        if (strstr(cleanLine, "=>") && strchr(cleanLine, '=')) {
+            const char* pEq = strchr(cleanLine, '=');
             const char* p = pEq - 1;
-            while (p >= line && (*p == ' ' || *p == '\t')) p--;
+            while (p >= cleanLine && (*p == ' ' || *p == '\t')) p--;
             const char* endW = p;
-            while (p >= line && ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9') || *p == '_')) p--;
+            while (p >= cleanLine && ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9') || *p == '_')) p--;
             p++;
             int len = endW - p + 1;
             if (len > 0 && len < 255) {
@@ -115,11 +165,11 @@ int IsLikeCFunction(const char* line, char* procName) {
                 return 1;
             }
         }
-        if (strstr(line, "=>") == NULL) return 0;
+        if (strstr(cleanLine, "=>") == NULL) return 0;
     }
 
-    if (strstr(line, "function ")) {
-        const char* pf = strstr(line, "function ") + 9;
+    if (strstr(cleanLine, "function ")) {
+        const char* pf = strstr(cleanLine, "function ") + 9;
         while (*pf == ' ' || *pf == '\t') pf++;
         const char* endW = pf;
         while ((*endW >= 'a' && *endW <= 'z') || (*endW >= 'A' && *endW <= 'Z') || (*endW >= '0' && *endW <= '9') || *endW == '_') endW++;
@@ -131,20 +181,20 @@ int IsLikeCFunction(const char* line, char* procName) {
         }
     }
 
-    int len_line = strlen(line);
+    int len_line = strlen(cleanLine);
     if (len_line == 0) return 0;
     
-    const char* end = line + len_line - 1;
-    while (end >= line && (*end == '\n' || *end == '\r' || *end == ' ' || *end == '\t')) end--;
-    if (end >= line && *end == ';') return 0;
+    const char* end = cleanLine + len_line - 1;
+    while (end >= cleanLine && (*end == '\n' || *end == '\r' || *end == ' ' || *end == '\t')) end--;
+    if (end >= cleanLine && *end == ';') return 0;
 
-    char* pOpen = strchr(line, '(');
-    char* pClose = strchr(line, ')');
+    char* pOpen = strchr(cleanLine, '(');
+    char* pClose = strchr(cleanLine, ')');
     if (pOpen && pClose && pOpen < pClose) {
         const char* p = pOpen - 1;
-        while (p >= line && (*p == ' ' || *p == '\t')) p--;
+        while (p >= cleanLine && (*p == ' ' || *p == '\t')) p--;
         const char* endWord = p;
-        while (p >= line && ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9') || *p == '_')) p--;
+        while (p >= cleanLine && ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9') || *p == '_')) p--;
         p++;
         int len = endWord - p + 1;
         if (len > 0 && len < 255) {
@@ -157,15 +207,20 @@ int IsLikeCFunction(const char* line, char* procName) {
     return 0;
 }
 
-void UpdateBraces(const char* line, int* count, int* seen) {
-    while (*line) {
-        if (*line == '{') {
+void UpdateBraces(const char* cleanLine, int* count, int* seen, int* seenSemicolon) {
+    int i = 0;
+    while (cleanLine[i]) {
+        if (cleanLine[i] == '{') {
             (*count)++;
             *seen = 1;
-        } else if (*line == '}') {
+        }
+        else if (cleanLine[i] == '}') {
             (*count)--;
         }
-        line++;
+        else if (cleanLine[i] == ';') {
+            if (seenSemicolon) *seenSemicolon = 1;
+        }
+        i++;
     }
 }
 
@@ -178,23 +233,28 @@ Chunk* ParseTextToChunks(const char* text) {
     int bufLen = 0;
 
     int state = 0; 
+    int globalInBlock = 0;
     char procName[256] = {0};
     const char* p = text;
-    char line[2048];
+    
+    char line[4096];
+    char cleanLine[4096];
     int lineLen = 0;
     int braceCount = 0;
     int seenBrace = 0;
 
     while (*p) {
         lineLen = 0;
-        while (*p && *p != '\n' && lineLen < 2047) {
+        while (*p && *p != '\n' && lineLen < 4094) {
             line[lineLen++] = *p++;
         }
         if (*p == '\n') line[lineLen++] = *p++;
         line[lineLen] = '\0';
 
+        CleanLineForParsing(line, cleanLine, &globalInBlock);
+
         if (state == 0) {
-            if (strstr(line, " PROC ") || (lineLen > 5 && strstr(line, " PROC\r") == line + lineLen - 6) || (lineLen > 4 && strstr(line, " PROC\n") == line + lineLen - 6)) {
+            if (strstr(cleanLine, " PROC ") || (lineLen > 5 && strstr(line, " PROC\r") == line + lineLen - 6) || (lineLen > 4 && strstr(line, " PROC\n") == line + lineLen - 6)) {
                 if (bufLen > 0) {
                     AddChunk(&head, &tail, 0, "", buf);
                     buf[0] = '\0'; bufLen = 0;
@@ -205,7 +265,7 @@ Chunk* ParseTextToChunks(const char* text) {
                 strcpy(buf + bufLen, line); 
                 bufLen += lineLen;
             } else {
-                if (IsLikeCFunction(line, procName)) {
+                if (IsLikeCFunction(cleanLine, procName)) {
                     if (bufLen > 0) {
                         AddChunk(&head, &tail, 0, "", buf);
                         buf[0] = '\0'; bufLen = 0;
@@ -217,8 +277,12 @@ Chunk* ParseTextToChunks(const char* text) {
                     strcpy(buf + bufLen, line); 
                     bufLen += lineLen;
                     
-                    UpdateBraces(line, &braceCount, &seenBrace);
-                    if (seenBrace && braceCount == 0) {
+                    int seenSemi = 0;
+                    UpdateBraces(cleanLine, &braceCount, &seenBrace, &seenSemi);
+                    
+                    if (seenBrace == 0 && seenSemi) {
+                        state = 0;
+                    } else if (seenBrace && braceCount <= 0) {
                         AddChunk(&head, &tail, 1, procName, buf);
                         buf[0] = '\0'; bufLen = 0;
                         state = 0;
@@ -243,8 +307,12 @@ Chunk* ParseTextToChunks(const char* text) {
             strcpy(buf + bufLen, line); 
             bufLen += lineLen;
             
-            UpdateBraces(line, &braceCount, &seenBrace);
-            if (seenBrace && braceCount <= 0) {
+            int seenSemi = 0;
+            UpdateBraces(cleanLine, &braceCount, &seenBrace, &seenSemi);
+            
+            if (seenBrace == 0 && seenSemi) {
+                state = 0;
+            } else if (seenBrace && braceCount <= 0) {
                 AddChunk(&head, &tail, 1, procName, buf);
                 buf[0] = '\0'; bufLen = 0;
                 state = 0;
@@ -368,7 +436,6 @@ void LoadFile(const char* path) {
         strcpy(fullPath, path);
     }
 
-    // Change current folder to the folder the source file is in
     char dirPath[MAX_PATH];
     strcpy(dirPath, fullPath);
     char* lastSlash = strrchr(dirPath, '\\');
@@ -399,8 +466,6 @@ void LoadFile(const char* path) {
     }
 }
 
-// --- STATE RELOAD FUNCTIONS ---
-
 void ReloadLeftList() {
     if (szCurrentFile[0] != '\0') {
         char* text = ReadFileText(szCurrentFile);
@@ -423,8 +488,6 @@ void ReloadRightList() {
     PopulateList(hListRight, g_RightChunks);
 }
 
-// ----------------------------------
-
 void OnBrowse() {
     ReloadRightList(); 
     OPENFILENAME ofn;
@@ -440,7 +503,6 @@ void OnBrowse() {
     }
 }
 
-// Returns 0 = Identical, 1 = Updated, 2 = Added
 int UpdateProcInLeft(Chunk* sourceChunk) {
     Chunk* l = g_LeftChunks;
     while (l) {
@@ -449,21 +511,18 @@ int UpdateProcInLeft(Chunk* sourceChunk) {
     }
 
     if (l) {
-        // Exists: Verify if it is actually different
         if (strcmp(l->text, sourceChunk->text) == 0) {
-            return 0; // Content is identical
+            return 0; 
         }
         
-        // Exists: Just update the text
         free(l->text);
-        l->text = my_strdup(sourceChunk->text);
+        l->text = safe_strdup_newline(sourceChunk->text);
         return 1;
     } else {
-        // Doesn't exist: Prepare the new chunk
         Chunk* nc = (Chunk*)malloc(sizeof(Chunk));
         nc->isProc = 1;
         strcpy(nc->name, sourceChunk->name);
-        nc->text = my_strdup(sourceChunk->text);
+        nc->text = safe_strdup_newline(sourceChunk->text);
         nc->next = NULL;
 
         Chunk* curr = g_LeftChunks;
@@ -471,12 +530,7 @@ int UpdateProcInLeft(Chunk* sourceChunk) {
         int inserted = 0;
 
         while (curr) {
-            if (curr->isProc && (
-                strcmp(curr->name, "main") == 0 ||
-                strcmp(curr->name, "WinMain") == 0 ||
-                strcmp(curr->name, "wmain") == 0 ||
-                strcmp(curr->name, "wWinMain") == 0
-            )) {
+            if (curr->isProc) {
                 nc->next = curr;
                 if (prev) {
                     prev->next = nc;
@@ -560,17 +614,15 @@ void OnUpdate() {
     }
     free(indices);
 
-    Chunk* oldRightChunks = g_RightChunks;
-    g_RightChunks = NULL;
-
     ReloadLeftList();
+    ReloadRightList();
     
     int addedCount = 0, updatedCount = 0;
     char addedNames[1024] = {0};
     char updatedNames[1024] = {0};
 
     for (int i = 0; i < count; i++) {
-        Chunk* r = oldRightChunks;
+        Chunk* r = g_RightChunks;
         while (r) {
             if (r->isProc && strcmp(r->name, selectedNames[i]) == 0) break;
             r = r->next;
@@ -588,9 +640,6 @@ void OnUpdate() {
         free(selectedNames[i]);
     }
     free(selectedNames);
-
-    FreeChunks(&oldRightChunks);
-    ReloadRightList();
 
     PopulateList(hListLeft, g_LeftChunks);
     
@@ -670,11 +719,9 @@ void OnCompile() {
         if (!p) p = strstr(line, "wcl386 ");
         
         if (p) {
-            // Strip ending comment tags if embedded in C block comments
             char* endComm = strstr(p, "*/");
             if (endComm) *endComm = '\0';
             
-            // Strip newline characters
             char* nl = strpbrk(p, "\r\n");
             if (nl) *nl = '\0';
             
@@ -691,7 +738,6 @@ void OnCompile() {
         SetStatus(msg);
         
         char sysCmd[1024];
-        // Runs via command line. || pause ensures that if it fails (non-zero return), it pauses to show errors
         sprintf(sysCmd, "cmd.exe /c \"%s || pause\"", cmd);
         system(sysCmd);
         
@@ -710,13 +756,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             InitCommonControlsEx(&icex);
 
             hComboMru    = CreateWindow("COMBOBOX", "", WS_CHILD | WS_VISIBLE | CBS_DROPDOWN | WS_VSCROLL, 0, 4, 220, 300, hwnd, (HMENU)IDC_MRUCOMBO, NULL, NULL);
-            hBtnBrowse   = CreateWindow("BUTTON", "Browse", WS_CHILD | WS_VISIBLE, 220, 0, 60, 30, hwnd, (HMENU)IDB_BROWSE, NULL, NULL);
-            hBtnPasteRep = CreateWindow("BUTTON", "Paste & Rep", WS_CHILD | WS_VISIBLE, 280, 0, 90, 30, hwnd, (HMENU)IDB_PASTEREPLACE, NULL, NULL);
-            hBtnPaste    = CreateWindow("BUTTON", "Paste", WS_CHILD | WS_VISIBLE, 370, 0, 50, 30, hwnd, (HMENU)IDB_PASTE, NULL, NULL);
-            hBtnUpdate   = CreateWindow("BUTTON", "Update", WS_CHILD | WS_VISIBLE, 420, 0, 60, 30, hwnd, (HMENU)IDB_UPDATE, NULL, NULL);
-            hBtnSave     = CreateWindow("BUTTON", "Save", WS_CHILD | WS_VISIBLE, 480, 0, 50, 30, hwnd, (HMENU)IDB_SAVE, NULL, NULL);
-            hBtnEdit     = CreateWindow("BUTTON", "Edit", WS_CHILD | WS_VISIBLE, 530, 0, 50, 30, hwnd, (HMENU)IDB_EDIT, NULL, NULL);
-            hBtnCompile  = CreateWindow("BUTTON", "Compile", WS_CHILD | WS_VISIBLE, 580, 0, 70, 30, hwnd, (HMENU)IDB_COMPILE, NULL, NULL);
+            hBtnBrowse   = CreateWindow("BUTTON", "Browse", WS_CHILD | WS_VISIBLE, 0, 0, 60, 30, hwnd, (HMENU)IDB_BROWSE, NULL, NULL);
+            hBtnPasteRep = CreateWindow("BUTTON", "Paste & Rep", WS_CHILD | WS_VISIBLE, 0, 0, 90, 30, hwnd, (HMENU)IDB_PASTEREPLACE, NULL, NULL);
+            hBtnPaste    = CreateWindow("BUTTON", "Paste", WS_CHILD | WS_VISIBLE, 0, 0, 50, 30, hwnd, (HMENU)IDB_PASTE, NULL, NULL);
+            hBtnUpdate   = CreateWindow("BUTTON", "Update", WS_CHILD | WS_VISIBLE, 0, 0, 60, 30, hwnd, (HMENU)IDB_UPDATE, NULL, NULL);
+            hBtnSave     = CreateWindow("BUTTON", "Save", WS_CHILD | WS_VISIBLE, 0, 0, 50, 30, hwnd, (HMENU)IDB_SAVE, NULL, NULL);
+            hBtnEdit     = CreateWindow("BUTTON", "Edit", WS_CHILD | WS_VISIBLE, 0, 0, 50, 30, hwnd, (HMENU)IDB_EDIT, NULL, NULL);
+            hBtnCompile  = CreateWindow("BUTTON", "Compile", WS_CHILD | WS_VISIBLE, 0, 0, 70, 30, hwnd, (HMENU)IDB_COMPILE, NULL, NULL);
 
             hListLeft  = CreateWindowEx(WS_EX_CLIENTEDGE, "LISTBOX", NULL, WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | LBS_NOTIFY, 0, 0, 0, 0, hwnd, (HMENU)IDL_LEFT, NULL, NULL);
             hListRight = CreateWindowEx(WS_EX_CLIENTEDGE, "LISTBOX", NULL, WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | LBS_EXTENDEDSEL, 0, 0, 0, 0, hwnd, (HMENU)IDL_RIGHT, NULL, NULL);
@@ -739,6 +785,19 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             int listY = 32;
             int listH = height - listY - statusHeight;
             int halfW = width / 2;
+
+            int rightX = width - 4;
+            rightX -= 70; MoveWindow(hBtnCompile, rightX, 0, 70, 30, TRUE);
+            rightX -= 50; MoveWindow(hBtnEdit, rightX, 0, 50, 30, TRUE);
+            rightX -= 50; MoveWindow(hBtnSave, rightX, 0, 50, 30, TRUE);
+            rightX -= 60; MoveWindow(hBtnUpdate, rightX, 0, 60, 30, TRUE);
+            rightX -= 50; MoveWindow(hBtnPaste, rightX, 0, 50, 30, TRUE);
+            rightX -= 90; MoveWindow(hBtnPasteRep, rightX, 0, 90, 30, TRUE);
+            rightX -= 60; MoveWindow(hBtnBrowse, rightX, 0, 60, 30, TRUE);
+
+            int comboWidth = rightX - 8;
+            if (comboWidth < 100) comboWidth = 100;
+            MoveWindow(hComboMru, 4, 4, comboWidth, 300, TRUE);
 
             MoveWindow(hListLeft, 0, listY, halfW, listH, TRUE);
             MoveWindow(hListRight, halfW, listY, width - halfW, listH, TRUE);
@@ -806,7 +865,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         LoadFile(mruList[0]);
     }
 
-    // Auto-load clipboard contents on startup
     ReloadRightList();
 
     MSG msg;
