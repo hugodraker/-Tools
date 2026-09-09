@@ -1,11 +1,11 @@
 /*
- * isomaster_win32.c - Complete ISO9660/RockRidge/Joliet Editor
+ * isomaster.c - Complete ISO9660/RockRidge/Joliet Editor
  * 
  * Recreated Linux ISO Master 2-pane interface for Win32
  * Fully Implemented Features: Save In-Place, Recursive Directory Add/Extract,
  * Drag & Drop Folders, Full ISO9660 & Joliet SVD Path Table Rebuilding.
  * 
- * Compile: gcc -mwindows -o isomaster.exe isomaster.c -lcomctl32 -lcomdlg32
+ * Compile: gcc -Os -s -mwindows -o isomaster.exe isomaster.c -lcomctl32 -lcomdlg32
  *
  * THIS WORK IS NOT FIT FOR ANY FUNCTION OR PURPOSE, COMES WITH NO WARRANTY,
  * AND IS BEING RELEASED INTO THE PUBLIC DOMAIN.
@@ -50,7 +50,7 @@ static void ListView_GetItemTextA_Compat(HWND hwnd, int i, int iSubItem, char* p
  * CONSTANTS
  * ============================================================ */
 #define APP_NAME        "ISO Master"
-#define APP_VERSION     "4.2 (Win32)"
+#define APP_VERSION     "3.2"
 #define WINDOW_WIDTH    800
 #define WINDOW_HEIGHT   600
 #define MAX_PATH_LEN    4096
@@ -64,6 +64,7 @@ static void ListView_GetItemTextA_Compat(HWND hwnd, int i, int iSubItem, char* p
 #define ID_ISO_ADD        2005
 #define ID_ISO_EXTRACT    2006
 #define ID_ISO_DELETE     2007
+#define ID_ISO_DELTEMP    2008
 #define IDC_CANCEL_BTN    2010
 
 #define IDM_IMAGE_NEW      3001
@@ -82,6 +83,14 @@ static void ListView_GetItemTextA_Compat(HWND hwnd, int i, int iSubItem, char* p
 #define IDM_SET_SCAN       3030
 #define IDM_SET_SYMLINK    3031
 #define IDM_HELP_ABOUT     3041
+
+#define IDM_MRU_1          3101
+#define IDM_MRU_2          3102
+#define IDM_MRU_3          3103
+#define IDM_MRU_4          3104
+#define IDM_MRU_5          3105
+#define IDM_MRU_SEP        3100
+#define IDM_MRU_SEP2       3106
 
 #define RR_ID_NM  "NM"  
 #define RR_ID_CL  "CL"  
@@ -160,6 +169,9 @@ typedef struct {
     DWORD           svd_sector;
     BYTE            svd_buffer[SECTOR_SIZE];
     
+    DWORD           boot_desc_sector;
+    BYTE            boot_desc_buffer[SECTOR_SIZE];
+    
     time_t          creation_date;
     char            system_identifier[32];
     BOOL            has_rockridge;
@@ -182,10 +194,131 @@ HINSTANCE g_hInstance = NULL;
 IsoImageState g_iso = {0};
 char g_current_local_path[MAX_PATH];
 DWORD g_current_iso_parent = 0; 
+char g_mru[5][MAX_PATH] = {0};
+
+char g_temp_files[256][MAX_PATH] = {0};
+int g_temp_files_count = 0;
 
 BOOL g_show_hidden = FALSE;
 BOOL g_sort_dirs_first = TRUE;
 volatile BOOL g_cancel_operation = FALSE;
+
+static void cmd_delete_selected(HWND hwnd);
+static void cmd_rename_local(HWND hwnd);
+static void cmd_rename_iso(HWND hwnd);
+static void iso_delete_entry(DWORD entry_idx);
+
+/* ============================================================
+ * UTILITY FUNCTIONS
+ * ============================================================ */
+static const char* get_basename(const char* path) {
+    const char* slash = strrchr(path, '/'); if (!slash) slash = strrchr(path, '\\'); return slash ? slash + 1 : path;
+}
+
+void UpdateWindowTitle() {
+    char title[MAX_PATH + 64];
+    if (g_iso.isOpen && strlen(g_iso.path) > 0) {
+        snprintf(title, sizeof(title), "ISO Master - %s - [%s]", APP_VERSION, get_basename(g_iso.path));
+    } else if (g_iso.isOpen) {
+        snprintf(title, sizeof(title), "ISO Master - %s - [New ISO]", APP_VERSION);
+    } else {
+        snprintf(title, sizeof(title), "ISO Master - %s", APP_VERSION);
+    }
+    SetWindowTextA(g_hMainWnd, title);
+}
+
+/* ============================================================
+ * SETTINGS & MRU MANAGEMENT
+ * ============================================================ */
+void SaveSettings() {
+    char iniPath[MAX_PATH];
+    GetModuleFileNameA(NULL, iniPath, MAX_PATH);
+    char* p = strrchr(iniPath, '\\');
+    if (p) strcpy(p + 1, "isomaster.ini");
+    else strcpy(iniPath, "isomaster.ini");
+    
+    WINDOWPLACEMENT wp = {0};
+    wp.length = sizeof(WINDOWPLACEMENT);
+    if (GetWindowPlacement(g_hMainWnd, &wp)) {
+        char buf[32];
+        snprintf(buf, 32, "%d", (int)wp.rcNormalPosition.left); WritePrivateProfileStringA("Window", "X", buf, iniPath);
+        snprintf(buf, 32, "%d", (int)wp.rcNormalPosition.top); WritePrivateProfileStringA("Window", "Y", buf, iniPath);
+        snprintf(buf, 32, "%d", (int)(wp.rcNormalPosition.right - wp.rcNormalPosition.left)); WritePrivateProfileStringA("Window", "Width", buf, iniPath);
+        snprintf(buf, 32, "%d", (int)(wp.rcNormalPosition.bottom - wp.rcNormalPosition.top)); WritePrivateProfileStringA("Window", "Height", buf, iniPath);
+    }
+    for (int i = 0; i < 5; i++) {
+        char key[16]; snprintf(key, 16, "MRU%d", i + 1);
+        WritePrivateProfileStringA("MRU", key, g_mru[i], iniPath);
+    }
+}
+
+void UpdateMRUMenu() {
+    HMENU hMenu = GetMenu(g_hMainWnd);
+    if (!hMenu) return; 
+    HMENU hFile = GetSubMenu(hMenu, 0);
+    
+    DeleteMenu(hFile, IDM_MRU_SEP, MF_BYCOMMAND);
+    for (int i = 0; i < 5; i++) DeleteMenu(hFile, IDM_MRU_1 + i, MF_BYCOMMAND);
+    DeleteMenu(hFile, IDM_MRU_SEP2, MF_BYCOMMAND);
+    
+    int count = 0;
+    for (int i = 0; i < 5; i++) if (strlen(g_mru[i]) > 0) count++;
+    
+    if (count > 0) {
+        InsertMenuA(hFile, IDM_IMAGE_QUIT, MF_BYCOMMAND | MF_SEPARATOR, IDM_MRU_SEP, NULL);
+        for (int i = 0; i < 5; i++) {
+            if (strlen(g_mru[i]) > 0) {
+                char text[MAX_PATH + 10];
+                snprintf(text, sizeof(text), "&%d %s", i + 1, g_mru[i]);
+                InsertMenuA(hFile, IDM_IMAGE_QUIT, MF_BYCOMMAND | MF_STRING, IDM_MRU_1 + i, text);
+            }
+        }
+    }
+    InsertMenuA(hFile, IDM_IMAGE_QUIT, MF_BYCOMMAND | MF_SEPARATOR, IDM_MRU_SEP2, NULL);
+    DrawMenuBar(g_hMainWnd);
+}
+
+void LoadSettings() {
+    char iniPath[MAX_PATH];
+    GetModuleFileNameA(NULL, iniPath, MAX_PATH);
+    char* p = strrchr(iniPath, '\\');
+    if (p) strcpy(p + 1, "isomaster.ini");
+    else strcpy(iniPath, "isomaster.ini");
+    
+    char buf[32];
+    int x = -9999, y = -9999, w = WINDOW_WIDTH, h = WINDOW_HEIGHT;
+    if (GetPrivateProfileStringA("Window", "X", "", buf, 32, iniPath) && strlen(buf) > 0) x = atoi(buf);
+    if (GetPrivateProfileStringA("Window", "Y", "", buf, 32, iniPath) && strlen(buf) > 0) y = atoi(buf);
+    if (GetPrivateProfileStringA("Window", "Width", "", buf, 32, iniPath) && strlen(buf) > 0) w = atoi(buf);
+    if (GetPrivateProfileStringA("Window", "Height", "", buf, 32, iniPath) && strlen(buf) > 0) h = atoi(buf);
+    
+    if (x != -9999 && y != -9999) {
+        SetWindowPos(g_hMainWnd, NULL, x, y, w, h, SWP_NOZORDER);
+    }
+    
+    for (int i = 0; i < 5; i++) {
+        char key[16]; snprintf(key, 16, "MRU%d", i + 1);
+        GetPrivateProfileStringA("MRU", key, "", g_mru[i], MAX_PATH, iniPath);
+    }
+    UpdateMRUMenu();
+}
+
+void UpdateMRU(const char* path) {
+    int existing = -1;
+    for (int i = 0; i < 5; i++) {
+        if (strcmp(g_mru[i], path) == 0) existing = i;
+    }
+    if (existing != -1) {
+        char temp[MAX_PATH]; strcpy(temp, g_mru[existing]);
+        for (int i = existing; i > 0; i--) strcpy(g_mru[i], g_mru[i-1]);
+        strcpy(g_mru[0], temp);
+    } else {
+        for (int i = 4; i > 0; i--) strcpy(g_mru[i], g_mru[i-1]);
+        strcpy(g_mru[0], path);
+    }
+    UpdateMRUMenu();
+    SaveSettings();
+}
 
 /* ============================================================
  * PROGRESS & MESSAGE PUMP
@@ -257,7 +390,7 @@ BOOL ShowInputBox(HWND parent, const char* title, const char* prompt, char* out_
 }
 
 /* ============================================================
- * UTILITY FUNCTIONS
+ * OTHER UTILITY FUNCTIONS
  * ============================================================ */
 static DWORD ReadLE32(const BYTE* buf) { return buf[0] | (buf[1] << 8) | (buf[2] << 16) | (buf[3] << 24); }
 static void WriteLE32(BYTE* buf, DWORD val) { buf[0] = val & 0xFF; buf[1] = (val >> 8) & 0xFF; buf[2] = (val >> 16) & 0xFF; buf[3] = (val >> 24) & 0xFF; }
@@ -267,9 +400,7 @@ static void ExtractString(const BYTE* src, char* dst, int max_len) {
     int i, j = 0;
     for (i = 0; i < max_len && src[i] != ' ' && src[i] != '\0'; i++) { if (src[i] >= 32 && src[i] < 127) dst[j++] = src[i]; } dst[j] = '\0';
 }
-static const char* get_basename(const char* path) {
-    const char* slash = strrchr(path, '/'); if (!slash) slash = strrchr(path, '\\'); return slash ? slash + 1 : path;
-}
+
 static void format_size(ULONGLONG bytes, char* buffer, int buf_size) {
     if (bytes >= 1073741824ULL) snprintf(buffer, buf_size, "%.2f GB", bytes / 1073741824.0);
     else if (bytes >= 1048576ULL) snprintf(buffer, buf_size, "%.2f MB", bytes / 1048576.0);
@@ -381,43 +512,56 @@ static void read_directory(DWORD sector, DWORD parent_idx, int depth) {
 static void iso_close_image(void) {
     if (g_iso.hFile && g_iso.hFile != INVALID_HANDLE_VALUE) { CloseHandle(g_iso.hFile); g_iso.hFile = INVALID_HANDLE_VALUE; }
     g_iso.isOpen = FALSE; g_iso.num_entries = 0; g_current_iso_parent = 0;
+    UpdateWindowTitle();
 }
 
 static int iso_open_image(const char* path) {
-    iso_close_image(); memset(&g_iso, 0, sizeof(g_iso));
-    g_iso.hFile = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (g_iso.hFile == INVALID_HANDLE_VALUE) return -1;
+    HANDLE hKeep = INVALID_HANDLE_VALUE;
+    if (g_iso.isOpen && strcmp(g_iso.path, path) == 0) hKeep = g_iso.hFile;
+    else iso_close_image();
+    
+    if (hKeep == INVALID_HANDLE_VALUE) {
+        memset(&g_iso, 0, sizeof(g_iso));
+        g_iso.hFile = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (g_iso.hFile == INVALID_HANDLE_VALUE) return -1;
+        strncpy(g_iso.path, path, MAX_PATH_LEN - 1);
+        g_iso.isOpen = TRUE;
+    } else {
+        memset(&g_iso.entries, 0, sizeof(g_iso.entries));
+        g_iso.num_entries = 0;
+        g_current_iso_parent = 0;
+        g_iso.boot_desc_sector = 0;
+        g_iso.svd_sector = 0;
+        g_iso.is_bootable = FALSE;
+    }
     
     LARGE_INTEGER fsize; GetFileSizeEx(g_iso.hFile, &fsize); g_iso.file_size = fsize.QuadPart;
     
     LARGE_INTEGER pos; pos.QuadPart = 16ULL * SECTOR_SIZE; SetFilePointerEx(g_iso.hFile, pos, NULL, FILE_BEGIN);
-    DWORD bytes_read; if (!ReadFile(g_iso.hFile, g_iso.pvd_buffer, SECTOR_SIZE, &bytes_read, NULL)) { CloseHandle(g_iso.hFile); return -2; }
+    DWORD bytes_read; if (!ReadFile(g_iso.hFile, g_iso.pvd_buffer, SECTOR_SIZE, &bytes_read, NULL)) { CloseHandle(g_iso.hFile); g_iso.hFile = INVALID_HANDLE_VALUE; return -2; }
     
     IsoPrimaryVolumeDesc* pvd = (IsoPrimaryVolumeDesc*)g_iso.pvd_buffer;
-    if (memcmp(pvd->identifier, "CD001", 5) != 0) { CloseHandle(g_iso.hFile); return -3; }
+    if (memcmp(pvd->identifier, "CD001", 5) != 0) { CloseHandle(g_iso.hFile); g_iso.hFile = INVALID_HANDLE_VALUE; return -3; }
     
     ExtractString(g_iso.pvd_buffer + 40, g_iso.volume_name, 32);
     DWORD root_extent = ReadLE32(g_iso.pvd_buffer + 156 + 2);
     DWORD root_size   = ReadLE32(g_iso.pvd_buffer + 156 + 10);
     
-    // Find SVD (Joliet)
+    // Find SVD (Joliet) and Boot Record (El Torito)
     g_iso.svd_sector = 0;
+    g_iso.boot_desc_sector = 0;
     for (DWORD s = 17; s < 32; s++) {
         pos.QuadPart = (LONGLONG)s * SECTOR_SIZE; SetFilePointerEx(g_iso.hFile, pos, NULL, FILE_BEGIN);
         BYTE desc[SECTOR_SIZE]; ReadFile(g_iso.hFile, desc, SECTOR_SIZE, &bytes_read, NULL);
         if (desc[0] == 2 && memcmp(desc+1, "CD001", 5) == 0) {
-            g_iso.svd_sector = s; memcpy(g_iso.svd_buffer, desc, SECTOR_SIZE); break;
-        } else if (desc[0] == 255) break;
-    }
-    
-    // Boot Record
-    pos.QuadPart = 17ULL * SECTOR_SIZE; SetFilePointerEx(g_iso.hFile, pos, NULL, FILE_BEGIN);
-    BYTE boot_sec[SECTOR_SIZE];
-    if (ReadFile(g_iso.hFile, boot_sec, SECTOR_SIZE, &bytes_read, NULL)) {
-        if (boot_sec[0] == 0 && memcmp(boot_sec+1, "CD001", 5) == 0 && memcmp(boot_sec+7, "EL TORITO SPECIFICATION", 23) == 0) {
-            g_iso.boot_catalog_sector = ReadLE32(boot_sec + 71);
+            g_iso.svd_sector = s; memcpy(g_iso.svd_buffer, desc, SECTOR_SIZE);
+        } else if (desc[0] == 0 && memcmp(desc+1, "CD001", 5) == 0 && memcmp(desc+7, "EL TORITO SPECIFICATION", 23) == 0) {
+            g_iso.boot_desc_sector = s;
+            memcpy(g_iso.boot_desc_buffer, desc, SECTOR_SIZE);
+            g_iso.boot_catalog_sector = ReadLE32(desc + 71);
             if (g_iso.boot_catalog_sector > 0) {
-                pos.QuadPart = (LONGLONG)g_iso.boot_catalog_sector * SECTOR_SIZE; SetFilePointerEx(g_iso.hFile, pos, NULL, FILE_BEGIN);
+                LARGE_INTEGER catPos; catPos.QuadPart = (LONGLONG)g_iso.boot_catalog_sector * SECTOR_SIZE; 
+                SetFilePointerEx(g_iso.hFile, catPos, NULL, FILE_BEGIN);
                 BYTE cat_sec[SECTOR_SIZE];
                 if (ReadFile(g_iso.hFile, cat_sec, SECTOR_SIZE, &bytes_read, NULL)) {
                     g_iso.boot_image_sector = ReadLE32(cat_sec + 32 + 8);
@@ -425,7 +569,7 @@ static int iso_open_image(const char* path) {
                     g_iso.is_bootable = TRUE;
                 }
             }
-        }
+        } else if (desc[0] == 255) break;
     }
     
     IsoEntry* root_entry = &g_iso.entries[0]; memset(root_entry, 0, sizeof(IsoEntry));
@@ -437,15 +581,19 @@ static int iso_open_image(const char* path) {
     g_iso.new_data_offset = g_iso.file_size;
     if (g_iso.new_data_offset % SECTOR_SIZE) g_iso.new_data_offset += SECTOR_SIZE - (g_iso.new_data_offset % SECTOR_SIZE);
     
-    strncpy(g_iso.path, path, MAX_PATH_LEN - 1); g_iso.isOpen = TRUE; g_current_iso_parent = 0; return 0;
+    UpdateWindowTitle();
+    return 0;
 }
 
 static void iso_new_image(void) {
     iso_close_image(); memset(&g_iso, 0, sizeof(g_iso));
     g_iso.isOpen = TRUE; strcpy(g_iso.volume_name, "NEW_VOLUME"); g_iso.file_size = SECTOR_SIZE * 20; 
+    g_iso.hFile = INVALID_HANDLE_VALUE; strcpy(g_iso.path, "");
     g_iso.entries[0].type = NODE_TYPE_DIRECTORY; g_iso.entries[0].is_directory = TRUE;
     strcpy(g_iso.entries[0].name, ""); strcpy(g_iso.entries[0].long_name, "Root");
-    g_iso.num_entries = 1; g_current_iso_parent = 0; populate_iso_listview();
+    g_iso.num_entries = 1; g_current_iso_parent = 0; 
+    UpdateWindowTitle();
+    populate_iso_listview();
 }
 
 /* ============================================================
@@ -617,12 +765,12 @@ static void write_path_tables(HANDLE hOut, BOOL is_joliet, DWORD* current_sector
 
 static int iso_save_image(const char* target_path) {
     if (!g_iso.isOpen) return -1;
-    HANDLE hOut; BOOL inplace = (strcmp(target_path, g_iso.path) == 0);
+    HANDLE hOut; BOOL inplace = (strcmp(target_path, g_iso.path) == 0 && g_iso.hFile != INVALID_HANDLE_VALUE);
     
     if (inplace) hOut = g_iso.hFile; 
     else {
-        CopyFileA(g_iso.path, target_path, FALSE);
-        hOut = CreateFileA(target_path, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (strlen(g_iso.path) > 0) CopyFileA(g_iso.path, target_path, FALSE);
+        hOut = CreateFileA(target_path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
         if (hOut == INVALID_HANDLE_VALUE) { MessageBoxA(g_hMainWnd, "Failed to open target file for writing.", "Error", MB_ICONERROR); return -1; }
     }
     
@@ -712,13 +860,31 @@ static int iso_save_image(const char* target_path) {
         WriteFile(hOut, g_iso.svd_buffer, SECTOR_SIZE, &bw, NULL); 
     }
     
+    // PRESERVE / HANDLE BOOT RECORD
+    if (g_iso.is_bootable && g_iso.boot_desc_sector != 0) {
+        LARGE_INTEGER bootPos; bootPos.QuadPart = (LONGLONG)g_iso.boot_desc_sector * SECTOR_SIZE;
+        SetFilePointerEx(hOut, bootPos, NULL, FILE_BEGIN);
+        WriteFile(hOut, g_iso.boot_desc_buffer, SECTOR_SIZE, &bw, NULL);
+    } else if (!g_iso.is_bootable && g_iso.boot_desc_sector != 0) {
+        LARGE_INTEGER bootPos; bootPos.QuadPart = (LONGLONG)g_iso.boot_desc_sector * SECTOR_SIZE;
+        SetFilePointerEx(hOut, bootPos, NULL, FILE_BEGIN);
+        BYTE zero[SECTOR_SIZE] = {0};
+        WriteFile(hOut, zero, SECTOR_SIZE, &bw, NULL);
+    }
+    
     if (current_sector > (DWORD)(fsize.QuadPart / SECTOR_SIZE)) {
         LARGE_INTEGER pos; pos.QuadPart = (LONGLONG)current_sector * SECTOR_SIZE;
         SetFilePointerEx(hOut, pos, NULL, FILE_BEGIN); SetEndOfFile(hOut);
     }
     
-    if (!inplace) CloseHandle(hOut);
-    ShowProgress(FALSE); SetWindowTextA(g_hStatusBar, "ISO saved successfully."); return 0;
+    if (!inplace) {
+        if (g_iso.hFile != INVALID_HANDLE_VALUE) CloseHandle(g_iso.hFile);
+        g_iso.hFile = hOut;
+        strcpy(g_iso.path, target_path);
+    }
+    ShowProgress(FALSE); SetWindowTextA(g_hStatusBar, "ISO saved successfully."); 
+    UpdateWindowTitle();
+    return 0;
 }
 
 /* ============================================================
@@ -774,8 +940,20 @@ static void iso_extract_local_directory(DWORD entry_idx, const char* dest_path, 
     }
 }
 
+static void check_overwrite_iso_entry(const char* name, DWORD parent_idx) {
+    for (DWORD i = 1; i < g_iso.num_entries; i++) {
+        if (g_iso.entries[i].parent_index == parent_idx && !g_iso.entries[i].marked_deleted) {
+            if (lstrcmpiA(g_iso.entries[i].name, name) == 0 || lstrcmpiA(g_iso.entries[i].long_name, name) == 0) {
+                iso_delete_entry(i);
+            }
+        }
+    }
+}
+
 static int iso_add_directory(const char* dest_name, DWORD parent_idx) {
     if (!g_iso.isOpen || g_iso.num_entries >= MAX_ENTRIES) return -1;
+    check_overwrite_iso_entry(dest_name, parent_idx);
+    
     IsoEntry* entry = &g_iso.entries[g_iso.num_entries]; memset(entry, 0, sizeof(IsoEntry));
     entry->type = NODE_TYPE_DIRECTORY; entry->is_directory = TRUE; entry->size = 0;
     entry->marked_new = TRUE; entry->parent_index = parent_idx; entry->timestamp = time(NULL);
@@ -790,6 +968,8 @@ static int iso_add_file(const char* source_file, const char* dest_name, DWORD pa
     ULONGLONG file_size = 0; BY_HANDLE_FILE_INFORMATION fi;
     if (GetFileInformationByHandle(hSrc, &fi)) file_size = ((ULONGLONG)fi.nFileSizeHigh << 32) | fi.nFileSizeLow;
     CloseHandle(hSrc);
+    
+    check_overwrite_iso_entry(get_basename(dest_name), parent_idx);
     
     IsoEntry* entry = &g_iso.entries[g_iso.num_entries]; memset(entry, 0, sizeof(IsoEntry));
     entry->type = NODE_TYPE_FILE; entry->is_directory = FALSE; entry->size = file_size;
@@ -928,7 +1108,7 @@ static void cmd_extract_selected(HWND hwnd) {
     } else {
         OPENFILENAMEA sf = {0}; sf.lStructSize = sizeof(sf); sf.hwndOwner = hwnd; 
         strcpy(dest_path, g_iso.entries[idx].long_name); sf.lpstrFile = dest_path; sf.nMaxFile = MAX_PATH;
-        sf.Flags = OFN_OVERWRITEPROMPT; sf.lpstrFilter = "All Files\0*.*\0";
+        sf.Flags = 0; sf.lpstrFilter = "All Files\0*.*\0";
         if (GetSaveFileNameA(&sf)) {
             int res = iso_extract_file(idx, dest_path, &copied_bytes, total_bytes);
             ShowProgress(FALSE);
@@ -946,6 +1126,43 @@ static void cmd_delete_selected(HWND hwnd) {
     if (idx != 0xFFFFFFFF && MessageBoxA(hwnd, "Delete selected item from ISO?", "Confirm", MB_YESNO) == IDYES) { iso_delete_entry(idx); populate_iso_listview(); }
 }
 
+static void cmd_rename_local(HWND hwnd) {
+    int sel = SendMessageA(g_hLocalListView, LVM_GETNEXTITEM, -1, LVNI_SELECTED);
+    if (sel == -1) return;
+    char old_name[MAX_PATH]; ListView_GetItemTextA_Compat(g_hLocalListView, sel, 0, old_name, MAX_PATH);
+    if (strcmp(old_name, "..") == 0) return;
+    
+    char new_name[MAX_PATH];
+    if (ShowInputBox(hwnd, "Rename Local File", "Enter new name:", new_name)) {
+        char old_path[MAX_PATH], new_path[MAX_PATH];
+        if (g_current_local_path[strlen(g_current_local_path)-1] == '\\') {
+            snprintf(old_path, MAX_PATH, "%s%s", g_current_local_path, old_name);
+            snprintf(new_path, MAX_PATH, "%s%s", g_current_local_path, new_name);
+        } else {
+            snprintf(old_path, MAX_PATH, "%s\\%s", g_current_local_path, old_name);
+            snprintf(new_path, MAX_PATH, "%s\\%s", g_current_local_path, new_name);
+        }
+        if (MoveFileA(old_path, new_path)) set_local_path(g_current_local_path);
+        else MessageBoxA(hwnd, "Failed to rename file.", "Error", MB_ICONERROR);
+    }
+}
+
+static void cmd_rename_iso(HWND hwnd) {
+    if (!g_iso.isOpen) return;
+    int sel = SendMessageA(g_hIsoListView, LVM_GETNEXTITEM, -1, LVNI_SELECTED);
+    if (sel == -1) return;
+    LVITEMA lvi = {0}; lvi.iItem = sel; lvi.mask = LVIF_PARAM; SendMessageA(g_hIsoListView, LVM_GETITEMA, 0, (LPARAM)&lvi);
+    DWORD idx = (DWORD)lvi.lParam;
+    if (idx == 0xFFFFFFFF) return;
+    
+    char new_name[MAX_PATH];
+    if (ShowInputBox(hwnd, "Rename ISO Item", "Enter new name:", new_name)) {
+        strncpy(g_iso.entries[idx].name, new_name, 255);
+        strncpy(g_iso.entries[idx].long_name, new_name, 255);
+        populate_iso_listview();
+    }
+}
+
 /* ============================================================
  * WINDOW PROCEDURES
  * ============================================================ */
@@ -960,16 +1177,17 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         case WM_CREATE: {
             DragAcceptFiles(hwnd, TRUE);
             HMENU hMenu = CreateMenu(), hFile = CreatePopupMenu();
-            AppendMenuA(hFile, MF_STRING, IDM_IMAGE_NEW, "&New"); AppendMenuA(hFile, MF_STRING, IDM_IMAGE_OPEN, "&Open..."); AppendMenuA(hFile, MF_STRING, IDM_IMAGE_SAVE, "&Save\tCtrl+S"); AppendMenuA(hFile, MF_STRING, IDM_IMAGE_SAVEAS, "&Save As..."); AppendMenuA(hFile, MF_STRING, IDM_IMAGE_PROPS, "&Properties"); AppendMenuA(hFile, MF_SEPARATOR, 0, NULL); AppendMenuA(hFile, MF_STRING, IDM_IMAGE_QUIT, "&Quit"); AppendMenuA(hMenu, MF_POPUP, (UINT_PTR)hFile, "&Image");
-            HMENU hView = CreatePopupMenu(); AppendMenuA(hView, MF_STRING, IDM_VIEW_REFRESH, "&Refresh"); AppendMenuA(hView, MF_STRING, IDM_VIEW_HIDDEN, "&Hidden files"); AppendMenuA(hView, MF_STRING | MF_CHECKED, IDM_VIEW_SORTDIR, "&Sort directories first"); AppendMenuA(hMenu, MF_POPUP, (UINT_PTR)hView, "&View");
+            AppendMenuA(hFile, MF_STRING, IDM_IMAGE_NEW, "&New"); AppendMenuA(hFile, MF_STRING, IDM_IMAGE_OPEN, "&Open..."); AppendMenuA(hFile, MF_STRING, IDM_IMAGE_SAVE, "&Save\tCtrl+S"); AppendMenuA(hFile, MF_STRING, IDM_IMAGE_SAVEAS, "&Save As..."); AppendMenuA(hFile, MF_STRING, IDM_IMAGE_PROPS, "&Properties"); AppendMenuA(hFile, MF_STRING, IDM_IMAGE_QUIT, "&Quit"); AppendMenuA(hMenu, MF_POPUP, (UINT_PTR)hFile, "&Image");
+            HMENU hView = CreatePopupMenu(); AppendMenuA(hView, MF_STRING, IDM_VIEW_REFRESH, "&Refresh\tF5"); AppendMenuA(hView, MF_STRING, IDM_VIEW_HIDDEN, "&Hidden files"); AppendMenuA(hView, MF_STRING | MF_CHECKED, IDM_VIEW_SORTDIR, "&Sort directories first"); AppendMenuA(hMenu, MF_POPUP, (UINT_PTR)hView, "&View");
             HMENU hBoot = CreatePopupMenu(); AppendMenuA(hBoot, MF_STRING, IDM_BOOT_PROPS, "&Properties"); AppendMenuA(hBoot, MF_STRING, IDM_BOOT_SAVE, "&Save to drive"); AppendMenuA(hBoot, MF_STRING, IDM_BOOT_DEL, "&Delete"); AppendMenuA(hMenu, MF_POPUP, (UINT_PTR)hBoot, "&BootRecord");
             HMENU hHelp = CreatePopupMenu(); AppendMenuA(hHelp, MF_STRING, IDM_HELP_ABOUT, "&About"); AppendMenuA(hMenu, MF_POPUP, (UINT_PTR)hHelp, "&Help");
             SetMenu(hwnd, hMenu); INITCOMMONCONTROLSEX icc = {sizeof(icc), ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES | ICC_PROGRESS_CLASS}; InitCommonControlsEx(&icc);
             
             g_hLocalToolBar = CreateWindowExA(0, TOOLBARCLASSNAMEA, NULL, WS_CHILD | WS_VISIBLE | TBSTYLE_FLAT | TBSTYLE_LIST | CCS_NODIVIDER | CCS_NORESIZE, 0, 0, 0, 0, hwnd, (HMENU)100, g_hInstance, NULL); SendMessage(g_hLocalToolBar, TB_BUTTONSTRUCTSIZE, (WPARAM)sizeof(TBBUTTON), 0); char locBtnStrings[] = "Go Back\0New Directory\0"; LRESULT idxLoc = SendMessage(g_hLocalToolBar, TB_ADDSTRINGA, 0, (LPARAM)locBtnStrings);
             TBBUTTON tbbLoc[2] = { {I_IMAGENONE, ID_LOCAL_BACK, TBSTATE_ENABLED, BTNS_BUTTON|BTNS_SHOWTEXT|BTNS_AUTOSIZE, {0},0,idxLoc}, {I_IMAGENONE, ID_LOCAL_NEWDIR, TBSTATE_ENABLED, BTNS_BUTTON|BTNS_SHOWTEXT|BTNS_AUTOSIZE, {0},0,idxLoc+1} }; SendMessage(g_hLocalToolBar, TB_ADDBUTTONS, 2, (LPARAM)&tbbLoc);
-            g_hIsoToolBar = CreateWindowExA(0, TOOLBARCLASSNAMEA, NULL, WS_CHILD | WS_VISIBLE | TBSTYLE_FLAT | TBSTYLE_LIST | CCS_NODIVIDER | CCS_NORESIZE, 0, 0, 0, 0, hwnd, (HMENU)101, g_hInstance, NULL); SendMessage(g_hIsoToolBar, TB_BUTTONSTRUCTSIZE, (WPARAM)sizeof(TBBUTTON), 0); char isoBtnStrings[] = "Go Back\0New Directory\0Add to ISO\0Extract from ISO\0Delete\0"; LRESULT idxIso = SendMessage(g_hIsoToolBar, TB_ADDSTRINGA, 0, (LPARAM)isoBtnStrings);
-            TBBUTTON tbbIso[5] = { {I_IMAGENONE, ID_ISO_BACK, TBSTATE_ENABLED, BTNS_BUTTON|BTNS_SHOWTEXT|BTNS_AUTOSIZE, {0},0,idxIso}, {I_IMAGENONE, ID_ISO_NEWDIR, TBSTATE_ENABLED, BTNS_BUTTON|BTNS_SHOWTEXT|BTNS_AUTOSIZE, {0},0,idxIso+1}, {I_IMAGENONE, ID_ISO_ADD, TBSTATE_ENABLED, BTNS_BUTTON|BTNS_SHOWTEXT|BTNS_AUTOSIZE, {0},0,idxIso+2}, {I_IMAGENONE, ID_ISO_EXTRACT, TBSTATE_ENABLED, BTNS_BUTTON|BTNS_SHOWTEXT|BTNS_AUTOSIZE, {0},0,idxIso+3}, {I_IMAGENONE, ID_ISO_DELETE, TBSTATE_ENABLED, BTNS_BUTTON|BTNS_SHOWTEXT|BTNS_AUTOSIZE, {0},0,idxIso+4} }; SendMessage(g_hIsoToolBar, TB_ADDBUTTONS, 5, (LPARAM)&tbbIso);
+            
+            g_hIsoToolBar = CreateWindowExA(0, TOOLBARCLASSNAMEA, NULL, WS_CHILD | WS_VISIBLE | TBSTYLE_FLAT | TBSTYLE_LIST | CCS_NODIVIDER | CCS_NORESIZE, 0, 0, 0, 0, hwnd, (HMENU)101, g_hInstance, NULL); SendMessage(g_hIsoToolBar, TB_BUTTONSTRUCTSIZE, (WPARAM)sizeof(TBBUTTON), 0); char isoBtnStrings[] = "Save ISO\0Go Back\0New Directory\0Add to ISO\0Extract from ISO\0Delete\0Delete Temp\0"; LRESULT idxIso = SendMessage(g_hIsoToolBar, TB_ADDSTRINGA, 0, (LPARAM)isoBtnStrings);
+            TBBUTTON tbbIso[7] = { {I_IMAGENONE, IDM_IMAGE_SAVE, TBSTATE_ENABLED, BTNS_BUTTON|BTNS_SHOWTEXT|BTNS_AUTOSIZE, {0},0,idxIso}, {I_IMAGENONE, ID_ISO_BACK, TBSTATE_ENABLED, BTNS_BUTTON|BTNS_SHOWTEXT|BTNS_AUTOSIZE, {0},0,idxIso+1}, {I_IMAGENONE, ID_ISO_NEWDIR, TBSTATE_ENABLED, BTNS_BUTTON|BTNS_SHOWTEXT|BTNS_AUTOSIZE, {0},0,idxIso+2}, {I_IMAGENONE, ID_ISO_ADD, TBSTATE_ENABLED, BTNS_BUTTON|BTNS_SHOWTEXT|BTNS_AUTOSIZE, {0},0,idxIso+3}, {I_IMAGENONE, ID_ISO_EXTRACT, TBSTATE_ENABLED, BTNS_BUTTON|BTNS_SHOWTEXT|BTNS_AUTOSIZE, {0},0,idxIso+4}, {I_IMAGENONE, ID_ISO_DELETE, TBSTATE_ENABLED, BTNS_BUTTON|BTNS_SHOWTEXT|BTNS_AUTOSIZE, {0},0,idxIso+5}, {I_IMAGENONE, ID_ISO_DELTEMP, TBSTATE_ENABLED, BTNS_BUTTON|BTNS_SHOWTEXT|BTNS_AUTOSIZE, {0},0,idxIso+6} }; SendMessage(g_hIsoToolBar, TB_ADDBUTTONS, 7, (LPARAM)&tbbIso);
 
             g_hLocalListView = CreateWindowExA(WS_EX_CLIENTEDGE, WC_LISTVIEWA, "", WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SHOWSELALWAYS | LVS_SINGLESEL, 0, 0, 0, 0, hwnd, NULL, g_hInstance, NULL); g_hIsoListView = CreateWindowExA(WS_EX_CLIENTEDGE, WC_LISTVIEWA, "", WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SHOWSELALWAYS | LVS_SINGLESEL, 0, 0, 0, 0, hwnd, NULL, g_hInstance, NULL);
             init_listview_columns(g_hLocalListView); init_listview_columns(g_hIsoListView); g_hStatusBar = CreateWindowExA(0, STATUSCLASSNAMEA, "Ready", WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP, 0, 0, 0, 0, hwnd, NULL, g_hInstance, NULL);
@@ -982,40 +1200,53 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         case WM_DROPFILES: {
             HDROP hDrop = (HDROP)wParam;
             if (!g_iso.isOpen) { MessageBoxA(hwnd, "Open or create an ISO first before dropping files.", "Warning", MB_ICONWARNING); DragFinish(hDrop); return 0; }
-            POINT pt; DragQueryPoint(hDrop, &pt); RECT rcClient; GetClientRect(hwnd, &rcClient);
-            if (pt.x > (rcClient.right / 2)) {
-                UINT count = DragQueryFileA(hDrop, 0xFFFFFFFF, NULL, 0); 
-                
-                int total_files = 0;
-                for (UINT i = 0; i < count; i++) {
-                    char filepath[MAX_PATH]; DragQueryFileA(hDrop, i, filepath, MAX_PATH);
-                    if (GetFileAttributesA(filepath) & FILE_ATTRIBUTE_DIRECTORY) {
-                        total_files++; count_files_local(filepath, &total_files);
-                    } else total_files++;
-                }
+            
+            UINT count = DragQueryFileA(hDrop, 0xFFFFFFFF, NULL, 0); 
+            int total_files = 0;
+            for (UINT i = 0; i < count; i++) {
+                char filepath[MAX_PATH]; DragQueryFileA(hDrop, i, filepath, MAX_PATH);
+                DWORD attr = GetFileAttributesA(filepath);
+                if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY)) {
+                    total_files++; count_files_local(filepath, &total_files);
+                } else total_files++;
+            }
 
-                ShowProgress(TRUE); SetWindowTextA(g_hStatusBar, "Adding files...");
-                int processed = 0, added = 0; 
-                for (UINT i = 0; i < count; i++) {
-                    if (g_cancel_operation) break;
-                    char filepath[MAX_PATH]; DragQueryFileA(hDrop, i, filepath, MAX_PATH);
-                    if (GetFileAttributesA(filepath) & FILE_ATTRIBUTE_DIRECTORY) { 
-                        if (iso_add_local_directory(filepath, get_basename(filepath), g_current_iso_parent, 0, &processed, total_files) >= 0) added++; 
-                    } else { 
-                        if (iso_add_file(filepath, get_basename(filepath), g_current_iso_parent) >= 0) added++; 
-                        processed++; UpdateProgress((processed * 100) / total_files);
-                    }
+            ShowProgress(TRUE); SetWindowTextA(g_hStatusBar, "Adding files...");
+            int processed = 0, added = 0; 
+            for (UINT i = 0; i < count; i++) {
+                if (g_cancel_operation) break;
+                char filepath[MAX_PATH]; DragQueryFileA(hDrop, i, filepath, MAX_PATH);
+                DWORD attr = GetFileAttributesA(filepath);
+                if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY)) { 
+                    if (iso_add_local_directory(filepath, get_basename(filepath), g_current_iso_parent, 0, &processed, total_files) >= 0) added++; 
+                } else { 
+                    if (iso_add_file(filepath, get_basename(filepath), g_current_iso_parent) >= 0) added++; 
+                    processed++; UpdateProgress((processed * 100) / total_files);
                 }
-                ShowProgress(FALSE);
-                if (added > 0 || processed > 0) { 
-                    populate_iso_listview(); 
-                    if (g_cancel_operation) SetWindowTextA(g_hStatusBar, "Operation cancelled. Partial files queued.");
-                    else { char msg[256]; snprintf(msg, sizeof(msg), "%d item(s) dropped and queued for addition.", added); SetWindowTextA(g_hStatusBar, msg); }
-                }
+            }
+            ShowProgress(FALSE);
+            if (added > 0 || processed > 0) { 
+                populate_iso_listview(); 
+                if (g_cancel_operation) SetWindowTextA(g_hStatusBar, "Operation cancelled. Partial files queued.");
+                else { char msg[256]; snprintf(msg, sizeof(msg), "%d item(s) dropped and queued for addition.", added); SetWindowTextA(g_hStatusBar, msg); }
             }
             DragFinish(hDrop); return 0;
         }
         case WM_COMMAND: {
+            if (LOWORD(wParam) >= IDM_MRU_1 && LOWORD(wParam) <= IDM_MRU_5) {
+                int idx = LOWORD(wParam) - IDM_MRU_1;
+                if (strlen(g_mru[idx]) > 0) {
+                    int res = iso_open_image(g_mru[idx]);
+                    if (res == 0) { 
+                        UpdateMRU(g_mru[idx]);
+                        populate_iso_listview(); 
+                        char status[512]; snprintf(status, sizeof(status), "Opened: %s", g_mru[idx]); 
+                        SetWindowTextA(g_hStatusBar, status); 
+                    } else MessageBoxA(hwnd, "Failed to open file.", "Error", MB_ICONERROR);
+                }
+                return 0;
+            }
+
             switch (LOWORD(wParam)) {
                 case IDC_CANCEL_BTN: g_cancel_operation = TRUE; break;
                 
@@ -1026,16 +1257,35 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                     OPENFILENAMEA ofn = {0}; char szFile[MAX_PATH] = ""; ofn.lStructSize = sizeof(ofn); ofn.hwndOwner = hwnd; ofn.lpstrFile = szFile; ofn.nMaxFile = MAX_PATH; ofn.lpstrFilter = "ISO Files (*.iso)\0*.iso\0All Files\0*.*\0"; 
                     if (GetOpenFileNameA(&ofn)) {
                         int res = iso_open_image(szFile);
-                        if (res == 0) { populate_iso_listview(); char status[512]; snprintf(status, sizeof(status), "Opened: %s", szFile); SetWindowTextA(g_hStatusBar, status); } 
+                        if (res == 0) { 
+                            UpdateMRU(szFile);
+                            populate_iso_listview(); 
+                            char status[512]; snprintf(status, sizeof(status), "Opened: %s", szFile); 
+                            SetWindowTextA(g_hStatusBar, status); 
+                        } 
                         else if (res == -3) { MessageBoxA(hwnd, "The selected file is corrupt or not a valid ISO9660 image.", "Invalid ISO", MB_ICONERROR); }
                         else { MessageBoxA(hwnd, "Failed to read the selected file.", "Error", MB_ICONERROR); }
                     } 
                     break; 
                 }
-                case IDM_IMAGE_SAVE: if (g_iso.isOpen) { iso_save_image(g_iso.path); iso_open_image(g_iso.path); populate_iso_listview(); } break;
+                case IDM_IMAGE_SAVE: 
+                    if (g_iso.isOpen) { 
+                        if (strlen(g_iso.path) == 0) { SendMessage(hwnd, WM_COMMAND, IDM_IMAGE_SAVEAS, 0); } 
+                        else { 
+                            iso_save_image(g_iso.path); 
+                            iso_open_image(g_iso.path); 
+                            populate_iso_listview(); 
+                        }
+                    } 
+                    break;
                 case IDM_IMAGE_SAVEAS: {
                     if (!g_iso.isOpen) break; OPENFILENAMEA ofn = {0}; char szFile[MAX_PATH] = ""; strcpy(szFile, get_basename(g_iso.path)); ofn.lStructSize = sizeof(ofn); ofn.hwndOwner = hwnd; ofn.lpstrFile = szFile; ofn.nMaxFile = MAX_PATH; ofn.lpstrFilter = "ISO Files (*.iso)\0*.iso\0All Files\0*.*\0"; ofn.Flags = OFN_OVERWRITEPROMPT;
-                    if (GetSaveFileNameA(&ofn)) { iso_save_image(szFile); iso_open_image(szFile); populate_iso_listview(); } break;
+                    if (GetSaveFileNameA(&ofn)) { 
+                        iso_save_image(szFile); 
+                        iso_open_image(szFile); 
+                        UpdateMRU(szFile);
+                        populate_iso_listview(); 
+                    } break;
                 }
                 case IDM_IMAGE_PROPS: { if (!g_iso.isOpen) break; char props[1024]; snprintf(props, sizeof(props), "Volume Name: %s\nSize: %llu bytes\nEntries: %lu\nRockRidge: %s\nJoliet: %s\nBootable: %s", g_iso.volume_name, g_iso.file_size, g_iso.num_entries, g_iso.has_rockridge ? "Yes" : "No", g_iso.has_joliet ? "Yes" : "No", g_iso.is_bootable ? "Yes (El Torito)" : "No"); MessageBoxA(hwnd, props, "Image Properties", MB_ICONINFORMATION); break; }
                 case IDM_IMAGE_QUIT: PostQuitMessage(0); break;
@@ -1046,11 +1296,25 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 }
                 case IDM_BOOT_SAVE: {
                     if (!g_iso.is_bootable) { MessageBoxA(hwnd, "No boot record to save.", "Warning", MB_ICONWARNING); break; }
-                    char dest[MAX_PATH] = "boot_image.img"; OPENFILENAMEA sf = {0}; sf.lStructSize = sizeof(sf); sf.hwndOwner = hwnd; sf.lpstrFile = dest; sf.nMaxFile = MAX_PATH; sf.Flags = OFN_OVERWRITEPROMPT; sf.lpstrFilter = "Image Files\0*.img\0All Files\0*.*\0";
+                    char dest[MAX_PATH] = "boot_image.img"; OPENFILENAMEA sf = {0}; sf.lStructSize = sizeof(sf); sf.hwndOwner = hwnd; sf.lpstrFile = dest; sf.nMaxFile = MAX_PATH; sf.Flags = 0; sf.lpstrFilter = "Image Files\0*.img\0All Files\0*.*\0";
                     if (GetSaveFileNameA(&sf)) {
                         HANDLE hDst = CreateFileA(dest, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
                         if (hDst != INVALID_HANDLE_VALUE) { LARGE_INTEGER pos; pos.QuadPart = (LONGLONG)g_iso.boot_image_sector * SECTOR_SIZE; SetFilePointerEx(g_iso.hFile, pos, NULL, FILE_BEGIN); BYTE* buf = (BYTE*)malloc(g_iso.boot_image_size * 512); DWORD bw; if (ReadFile(g_iso.hFile, buf, g_iso.boot_image_size * 512, &bw, NULL)) WriteFile(hDst, buf, bw, &bw, NULL); free(buf); CloseHandle(hDst); SetWindowTextA(g_hStatusBar, "Boot image extracted."); } else MessageBoxA(hwnd, "Failed to create destination file.", "Error", MB_ICONERROR);
                     } break;
+                }
+                case ID_ISO_DELTEMP: {
+                    int del_count = 0;
+                    for (int i = 0; i < g_temp_files_count; i++) {
+                        if (DeleteFileA(g_temp_files[i])) del_count++;
+                    }
+                    char tmpDir[MAX_PATH]; GetTempPathA(MAX_PATH, tmpDir);
+                    strcat(tmpDir, "isomaster_temp\\");
+                    RemoveDirectoryA(tmpDir);
+                    
+                    char msg[128]; snprintf(msg, sizeof(msg), "Deleted %d temporary files.", del_count);
+                    SetWindowTextA(g_hStatusBar, msg);
+                    g_temp_files_count = 0;
+                    break;
                 }
                 case IDM_BOOT_DEL: if (g_iso.is_bootable) { g_iso.is_bootable = FALSE; SetWindowTextA(g_hStatusBar, "Boot record marked for deletion on save."); } break;
                 case IDM_HELP_ABOUT: MessageBoxA(hwnd, "ISO Master Win32 - 2-Pane Editor", "About", MB_ICONINFORMATION); break;
@@ -1082,19 +1346,78 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                     int sel = SendMessageA(g_hIsoListView, LVM_GETNEXTITEM, -1, LVNI_SELECTED);
                     if (sel != -1) {
                         LVITEMA lvi = {0}; lvi.iItem = sel; lvi.mask = LVIF_PARAM; SendMessageA(g_hIsoListView, LVM_GETITEMA, 0, (LPARAM)&lvi);
-                        DWORD idx = (DWORD)lvi.lParam; if (idx == 0xFFFFFFFF) cmd_iso_back(); else if (g_iso.entries[idx].is_directory) { g_current_iso_parent = idx; populate_iso_listview(); }
+                        DWORD idx = (DWORD)lvi.lParam; 
+                        if (idx == 0xFFFFFFFF) cmd_iso_back(); 
+                        else if (g_iso.entries[idx].is_directory) { g_current_iso_parent = idx; populate_iso_listview(); }
+                        else {
+                            if (g_temp_files_count < 256) {
+                                char tmpDir[MAX_PATH]; GetTempPathA(MAX_PATH, tmpDir);
+                                strcat(tmpDir, "isomaster_temp\\");
+                                CreateDirectoryA(tmpDir, NULL);
+                                
+                                char destPath[MAX_PATH];
+                                snprintf(destPath, MAX_PATH, "%s%s", tmpDir, g_iso.entries[idx].name);
+                                
+                                if (iso_extract_file(idx, destPath, NULL, 0) == 0) {
+                                    strcpy(g_temp_files[g_temp_files_count++], destPath);
+                                    ShellExecuteA(g_hMainWnd, "open", destPath, NULL, NULL, SW_SHOWNORMAL);
+                                }
+                            }
+                        }
                     }
                 }
             } return 0;
         }
-        case WM_DESTROY: iso_close_image(); PostQuitMessage(0); return 0;
+        case WM_DESTROY: {
+            SaveSettings();
+            SendMessage(hwnd, WM_COMMAND, ID_ISO_DELTEMP, 0); // Cleanup temp
+            iso_close_image(); 
+            PostQuitMessage(0); 
+            return 0;
+        }
     } return DefWindowProcA(hwnd, uMsg, wParam, lParam);
 }
 
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdline, int show) {
     g_hInstance = hInst; WNDCLASSA wc = {0}; wc.style = CS_HREDRAW | CS_VREDRAW; wc.lpfnWndProc = WindowProc; wc.hInstance = hInst; wc.hCursor = LoadCursor(NULL, IDC_ARROW); wc.hIcon = LoadIcon(NULL, IDI_APPLICATION); wc.lpszClassName = "IsoMasterClass";
     if (!RegisterClassA(&wc)) return 1;
-    g_hMainWnd = CreateWindowExA(0, "IsoMasterClass", "ISO Master - " APP_VERSION, WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, WINDOW_WIDTH, WINDOW_HEIGHT, NULL, NULL, hInst, NULL);
-    ShowWindow(g_hMainWnd, SW_SHOW); UpdateWindow(g_hMainWnd);
-    MSG msg; while (GetMessageA(&msg, NULL, 0, 0)) { TranslateMessage(&msg); DispatchMessageA(&msg); } return (int)msg.wParam;
+    
+    g_hMainWnd = CreateWindowExA(0, "IsoMasterClass", "ISO Master", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, WINDOW_WIDTH, WINDOW_HEIGHT, NULL, NULL, hInst, NULL);
+    
+    LoadSettings(); 
+    UpdateWindowTitle();
+    
+    ShowWindow(g_hMainWnd, SW_SHOW); 
+    UpdateWindow(g_hMainWnd);
+    
+    MSG msg; 
+    while (GetMessageA(&msg, NULL, 0, 0)) { 
+        if (msg.message == WM_KEYDOWN) {
+            if (msg.wParam == VK_DELETE) {
+                if (GetFocus() == g_hIsoListView) cmd_delete_selected(g_hMainWnd);
+                continue; 
+            }
+            else if (msg.wParam == VK_F5) {
+                SendMessageA(g_hMainWnd, WM_COMMAND, IDM_VIEW_REFRESH, 0);
+                continue;
+            }
+            else if (msg.wParam == VK_F2) {
+                HWND hFocus = GetFocus();
+                if (hFocus == g_hLocalListView) cmd_rename_local(g_hMainWnd);
+                else if (hFocus == g_hIsoListView) cmd_rename_iso(g_hMainWnd);
+                continue;
+            }
+            else if (msg.wParam == VK_RETURN) {
+                HWND hFocus = GetFocus();
+                if (hFocus == g_hLocalListView || hFocus == g_hIsoListView) {
+                    NMHDR nmhdr; nmhdr.hwndFrom = hFocus; nmhdr.idFrom = GetDlgCtrlID(hFocus); nmhdr.code = NM_DBLCLK;
+                    SendMessageA(g_hMainWnd, WM_NOTIFY, nmhdr.idFrom, (LPARAM)&nmhdr);
+                    continue;
+                }
+            }
+        }
+        TranslateMessage(&msg); 
+        DispatchMessageA(&msg); 
+    } 
+    return (int)msg.wParam;
 }

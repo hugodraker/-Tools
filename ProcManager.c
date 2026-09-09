@@ -2,7 +2,7 @@
  * C Procedure Function Replacer - Replaces Functions with updated ones
  *
  * Compile instructions (GCC / MinGW):
- * gcc -Os -s -mwindows -o ProcManager.exe ProcManager.c -lcomctl32 -lcomdlg32
+ * gcc -Os -s -mwindows -o ProcManager.exe ProcManager.c -lcomctl32 -lcomdlg32 -lshell32
  *
  * THIS WORK IS NOT FIT FOR ANY FUNCTION OR PURPOSE, COMES WITH NO WARRANTY,
  * AND IS BEING RELEASED INTO THE PUBLIC DOMAIN.
@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <shellapi.h>
 
 #define IDB_BROWSE       101
 #define IDB_PASTEREPLACE 102
@@ -772,6 +773,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             
             LoadMRU();
             PopulateMRUCombo();
+
+            // Enable drag and drop for the main window
+            DragAcceptFiles(hwnd, TRUE);
+        } break;
+
+        case WM_DROPFILES: {
+            HDROP hDrop = (HDROP)wParam;
+            char droppedFile[MAX_PATH];
+            
+            // Extract the path of the first file dropped
+            if (DragQueryFile(hDrop, 0, droppedFile, MAX_PATH)) {
+                LoadFile(droppedFile);
+            }
+            
+            // Release memory allocated by the system for the drop operation
+            DragFinish(hDrop);
         } break;
 
         case WM_SIZE: {
