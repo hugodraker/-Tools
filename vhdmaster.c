@@ -4,8 +4,8 @@
  * Implemented: VHD fixed-disk container (footer/checksum/open/save/resize/convert),
  *              MBR partition table (create/delete/properties/active/resize/mbr/vbr),
  *              local filesystem browser, FAT16/FAT32 read/write/format engine,
- *              Drag & Drop recursive imports, QEMU boot integration,
- *              Intelligent Shrink with Data Loss detection, Secure Zeroing, Compacting.
+ *              Drag & Drop recursive imports, QEMU boot integration, Physical Cloning,
+ *              Intelligent Shrink, Secure Zeroing, Compacting, Defragmentation.
  *
  * Compile: gcc -Os -s -mwindows -o vhdmaster.exe vhdmaster.c -lcomctl32 -lcomdlg32
  *
@@ -21,6 +21,7 @@
 #include <commctrl.h>
 #include <commdlg.h>
 #include <shellapi.h>
+#include <winioctl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,6 +37,9 @@
 #define SECTOR_SIZE     512
 #define MAX_MBR_PARTS   4
 
+#define IDC_LOCAL_LIST    1001
+#define IDC_VHD_LIST      1002
+
 #define ID_LOCAL_BACK     2001
 #define ID_LOCAL_NEWDIR   2002
 #define ID_VHD_BACK       2003
@@ -46,6 +50,7 @@
 #define IDM_IMAGE_NEW      3001
 #define IDM_IMAGE_OPEN     3002
 #define IDM_IMAGE_SAVE     3003
+#define IDM_IMAGE_CLONE_PHYSICAL 3009
 #define IDM_IMAGE_CONVERT  3007
 #define IDM_IMAGE_QEMU_BOOT 3008
 #define IDM_IMAGE_QUIT     3006
@@ -59,6 +64,7 @@
 #define IDM_PART_VBR_FILE  3027
 #define IDM_PART_COMPACT   3028
 #define IDM_PART_REPLACE_BOOT 3029
+#define IDM_PART_DEFRAG    3034
 
 #define IDM_DISK_MBR_STD     3030
 #define IDM_DISK_TRIM        3031
@@ -112,6 +118,7 @@ VhdState g_vhd = {0};
 char g_current_local_path[MAX_PATH];
 char g_mru[5][MAX_PATH] = {0};
 BOOL g_show_hidden = FALSE;
+BOOL g_dragging = FALSE;
 volatile BOOL g_cancel_operation = FALSE;
 static int g_last_percent = -1;
 
@@ -219,6 +226,79 @@ BOOL ShowInputBox(HWND parent, const char* title, const char* prompt, char* out_
     }
     EnableWindow(parent, TRUE); SetForegroundWindow(parent);
     if (g_input_result[0] != '\0') { strcpy(out_buf, g_input_result); return TRUE; }
+    return FALSE;
+}
+
+HWND g_hCombo;
+int g_combo_sel_data = -1;
+LRESULT CALLBACK ComboDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+        case WM_COMMAND:
+            if (LOWORD(wp) == 1) { 
+                int sel = SendMessageA(g_hCombo, CB_GETCURSEL, 0, 0);
+                if (sel != CB_ERR) {
+                    g_combo_sel_data = SendMessageA(g_hCombo, CB_GETITEMDATA, sel, 0);
+                } else g_combo_sel_data = -1;
+                DestroyWindow(hwnd); 
+            }
+            else if (LOWORD(wp) == 2) { g_combo_sel_data = -1; DestroyWindow(hwnd); }
+            break;
+        case WM_CLOSE: g_combo_sel_data = -1; DestroyWindow(hwnd); break;
+    }
+    return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+BOOL ShowDriveSelectBox(HWND parent, char* out_drive) {
+    WNDCLASSA wc = {0};
+    wc.lpfnWndProc = ComboDlgProc; wc.hInstance = g_hInstance;
+    wc.lpszClassName = "VhdComboDlgClass"; wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    RegisterClassA(&wc);
+
+    HWND hDlg = CreateWindowExA(WS_EX_DLGMODALFRAME, "VhdComboDlgClass", "Select Physical Drive",
+        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT, 350, 140,
+        parent, NULL, g_hInstance, NULL);
+    CreateWindowExA(0, "STATIC", "Select source drive (Requires Admin):", WS_CHILD | WS_VISIBLE, 10, 10, 310, 20, hDlg, NULL, g_hInstance, NULL);
+    
+    g_hCombo = CreateWindowExA(0, "COMBOBOX", "", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+        10, 35, 310, 200, hDlg, NULL, g_hInstance, NULL);
+    
+    CreateWindowExA(0, "BUTTON", "OK", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON, 160, 70, 75, 23, hDlg, (HMENU)1, g_hInstance, NULL);
+    CreateWindowExA(0, "BUTTON", "Cancel", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 245, 70, 75, 23, hDlg, (HMENU)2, g_hInstance, NULL);
+
+    int count = 0;
+    for (int i = 0; i < 32; i++) {
+        char path[64]; snprintf(path, 64, "\\\\.\\PhysicalDrive%d", i);
+        HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ|FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+        if (h != INVALID_HANDLE_VALUE) {
+            GET_LENGTH_INFORMATION gli; DWORD ret;
+            if (DeviceIoControl(h, IOCTL_DISK_GET_LENGTH_INFO, NULL, 0, &gli, sizeof(gli), &ret, NULL)) {
+                char display[128]; char sz[64];
+                format_size(gli.Length.QuadPart, sz, sizeof(sz));
+                snprintf(display, sizeof(display), "PhysicalDrive%d (%s)", i, sz);
+                int idx = SendMessageA(g_hCombo, CB_ADDSTRING, 0, (LPARAM)display);
+                SendMessageA(g_hCombo, CB_SETITEMDATA, idx, i);
+                count++;
+            }
+            CloseHandle(h);
+        }
+    }
+    if (count == 0) {
+        int idx = SendMessageA(g_hCombo, CB_ADDSTRING, 0, (LPARAM)"No drives found (Run as Admin?)");
+        SendMessageA(g_hCombo, CB_SETITEMDATA, idx, -1);
+    }
+    SendMessageA(g_hCombo, CB_SETCURSEL, 0, 0);
+
+    EnableWindow(parent, FALSE);
+    MSG msg;
+    while (IsWindow(hDlg) && GetMessageA(&msg, NULL, 0, 0)) {
+        if (!IsDialogMessageA(hDlg, &msg)) { TranslateMessage(&msg); DispatchMessageA(&msg); }
+    }
+    EnableWindow(parent, TRUE); SetForegroundWindow(parent);
+    
+    if (g_combo_sel_data != -1) {
+        snprintf(out_drive, 64, "\\\\.\\PhysicalDrive%d", g_combo_sel_data);
+        return TRUE;
+    }
     return FALSE;
 }
 
@@ -358,25 +438,41 @@ static void vhd_build_footer(u8 *foot, u64 cap) {
     memcpy(foot + 0,  "conectix", 8);
     wr32be(foot + 8,  0x00000002);
     wr32be(foot + 12, 0x00010000);
-    wr32be(foot + 16, 0xFFFFFFFF);
-    wr32be(foot + 24, (u32)time(NULL));
+    wr64be(foot + 16, 0xFFFFFFFFFFFFFFFFULL); // Required format for Fixed Disks
+    wr32be(foot + 24, (u32)(time(NULL) - 946684800)); // VHD timestamp is Jan 1, 2000 epoch
     memcpy(foot + 28, "vhdm", 4);
     wr32be(foot + 32, 0x00010000);
     memcpy(foot + 36, "Wi2k", 4);
     wr64be(foot + 40, cap);
     wr64be(foot + 48, cap);
-    {
-        u64 secs = cap / 512;
-        u32 cyl = (u32)(secs / (255ULL * 63));
-        if (cyl < 1)     cyl = 1;
-        if (cyl > 65535) cyl = 65535;
-        wr16be(foot + 56, (u16)cyl);
-        foot[58] = 255;
-        foot[59] = 63;
+    
+    // Strict Microsoft VHD CHS Calculation
+    u32 ts = (u32)(cap / 512);
+    u32 c, h, s;
+    if (ts > 65535 * 16 * 255) ts = 65535 * 16 * 255;
+    if (ts >= 65535 * 16 * 63) {
+        s = 255; h = 16; c = ts / (s * h);
+    } else {
+        s = 17;
+        u32 cy_hx = ts / s;
+        h = (cy_hx + 1023) / 1024;
+        if (h < 4) h = 4;
+        if (cy_hx >= (h * 1024) || h > 16) {
+            s = 31; h = 16; cy_hx = ts / s;
+        }
+        if (cy_hx >= (h * 1024)) {
+            s = 63; h = 16; cy_hx = ts / s;
+        }
+        c = cy_hx / h;
     }
-    wr32be(foot + 60, 2);
+    wr16be(foot + 56, (u16)c);
+    foot[58] = (u8)h;
+    foot[59] = (u8)s;
+
+    wr32be(foot + 60, 2); // Disk Type Fixed
     for (i = 0; i < 16; i++) foot[68 + i] = (u8)(rand() & 0xFF);
     foot[84] = 0;
+    
     memset(foot + 64, 0, 4);
     sum = 0;
     for (i = 0; i < 512; i++) sum += foot[i];
@@ -385,10 +481,13 @@ static void vhd_build_footer(u8 *foot, u64 cap) {
 
 static int vhd_validate(const u8 *img, long long bytes, long long *data_offset, u64 *cap) {
     const u8 *foot = img + bytes - 512;
-    if (bytes < 1024)                                             return -1;
-    if (memcmp(img, "conectix", 8) == 0) *data_offset = 512;
-    else if (memcmp(foot, "conectix", 8) == 0) *data_offset = 0;
+    if (bytes < 1024) return -1;
+    
+    // Strict requirement: Fixed disks only have the footer at the very end
+    if (memcmp(foot, "conectix", 8) == 0) *data_offset = 0;
+    else if (memcmp(img, "conectix", 8) == 0) *data_offset = 512; 
     else return -2;
+    
     if (rd32be(foot + 60) != 2) return -3;
     *cap = rd64be(foot + 48);
     if (*cap == 0 || (long long)(*cap) + 512 + *data_offset > bytes) return -4;
@@ -465,24 +564,30 @@ static int vhd_open(const char* path) {
 }
 
 static int vhd_create(const char* path, u32 size_mb) {
-    u8 *buf; u64 cap = (u64)size_mb * 1024 * 1024;
-    long long total = 512 + (long long)cap + 512;
-    buf = (u8*)calloc(1, (size_t)total);
-    if (!buf) return -1;
-    vhd_build_footer(buf, cap);
-    vhd_build_footer(buf + total - 512, cap);
-    {
-        u8 *mbr = buf + 512;
-        mbr[510] = 0x55; mbr[511] = 0xAA;
+    u64 cap = (u64)size_mb * 1024 * 1024;
+    HANDLE h = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) return -2;
+
+    ShowProgress(TRUE);
+    u8 buf[65536];
+    memset(buf, 0, sizeof(buf));
+    buf[510] = 0x55; buf[511] = 0xAA; 
+    
+    u64 rem = cap;
+    DWORD w;
+    while (rem > 0) {
+        u32 chunk = (rem > sizeof(buf)) ? sizeof(buf) : (u32)rem;
+        WriteFile(h, buf, chunk, &w, NULL);
+        if (buf[510]) { buf[510] = 0; buf[511] = 0; } 
+        rem -= chunk;
+        if (rem % (1024 * 1024 * 10) == 0) UpdateProgress((int)(((cap - rem) * 100) / cap));
     }
-    {
-        HANDLE h = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
-        DWORD w;
-        if (h == INVALID_HANDLE_VALUE) { free(buf); return -2; }
-        WriteFile(h, buf, (DWORD)total, &w, NULL);
-        CloseHandle(h);
-    }
-    free(buf);
+
+    u8 footer[512];
+    vhd_build_footer(footer, cap);
+    WriteFile(h, footer, 512, &w, NULL);
+    CloseHandle(h);
+    ShowProgress(FALSE);
     return 0;
 }
 
@@ -490,7 +595,6 @@ static int vhd_save(void) {
     HANDLE h; DWORD w;
     if (!g_vhd.isOpen || !g_vhd.img) return -1;
     vhd_build_footer(g_vhd.img + g_vhd.img_bytes - 512, g_vhd.cap);
-    if (g_vhd.data_offset >= 512) vhd_build_footer(g_vhd.img, g_vhd.cap);
     h = CreateFileA(g_vhd.path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
     if (h == INVALID_HANDLE_VALUE) return -2;
     WriteFile(h, g_vhd.img, (DWORD)g_vhd.img_bytes, &w, NULL);
@@ -499,28 +603,28 @@ static int vhd_save(void) {
 }
 
 static int vhd_resize(u32 new_mb) {
-    u8 *nbuf; u64 newcap = (u64)new_mb * 1024 * 1024;
-    long long new_total;
+    u64 newcap = (u64)new_mb * 1024 * 1024;
+    long long new_total = (long long)newcap + 512;
     int i;
     if (!g_vhd.isOpen) return -1;
-    new_total = 512 + (long long)newcap + 512;
 
     for (i = 0; i < MAX_MBR_PARTS; i++)
         if (g_vhd.parts[i].used &&
             (u64)(g_vhd.parts[i].lba_begin + g_vhd.parts[i].lba_count) * 512 > newcap)
             return -2;
 
-    nbuf = (u8*)calloc(1, (size_t)new_total);
+    u8 *nbuf = (u8*)calloc(1, (size_t)new_total);
     if (!nbuf) return -3;
-    if (new_total >= g_vhd.img_bytes)
-        memcpy(nbuf + 512, g_vhd.img + 512, (size_t)g_vhd.img_bytes - 1024);
-    else
-        memcpy(nbuf + 512, g_vhd.img + 512, (size_t)(g_vhd.img_bytes - 1024 - (g_vhd.img_bytes - new_total)));
-
+    
+    long long copy_len = g_vhd.img_bytes - 512;
+    if (copy_len > (long long)newcap) copy_len = newcap;
+    
+    memcpy(nbuf, g_vhd.img + g_vhd.data_offset, (size_t)copy_len);
     free(g_vhd.img);
     g_vhd.img = nbuf;
     g_vhd.img_bytes = new_total;
     g_vhd.cap = newcap;
+    g_vhd.data_offset = 0; 
     return 0;
 }
 
@@ -603,12 +707,7 @@ static int part_create_fat(HWND hwnd, u8 force_type) {
         u64 len = best_sz;
         if (len > 0xFFFFFFFFu) len = 0xFFFFFFFFu;
         
-        u8 type = 0x06;
-        if (force_type != 0) {
-            type = force_type;
-        } else {
-            type = (len >= 65528 * 63) ? 0x0B : 0x06;
-        }
+        u8 type = force_type != 0 ? force_type : ((len >= 65528 * 63) ? 0x0B : 0x06);
 
         g_vhd.parts[slot].used = 1;
         g_vhd.parts[slot].type = type;
@@ -722,6 +821,42 @@ static u32 alloc_cluster(void) {
             u8 z[512] = {0};
             for(u32 k=0; k<g_sec_per_clus; k++) write_sec(cluster_to_lba(i)+k, z, 1);
             return i;
+        }
+    }
+    return 0;
+}
+
+static u32 get_chain_length(u32 clus) {
+    u32 count = 0;
+    while (clus >= 2 && clus < 0x0FFFFFF0) {
+        count++;
+        clus = read_fat(clus);
+    }
+    return count;
+}
+
+static int is_chain_fragmented(u32 clus) {
+    if (clus < 2 || clus >= 0x0FFFFFF0) return 0;
+    u32 prev = clus;
+    clus = read_fat(clus);
+    while (clus >= 2 && clus < 0x0FFFFFF0) {
+        if (clus != prev + 1) return 1;
+        prev = clus;
+        clus = read_fat(clus);
+    }
+    return 0;
+}
+
+static u32 find_contiguous_free(u32 count) {
+    u32 start = 0;
+    u32 streak = 0;
+    for (u32 i = 2; i <= g_total_clusters + 1; i++) {
+        if (read_fat(i) == 0) {
+            if (streak == 0) start = i;
+            streak++;
+            if (streak == count) return start;
+        } else {
+            streak = 0;
         }
     }
     return 0;
@@ -1045,6 +1180,90 @@ end_search:
     return 0;
 }
 
+static void fs_defrag_dir(u32 dir_cluster, int *moved_count) {
+    u8 sec[512];
+    u32 cur = dir_cluster;
+    int is_root16 = (g_fat_type == 16 && dir_cluster == 0);
+    u32 sec_idx = 0;
+
+    while (1) {
+        u32 lba = is_root16 ? (g_root_lba + sec_idx) : (cluster_to_lba(cur) + sec_idx);
+        if (read_sec(lba, sec, 1) != 0) break;
+
+        int modified = 0;
+        for (int i = 0; i < 512; i += 32) {
+            u8 *ent = sec + i;
+            if (ent[0] == 0x00) {
+                if (modified) write_sec(lba, sec, 1);
+                return; 
+            }
+            if (ent[0] == 0xE5 || ent[11] == 0x0F) continue;
+
+            char fname[13]; format_83_name(ent, fname);
+            if (strcmp(fname, ".") == 0 || strcmp(fname, "..") == 0) continue;
+
+            int is_dir = (ent[11] & 0x10);
+            u32 fclus = (rd16le(ent + 20) << 16) | rd16le(ent + 26);
+
+            if (!is_dir && fclus >= 2) {
+                u32 len = get_chain_length(fclus);
+                if (len > 1 && is_chain_fragmented(fclus)) {
+                    u32 new_start = find_contiguous_free(len);
+                    if (new_start >= 2) {
+                        for (u32 c = 0; c < len; c++) {
+                            write_fat(new_start + c, (c == len - 1) ? 0x0FFFFFFF : (new_start + c + 1));
+                        }
+                        
+                        u32 cur_old = fclus;
+                        u32 c_idx = 0;
+                        u8 cbuf[512];
+                        while (cur_old >= 2 && cur_old < 0x0FFFFFF0) {
+                            u32 lba_old = cluster_to_lba(cur_old);
+                            u32 lba_new = cluster_to_lba(new_start + c_idx);
+                            for (u32 s = 0; s < g_sec_per_clus; s++) {
+                                read_sec(lba_old + s, cbuf, 1);
+                                write_sec(lba_new + s, cbuf, 1);
+                            }
+                            cur_old = read_fat(cur_old);
+                            c_idx++;
+                        }
+                        
+                        wr16le(ent + 20, new_start >> 16);
+                        wr16le(ent + 26, new_start & 0xFFFF);
+                        write_sec(lba, sec, 1); 
+                        modified = 0; 
+                        
+                        cur_old = fclus;
+                        u8 z[512] = {0};
+                        while (cur_old >= 2 && cur_old < 0x0FFFFFF0) {
+                            u32 lba_old = cluster_to_lba(cur_old);
+                            for (u32 s = 0; s < g_sec_per_clus; s++) write_sec(lba_old + s, z, 1);
+                            u32 nxt = read_fat(cur_old);
+                            write_fat(cur_old, 0);
+                            cur_old = nxt;
+                        }
+                        
+                        (*moved_count)++;
+                        PumpMessages();
+                    }
+                }
+            } else if (is_dir && fclus >= 2) {
+                if (modified) { write_sec(lba, sec, 1); modified = 0; }
+                fs_defrag_dir(fclus, moved_count);
+            }
+        }
+        if (modified) write_sec(lba, sec, 1);
+
+        sec_idx++;
+        if (is_root16 && sec_idx >= g_root_secs) break;
+        if (!is_root16 && sec_idx >= g_sec_per_clus) {
+            sec_idx = 0;
+            cur = read_fat(cur);
+            if (cur >= 0x0FFFFFF8) break;
+        }
+    }
+}
+
 static int fs_format_partition(int part_idx, int fat32) {
     if (!g_vhd.isOpen || !g_vhd.parts[part_idx].used) return -1;
     u64 secs = (u64)g_vhd.parts[part_idx].lba_count;
@@ -1079,6 +1298,7 @@ static int fs_format_partition(int part_idx, int fat32) {
     wr32le(bpb + 32, (secs >= 65536) ? (u32)secs : 0);
 
     if (fat32) {
+        if (g_vhd.parts[part_idx].type != 0x0C) g_vhd.parts[part_idx].type = 0x0B;
         wr32le(bpb + 36, fat_sz);
         wr16le(bpb + 40, 0); 
         wr16le(bpb + 42, 0); 
@@ -1091,6 +1311,7 @@ static int fs_format_partition(int part_idx, int fat32) {
         memcpy(bpb + 71, "NO NAME    ", 11);
         memcpy(bpb + 82, "FAT32   ", 8);
     } else {
+        if (g_vhd.parts[part_idx].type != 0x0E && g_vhd.parts[part_idx].type != 0x01) g_vhd.parts[part_idx].type = 0x06;
         bpb[36] = 0x80; 
         bpb[38] = 0x29; 
         wr32le(bpb + 39, 0x12345678); 
@@ -1128,7 +1349,6 @@ static int fs_format_partition(int part_idx, int fat32) {
         for(u32 i=0; i<spc; i++) write_sec(rd_start + i, z, 1);
     }
 
-    g_vhd.parts[part_idx].type = fat32 ? 0x0B : 0x06;
     update_mbr_in_ram();
     return 0;
 }
@@ -1226,7 +1446,7 @@ static void delete_lost_items(u32 dir_cluster, u32 max_cluster) {
                     c = n;
                 }
                 ent[0] = 0xE5;
-                memset(ent + 1, 0, 31); /* Wipe entry metadata */
+                memset(ent + 1, 0, 31);
                 modified = 1;
             } else if (is_dir && fclus >= 2) {
                 if (modified) { write_sec(lba, sec, 1); modified = 0; }
@@ -1258,8 +1478,7 @@ static void set_local_path(const char* path) {
         int i = 0;
         if (strlen(g_current_local_path) > 3) {
             LVITEMA lvi = {0}; lvi.mask = LVIF_TEXT; lvi.iItem = i++; lvi.pszText = "..";
-            int idx = (int)SendMessageA(g_hLocalListView, LVM_INSERTITEMA, 0, (LPARAM)&lvi);
-            (void)idx;
+            SendMessageA(g_hLocalListView, LVM_INSERTITEMA, 0, (LPARAM)&lvi);
             LVITEMA s = {0}; s.iSubItem = 1; s.pszText = "<DIR>";
             SendMessageA(g_hLocalListView, LVM_SETITEMTEXTA, 0, (LPARAM)&s);
         }
@@ -1324,7 +1543,144 @@ static void populate_vhd_listview(void) {
     }
 }
 
+static void navigate_local(HWND hwnd, int item) {
+    char name[256], type[64];
+    ListView_GetItemText(g_hLocalListView, item, 0, name, sizeof(name));
+    ListView_GetItemText(g_hLocalListView, item, 1, type, sizeof(type));
+    if (strcmp(type, "<DIR>") == 0) {
+        if (strcmp(name, "..") == 0) {
+            char *p = strrchr(g_current_local_path, '\\');
+            if (p && p != g_current_local_path) {
+                *p = '\0';
+                if (g_current_local_path[0] != '\0' && g_current_local_path[1] == ':' && g_current_local_path[2] == '\0')
+                    strcat(g_current_local_path, "\\");
+            }
+        } else {
+            if (g_current_local_path[strlen(g_current_local_path)-1] != '\\') strcat(g_current_local_path, "\\");
+            strcat(g_current_local_path, name);
+        }
+        set_local_path(g_current_local_path);
+    }
+}
+
+static void navigate_vhd(HWND hwnd, int item) {
+    if (g_view_mode == 0) {
+        if (g_vhd.parts[item].used) {
+            if (fs_mount(item) == 0) {
+                g_view_mode = 1;
+                fs_list(g_current_dir_cluster);
+                populate_vhd_listview();
+            } else {
+                MessageBoxA(hwnd, "Failed to mount partition. (Not FAT16/32 or unformatted)", "Error", MB_ICONERROR);
+            }
+        }
+    } else {
+        char name[256];
+        ListView_GetItemText(g_hVhdListView, item, 0, name, sizeof(name));
+        if (strcmp(name, "..") == 0) {
+            int is_root = (g_current_dir_cluster == g_root_cluster || (g_fat_type == 16 && g_current_dir_cluster == 0));
+            if (is_root) {
+                g_view_mode = 0; g_vhd.fs_mounted = 0;
+                populate_vhd_listview();
+            } else {
+                u32 pclus = 0;
+                for(int k=0; k<g_fs_entry_count; k++) {
+                    if (strcmp(g_fs_entries[k].name, "..") == 0) {
+                        pclus = g_fs_entries[k].first_cluster;
+                        if (pclus == 0 && g_fat_type == 32) pclus = g_root_cluster;
+                        break;
+                    }
+                }
+                g_current_dir_cluster = pclus;
+                fs_list(g_current_dir_cluster);
+                populate_vhd_listview();
+            }
+        } else {
+            for (int k = 0; k < g_fs_entry_count; k++) {
+                if (strcmp(g_fs_entries[k].name, name) == 0 && g_fs_entries[k].is_directory) {
+                    g_current_dir_cluster = g_fs_entries[k].first_cluster;
+                    fs_list(g_current_dir_cluster);
+                    populate_vhd_listview();
+                    break;
+                }
+            }
+        }
+    }
+}
+
 /* ============================================================ CONVERSION, BOOT, EXTRACT */
+static void cmd_clone_physical(HWND hwnd) {
+    char drive_path[64];
+    if (!ShowDriveSelectBox(hwnd, drive_path)) return;
+
+    OPENFILENAMEA sfn = {0};
+    char szVhd[MAX_PATH] = "";
+    sfn.lStructSize = sizeof(sfn); sfn.hwndOwner = hwnd;
+    sfn.lpstrFile = szVhd; sfn.nMaxFile = MAX_PATH;
+    sfn.lpstrFilter = "VHD Files (*.vhd)\0*.vhd\0";
+    sfn.lpstrDefExt = "vhd";
+    sfn.Flags = OFN_OVERWRITEPROMPT;
+    sfn.lpstrTitle = "Save Cloned VHD as...";
+    if (!GetSaveFileNameA(&sfn)) return;
+
+    HANDLE hIn = CreateFileA(drive_path, GENERIC_READ, FILE_SHARE_READ|FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    if (hIn == INVALID_HANDLE_VALUE) { MessageBoxA(hwnd, "Cannot open physical drive.", "Error", MB_ICONERROR); return; }
+
+    GET_LENGTH_INFORMATION gli; DWORD ret;
+    if (!DeviceIoControl(hIn, IOCTL_DISK_GET_LENGTH_INFO, NULL, 0, &gli, sizeof(gli), &ret, NULL)) {
+        CloseHandle(hIn); MessageBoxA(hwnd, "Cannot determine drive size.", "Error", MB_ICONERROR); return;
+    }
+    u64 fileSize = gli.Length.QuadPart;
+    u64 cap = (fileSize + 511) & ~511ULL;
+
+    HANDLE hOut = CreateFileA(szVhd, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    if (hOut == INVALID_HANDLE_VALUE) { CloseHandle(hIn); MessageBoxA(hwnd, "Cannot create VHD.", "Error", MB_ICONERROR); return; }
+
+    u8 *buf = (u8*)malloc(1048576);
+    if (!buf) { CloseHandle(hIn); CloseHandle(hOut); return; }
+    
+    DWORD bytesRead, bytesWritten;
+    u64 copied = 0;
+    ShowProgress(TRUE);
+
+    while (ReadFile(hIn, buf, 1048576, &bytesRead, NULL) && bytesRead > 0) {
+        if (g_cancel_operation) break;
+        WriteFile(hOut, buf, bytesRead, &bytesWritten, NULL);
+        copied += bytesRead;
+        if (copied % (1024 * 1024 * 10) == 0 || copied == fileSize) {
+            UpdateProgress((int)((copied * 100) / fileSize));
+        }
+    }
+    
+    free(buf);
+    CloseHandle(hIn);
+
+    if (g_cancel_operation) {
+        CloseHandle(hOut);
+        DeleteFileA(szVhd);
+        ShowProgress(FALSE);
+        SetWindowTextA(g_hStatusBar, "Physical Clone cancelled.");
+        return;
+    }
+
+    if (cap > copied) {
+        u8 pad[512] = {0};
+        WriteFile(hOut, pad, (DWORD)(cap - copied), &bytesWritten, NULL);
+    }
+
+    u8 footer[512];
+    vhd_build_footer(footer, cap);
+    WriteFile(hOut, footer, 512, &bytesWritten, NULL);
+    CloseHandle(hOut);
+    ShowProgress(FALSE);
+
+    if (vhd_open(szVhd) == 0) {
+        UpdateMRU(szVhd);
+        populate_vhd_listview();
+        SetWindowTextA(g_hStatusBar, "Clone complete. VHD Opened.");
+    }
+}
+
 static void cmd_convert_img(HWND hwnd) {
     OPENFILENAMEA ofn = {0};
     char szImg[MAX_PATH] = "";
@@ -1354,19 +1710,37 @@ static void cmd_convert_img(HWND hwnd) {
     u64 fileSize = ftell(fin);
     fseek(fin, 0, SEEK_SET);
 
-    u8 buf[8192];
+    u64 cap = (fileSize + 511) & ~511ULL;
+
+    u8 buf[1048576];
     size_t bytes;
     ShowProgress(TRUE);
     u64 copied = 0;
 
     while ((bytes = fread(buf, 1, sizeof(buf), fin)) > 0) {
+        if (g_cancel_operation) break;
         fwrite(buf, 1, bytes, fout);
         copied += bytes;
-        if (copied % (1024 * 1024) == 0) UpdateProgress((int)((copied * 100) / fileSize));
+        if (copied % (1024 * 1024 * 10) == 0 || copied == fileSize) {
+            UpdateProgress((int)((copied * 100) / fileSize));
+        }
+    }
+    
+    if (g_cancel_operation) {
+        fclose(fin); fclose(fout);
+        DeleteFileA(szVhd);
+        ShowProgress(FALSE);
+        SetWindowTextA(g_hStatusBar, "Conversion cancelled.");
+        return;
+    }
+
+    if (cap > copied) {
+        u8 pad[512] = {0};
+        fwrite(pad, 1, cap - copied, fout);
     }
     
     u8 footer[512];
-    vhd_build_footer(footer, fileSize);
+    vhd_build_footer(footer, cap);
     fwrite(footer, 1, 512, fout);
     
     fclose(fin);
@@ -1376,7 +1750,7 @@ static void cmd_convert_img(HWND hwnd) {
     if (vhd_open(szVhd) == 0) {
         UpdateMRU(szVhd);
         populate_vhd_listview();
-        SetWindowTextA(g_hStatusBar, "Conversion complete. VHD Opened.");
+        SetWindowTextA(g_hStatusBar, "Conversion complete. Fixed VHD Opened.");
     }
 }
 
@@ -1687,26 +2061,28 @@ static void cmd_resize(HWND hwnd) {
 
 static void cmd_extract_selected(HWND hwnd) {
     if (g_view_mode != 1) return;
-    int sel = ListView_GetNextItem(g_hVhdListView, -1, LVNI_SELECTED);
-    if (sel < 0) return;
-    char name[256];
-    ListView_GetItemText(g_hVhdListView, sel, 0, name, sizeof(name));
-    if (strcmp(name, "..") == 0) return;
-    int eidx = -1;
-    for(int k=0; k<g_fs_entry_count; k++) {
-        if (strcmp(g_fs_entries[k].name, name) == 0) { eidx = k; break; }
+    int sel = -1;
+    int extracted = 0, failed = 0;
+    while ((sel = ListView_GetNextItem(g_hVhdListView, sel, LVNI_SELECTED)) != -1) {
+        char name[256];
+        ListView_GetItemText(g_hVhdListView, sel, 0, name, sizeof(name));
+        if (strcmp(name, "..") == 0) continue;
+        int eidx = -1;
+        for(int k=0; k<g_fs_entry_count; k++) {
+            if (strcmp(g_fs_entries[k].name, name) == 0) { eidx = k; break; }
+        }
+        if (eidx != -1 && !g_fs_entries[eidx].is_directory) {
+            char dest[MAX_PATH];
+            snprintf(dest, sizeof(dest), "%s\\%s", g_current_local_path, name);
+            if (fs_extract(eidx, dest) == 0) extracted++;
+            else failed++;
+        }
     }
-    if (eidx == -1 || g_fs_entries[eidx].is_directory) {
-        MessageBoxA(hwnd, "Select a file to extract.", "Error", MB_ICONWARNING);
-        return;
-    }
-    char dest[MAX_PATH];
-    snprintf(dest, sizeof(dest), "%s\\%s", g_current_local_path, name);
-    if (fs_extract(eidx, dest) == 0) {
+    if (extracted > 0 || failed > 0) {
         set_local_path(g_current_local_path);
-        SetWindowTextA(g_hStatusBar, "Extracted successfully.");
-    } else {
-        MessageBoxA(hwnd, "Failed to extract file.", "Error", MB_ICONERROR);
+        char msg[128];
+        snprintf(msg, sizeof(msg), "Extracted: %d, Failed: %d.", extracted, failed);
+        SetWindowTextA(g_hStatusBar, msg);
     }
 }
 
@@ -1715,41 +2091,51 @@ static void cmd_add_selected(HWND hwnd) {
         MessageBoxA(hwnd, "Navigate into a FAT partition first.", "Error", MB_ICONWARNING);
         return;
     }
-    int sel = ListView_GetNextItem(g_hLocalListView, -1, LVNI_SELECTED);
-    if (sel < 0) return;
-    char name[256];
-    ListView_GetItemText(g_hLocalListView, sel, 0, name, sizeof(name));
-    if (strcmp(name, "..") == 0) return;
-    char src[MAX_PATH];
-    snprintf(src, sizeof(src), "%s\\%s", g_current_local_path, name);
+    int sel = -1;
+    int added = 0, failed = 0;
+    while ((sel = ListView_GetNextItem(g_hLocalListView, sel, LVNI_SELECTED)) != -1) {
+        char name[256];
+        ListView_GetItemText(g_hLocalListView, sel, 0, name, sizeof(name));
+        if (strcmp(name, "..") == 0) continue;
+        char src[MAX_PATH];
+        snprintf(src, sizeof(src), "%s\\%s", g_current_local_path, name);
+        
+        if (import_recursive(src, g_current_dir_cluster) == 0) added++;
+        else failed++;
+    }
     
-    if (import_recursive(src, g_current_dir_cluster) == 0) {
+    if (added > 0 || failed > 0) {
         fs_list(g_current_dir_cluster);
         populate_vhd_listview();
-        SetWindowTextA(g_hStatusBar, "File(s) imported successfully.");
-    } else {
-        MessageBoxA(hwnd, "Failed to import some file(s).", "Error", MB_ICONERROR);
+        char msg[128];
+        snprintf(msg, sizeof(msg), "Imported: %d, Failed: %d.", added, failed);
+        SetWindowTextA(g_hStatusBar, msg);
     }
 }
 
 static void cmd_delete_selected(HWND hwnd) {
     if (g_view_mode != 1) return;
-    int sel = ListView_GetNextItem(g_hVhdListView, -1, LVNI_SELECTED);
-    if (sel < 0) return;
-    char name[256];
-    ListView_GetItemText(g_hVhdListView, sel, 0, name, sizeof(name));
-    if (strcmp(name, "..") == 0) return;
-    int eidx = -1;
-    for(int k=0; k<g_fs_entry_count; k++) {
-        if (strcmp(g_fs_entries[k].name, name) == 0) { eidx = k; break; }
+    int sel = -1;
+    int deleted = 0, failed = 0;
+    while ((sel = ListView_GetNextItem(g_hVhdListView, sel, LVNI_SELECTED)) != -1) {
+        char name[256];
+        ListView_GetItemText(g_hVhdListView, sel, 0, name, sizeof(name));
+        if (strcmp(name, "..") == 0) continue;
+        int eidx = -1;
+        for(int k=0; k<g_fs_entry_count; k++) {
+            if (strcmp(g_fs_entries[k].name, name) == 0) { eidx = k; break; }
+        }
+        if (eidx != -1) {
+            if (fs_delete(eidx) == 0) deleted++;
+            else failed++;
+        }
     }
-    if (eidx == -1) return;
-    if (fs_delete(eidx) == 0) {
+    if (deleted > 0) {
         fs_list(g_current_dir_cluster);
         populate_vhd_listview();
-        SetWindowTextA(g_hStatusBar, "Deleted successfully (sectors & metadata zeroed).");
-    } else {
-        MessageBoxA(hwnd, "Failed to delete item.", "Error", MB_ICONERROR);
+        char msg[128];
+        snprintf(msg, sizeof(msg), "Deleted: %d, Failed: %d.", deleted, failed);
+        SetWindowTextA(g_hStatusBar, msg);
     }
 }
 
@@ -1770,6 +2156,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             AppendMenuA(hFile, MF_STRING, IDM_IMAGE_OPEN,  "&Open...");
             AppendMenuA(hFile, MF_STRING, IDM_IMAGE_SAVE,  "&Save\tCtrl+S");
             AppendMenuA(hFile, MF_SEPARATOR, 0, NULL);
+            AppendMenuA(hFile, MF_STRING, IDM_IMAGE_CLONE_PHYSICAL, "Create VHD from &Physical Disk...");
             AppendMenuA(hFile, MF_STRING, IDM_IMAGE_CONVERT, "&Convert .img to .vhd...");
             AppendMenuA(hFile, MF_STRING, IDM_IMAGE_QEMU_BOOT, "Boot in &QEMU...");
             AppendMenuA(hFile, MF_SEPARATOR, 0, NULL);
@@ -1789,6 +2176,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             AppendMenuA(hPart, MF_POPUP, (UINT_PTR)hCreatePart, "&Create FAT Partition");
             AppendMenuA(hPart, MF_SEPARATOR, 0, NULL);
             AppendMenuA(hPart, MF_STRING, IDM_PART_COMPACT, "&Compact (Zero Free Space)");
+            AppendMenuA(hPart, MF_STRING, IDM_PART_DEFRAG, "Defrag&ment Files");
             AppendMenuA(hPart, MF_STRING, IDM_PART_ACTIVE, "Set &Active (Bootable)");
             AppendMenuA(hPart, MF_STRING, IDM_PART_RESIZE, "&Resize Partition...");
             AppendMenuA(hPart, MF_SEPARATOR, 0, NULL);
@@ -1815,11 +2203,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             InitCommonControlsEx(&icc);
 
             g_hLocalListView = CreateWindowExA(WS_EX_CLIENTEDGE, WC_LISTVIEWA, "",
-                WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SHOWSELALWAYS | LVS_SINGLESEL,
-                0, 0, 0, 0, hwnd, NULL, g_hInstance, NULL);
+                WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SHOWSELALWAYS,
+                0, 0, 0, 0, hwnd, (HMENU)IDC_LOCAL_LIST, g_hInstance, NULL);
             g_hVhdListView = CreateWindowExA(WS_EX_CLIENTEDGE, WC_LISTVIEWA, "",
-                WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SHOWSELALWAYS | LVS_SINGLESEL,
-                0, 0, 0, 0, hwnd, NULL, g_hInstance, NULL);
+                WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SHOWSELALWAYS,
+                0, 0, 0, 0, hwnd, (HMENU)IDC_VHD_LIST, g_hInstance, NULL);
             init_listview_columns(g_hLocalListView);
             init_listview_columns(g_hVhdListView);
             g_hStatusBar = CreateWindowExA(0, STATUSCLASSNAMEA, "Ready. File > New to create a VHD.",
@@ -1847,6 +2235,28 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             SetWindowPos(g_hCancelBtn, NULL, w - 55, rc.bottom - 21, 50, 18, SWP_NOZORDER);
             return 0;
         }
+        case WM_MOUSEMOVE: {
+            if (g_dragging) {
+                SetCursor(LoadCursor(NULL, IDC_CROSS));
+            }
+            break;
+        }
+        case WM_LBUTTONUP: {
+            if (g_dragging) {
+                g_dragging = FALSE;
+                ReleaseCapture();
+                POINT pt;
+                pt.x = GET_X_LPARAM(lParam);
+                pt.y = GET_Y_LPARAM(lParam);
+                ClientToScreen(hwnd, &pt);
+                RECT rcVhd;
+                GetWindowRect(g_hVhdListView, &rcVhd);
+                if (PtInRect(&rcVhd, pt)) {
+                    cmd_add_selected(hwnd);
+                }
+            }
+            break;
+        }
         case WM_DROPFILES: {
             if (g_view_mode != 1) {
                 MessageBoxA(hwnd, "Please navigate into a FAT partition to drop files.", "Warning", MB_ICONWARNING);
@@ -1868,73 +2278,30 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         }
         case WM_NOTIFY: {
             LPNMHDR nmh = (LPNMHDR)lParam;
-            if (nmh->idFrom == GetDlgCtrlID(g_hVhdListView) && nmh->code == NM_DBLCLK) {
-                LPNMITEMACTIVATE lpnm = (LPNMITEMACTIVATE)lParam;
-                if (lpnm->iItem >= 0) {
-                    if (g_view_mode == 0) {
-                        if (g_vhd.parts[lpnm->iItem].used) {
-                            if (fs_mount(lpnm->iItem) == 0) {
-                                g_view_mode = 1;
-                                fs_list(g_current_dir_cluster);
-                                populate_vhd_listview();
-                            } else {
-                                MessageBoxA(hwnd, "Failed to mount partition. (Not FAT16/32 or unformatted)", "Error", MB_ICONERROR);
-                            }
-                        }
-                    } else {
-                        char name[256];
-                        ListView_GetItemText(g_hVhdListView, lpnm->iItem, 0, name, sizeof(name));
-                        if (strcmp(name, "..") == 0) {
-                            int is_root = (g_current_dir_cluster == g_root_cluster || (g_fat_type == 16 && g_current_dir_cluster == 0));
-                            if (is_root) {
-                                g_view_mode = 0; g_vhd.fs_mounted = 0;
-                                populate_vhd_listview();
-                            } else {
-                                u32 pclus = 0;
-                                for(int k=0; k<g_fs_entry_count; k++) {
-                                    if (strcmp(g_fs_entries[k].name, "..") == 0) {
-                                        pclus = g_fs_entries[k].first_cluster;
-                                        if (pclus == 0 && g_fat_type == 32) pclus = g_root_cluster;
-                                        break;
-                                    }
-                                }
-                                g_current_dir_cluster = pclus;
-                                fs_list(g_current_dir_cluster);
-                                populate_vhd_listview();
-                            }
-                        } else {
-                            for (int k = 0; k < g_fs_entry_count; k++) {
-                                if (strcmp(g_fs_entries[k].name, name) == 0 && g_fs_entries[k].is_directory) {
-                                    g_current_dir_cluster = g_fs_entries[k].first_cluster;
-                                    fs_list(g_current_dir_cluster);
-                                    populate_vhd_listview();
-                                    break;
-                                }
-                            }
-                        }
+            if (nmh->code == LVN_BEGINDRAG) {
+                if (nmh->idFrom == IDC_LOCAL_LIST) {
+                    g_dragging = TRUE;
+                    SetCapture(hwnd);
+                    SetCursor(LoadCursor(NULL, IDC_CROSS));
+                }
+            }
+            else if (nmh->code == LVN_KEYDOWN) {
+                LPNMLVKEYDOWN pnkd = (LPNMLVKEYDOWN)lParam;
+                if (pnkd->wVKey == VK_RETURN) {
+                    if (nmh->idFrom == IDC_VHD_LIST) {
+                        int sel = ListView_GetNextItem(g_hVhdListView, -1, LVNI_SELECTED);
+                        if (sel >= 0) navigate_vhd(hwnd, sel);
+                    } else if (nmh->idFrom == IDC_LOCAL_LIST) {
+                        int sel = ListView_GetNextItem(g_hLocalListView, -1, LVNI_SELECTED);
+                        if (sel >= 0) navigate_local(hwnd, sel);
                     }
                 }
             }
-            if (nmh->idFrom == GetDlgCtrlID(g_hLocalListView) && nmh->code == NM_DBLCLK) {
+            else if (nmh->code == NM_DBLCLK) {
                 LPNMITEMACTIVATE lpnm = (LPNMITEMACTIVATE)lParam;
                 if (lpnm->iItem >= 0) {
-                    char name[256], type[64];
-                    ListView_GetItemText(g_hLocalListView, lpnm->iItem, 0, name, sizeof(name));
-                    ListView_GetItemText(g_hLocalListView, lpnm->iItem, 1, type, sizeof(type));
-                    if (strcmp(type, "<DIR>") == 0) {
-                        if (strcmp(name, "..") == 0) {
-                            char *p = strrchr(g_current_local_path, '\\');
-                            if (p && p != g_current_local_path) {
-                                *p = '\0';
-                                if (g_current_local_path[0] != '\0' && g_current_local_path[1] == ':' && g_current_local_path[2] == '\0')
-                                    strcat(g_current_local_path, "\\");
-                            }
-                        } else {
-                            if (g_current_local_path[strlen(g_current_local_path)-1] != '\\') strcat(g_current_local_path, "\\");
-                            strcat(g_current_local_path, name);
-                        }
-                        set_local_path(g_current_local_path);
-                    }
+                    if (nmh->idFrom == IDC_VHD_LIST) navigate_vhd(hwnd, lpnm->iItem);
+                    else if (nmh->idFrom == IDC_LOCAL_LIST) navigate_local(hwnd, lpnm->iItem);
                 }
             }
             break;
@@ -1960,6 +2327,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                     AppendMenuA(hMenu, MF_POPUP, (UINT_PTR)hCreatePart, "Create FAT Partition");
                     AppendMenuA(hMenu, MF_STRING, IDM_PART_FORMAT, "Format (FAT)");
                     AppendMenuA(hMenu, MF_STRING, IDM_PART_COMPACT, "Compact (Zero Free Space)");
+                    AppendMenuA(hMenu, MF_STRING, IDM_PART_DEFRAG, "Defragment Files");
                     AppendMenuA(hMenu, MF_STRING, IDM_PART_ACTIVE, "Set Active");
                     AppendMenuA(hMenu, MF_STRING, IDM_PART_RESIZE, "Resize Partition");
                     AppendMenuA(hMenu, MF_STRING, IDM_PART_VBR_FILE, "Write VBR from File");
@@ -1991,16 +2359,17 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 case IDM_IMAGE_SAVE:  cmd_save(hwnd); break;
                 case IDM_IMAGE_QUIT:  PostQuitMessage(0); break;
                 
+                case IDM_IMAGE_CLONE_PHYSICAL: cmd_clone_physical(hwnd); break;
                 case IDM_IMAGE_CONVERT:   cmd_convert_img(hwnd); break;
                 case IDM_IMAGE_QEMU_BOOT: cmd_qemu_boot(hwnd); break;
 
                 case IDM_PART_LIST:   if (g_vhd.isOpen) part_show_properties(hwnd); break;
-                case IDM_PART_CREATE_FAT12:  if (g_vhd.isOpen) { part_create_fat(hwnd, 0x01); populate_vhd_listview(); } break;
-                case IDM_PART_CREATE_FAT16_S:if (g_vhd.isOpen) { part_create_fat(hwnd, 0x04); populate_vhd_listview(); } break;
-                case IDM_PART_CREATE_FAT16:  if (g_vhd.isOpen) { part_create_fat(hwnd, 0x06); populate_vhd_listview(); } break;
-                case IDM_PART_CREATE_FAT32:  if (g_vhd.isOpen) { part_create_fat(hwnd, 0x0B); populate_vhd_listview(); } break;
-                case IDM_PART_CREATE_FAT32L: if (g_vhd.isOpen) { part_create_fat(hwnd, 0x0C); populate_vhd_listview(); } break;
-                case IDM_PART_CREATE_FAT16L: if (g_vhd.isOpen) { part_create_fat(hwnd, 0x0E); populate_vhd_listview(); } break;
+                case IDM_PART_CREATE_FAT12:  if (g_vhd.isOpen) { int s = part_create_fat(hwnd, 0x01); if(s>=0) fs_format_partition(s, 0); populate_vhd_listview(); } break;
+                case IDM_PART_CREATE_FAT16_S:if (g_vhd.isOpen) { int s = part_create_fat(hwnd, 0x04); if(s>=0) fs_format_partition(s, 0); populate_vhd_listview(); } break;
+                case IDM_PART_CREATE_FAT16:  if (g_vhd.isOpen) { int s = part_create_fat(hwnd, 0x06); if(s>=0) fs_format_partition(s, 0); populate_vhd_listview(); } break;
+                case IDM_PART_CREATE_FAT32:  if (g_vhd.isOpen) { int s = part_create_fat(hwnd, 0x0B); if(s>=0) fs_format_partition(s, 1); populate_vhd_listview(); } break;
+                case IDM_PART_CREATE_FAT32L: if (g_vhd.isOpen) { int s = part_create_fat(hwnd, 0x0C); if(s>=0) fs_format_partition(s, 1); populate_vhd_listview(); } break;
+                case IDM_PART_CREATE_FAT16L: if (g_vhd.isOpen) { int s = part_create_fat(hwnd, 0x0E); if(s>=0) fs_format_partition(s, 0); populate_vhd_listview(); } break;
                 
                 case IDM_PART_DELETE: {
                     if (!g_vhd.isOpen || g_view_mode != 0) break;
@@ -2052,6 +2421,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                             ShowProgress(TRUE);
                             u8 z[512] = {0};
                             for (u32 i = 2; i <= g_total_clusters + 1; i++) {
+                                if (g_cancel_operation) break;
                                 if (read_fat(i) == 0) {
                                     u32 lba = cluster_to_lba(i);
                                     for(u32 j=0; j<g_sec_per_clus; j++) write_sec(lba+j, z, 1);
@@ -2060,10 +2430,29 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                             }
                             ShowProgress(FALSE);
                             g_vhd.fs_mounted = 0;
-                            SetWindowTextA(g_hStatusBar, "Partition free space zeroed (Compacted).");
+                            SetWindowTextA(g_hStatusBar, g_cancel_operation ? "Compacting cancelled." : "Partition free space zeroed (Compacted).");
                         }
                     } else {
                         MessageBoxA(hwnd, "Please select a valid partition to compact.", "VHD Master", MB_ICONWARNING);
+                    }
+                    break;
+                }
+                case IDM_PART_DEFRAG: {
+                    if (!g_vhd.isOpen || g_view_mode != 0) break;
+                    int sel = ListView_GetNextItem(g_hVhdListView, -1, LVNI_SELECTED);
+                    if (sel >= 0 && sel < 4 && g_vhd.parts[sel].used) {
+                        if (fs_mount(sel) == 0) {
+                            ShowProgress(TRUE);
+                            int moved = 0;
+                            fs_defrag_dir(g_root_cluster, &moved);
+                            ShowProgress(FALSE);
+                            g_vhd.fs_mounted = 0;
+                            char msg[128];
+                            snprintf(msg, sizeof(msg), "Defragmentation complete. %d fragmented file(s) relocated.", moved);
+                            SetWindowTextA(g_hStatusBar, msg);
+                        }
+                    } else {
+                        MessageBoxA(hwnd, "Please select a valid partition.", "VHD Master", MB_ICONWARNING);
                     }
                     break;
                 }
@@ -2139,13 +2528,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                     }
                     break;
                 }
-                case IDM_PART_VBR_FILE:   cmd_write_vbr(hwnd); break;
+                case IDM_PART_VBR_FILE:     cmd_write_vbr(hwnd); break;
                 case IDM_PART_REPLACE_BOOT: cmd_replace_os_boot(hwnd); break;
                 
-                case IDM_DISK_MBR_STD:    cmd_write_mbr(hwnd); break;
-                case IDM_DISK_RESIZE:     cmd_resize(hwnd); break;
-                case IDM_DISK_EXTRACT_MBR:cmd_extract_mbr(hwnd); break;
-                case IDM_DISK_EXTRACT_VBR:cmd_extract_vbr(hwnd); break;
+                case IDM_DISK_MBR_STD:      cmd_write_mbr(hwnd); break;
+                case IDM_DISK_RESIZE:       cmd_resize(hwnd); break;
+                case IDM_DISK_EXTRACT_MBR:  cmd_extract_mbr(hwnd); break;
+                case IDM_DISK_EXTRACT_VBR:  cmd_extract_vbr(hwnd); break;
 
                 case IDM_DISK_TRIM: {
                     if (!g_vhd.isOpen) break;
