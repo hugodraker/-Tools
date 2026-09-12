@@ -23,6 +23,8 @@
 #define IDC_MRUCOMBO     106
 #define IDB_EDIT         107
 #define IDB_COMPILE      108
+#define IDB_COPYLEFT     109
+#define IDB_DELETELEFT   110
 #define IDL_LEFT         201
 #define IDL_RIGHT        202
 #define IDS_STATUS       301
@@ -34,11 +36,25 @@ typedef struct Chunk {
     struct Chunk* next;
 } Chunk;
 
+typedef struct {
+    Chunk* head;
+    Chunk* tail;
+} ProcGroup;
+
+void SetStatus(const char* msg);
+void PopulateList(HWND hList, Chunk* head);
+void EnsureCRLF(Chunk* c);
+void MoveLeftChunk(int fromIdx, int toIdx);
+
+LRESULT CALLBACK LeftListWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
+
 HWND hMainWindow;
 HWND hComboMru;
-HWND hBtnBrowse, hBtnPasteRep, hBtnPaste, hBtnUpdate, hBtnSave, hBtnEdit, hBtnCompile;
+HWND hBtnBrowse, hBtnPasteRep, hBtnPaste, hBtnUpdate, hBtnSave, hBtnEdit, hBtnCompile, hBtnCopyLeft, hBtnDeleteLeft;
 HWND hListLeft, hListRight;
 HWND hStatus;
+
+WNDPROC OldListProc;
 
 Chunk* g_LeftChunks = NULL;
 Chunk* g_RightChunks = NULL;
@@ -47,6 +63,180 @@ char szIniFile[MAX_PATH] = {0};
 
 char mruList[20][MAX_PATH];
 int mruCount = 0;
+
+void EnsureCRLF(Chunk* c) {
+    if (!c || !c->text) return;
+    int len = strlen(c->text);
+    if (len == 0) return;
+    
+    if (c->text[len - 1] != '\n') {
+        char* newText = (char*)malloc(len + 3); 
+        strcpy(newText, c->text);
+        strcat(newText, "\r\n");
+        free(c->text);
+        c->text = newText;
+    }
+}
+
+LRESULT CALLBACK LeftListWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    static POINT ptDown;
+    static BOOL bDragging = FALSE;
+    static int dragIndex = -1;
+    static BOOL bOurCapture = FALSE;
+
+    switch (msg) {
+        case WM_LBUTTONDOWN: {
+            int idx = SendMessage(hwnd, LB_ITEMFROMPOINT, 0, lParam);
+            if (!HIWORD(idx)) {
+                dragIndex = LOWORD(idx);
+                ptDown.x = (short)LOWORD(lParam);
+                ptDown.y = (short)HIWORD(lParam);
+                bDragging = FALSE;
+                
+                if ((wParam & MK_SHIFT) || (wParam & MK_CONTROL)) {
+                    bOurCapture = FALSE;
+                } else {
+                    SendMessage(hwnd, LB_SETSEL, FALSE, -1);
+                    SendMessage(hwnd, LB_SETSEL, TRUE, dragIndex);
+                    
+                    bOurCapture = TRUE;
+                    SetCapture(hwnd);
+                    return 0; 
+                }
+            } else {
+                dragIndex = -1;
+            }
+            break; 
+        }
+        case WM_MOUSEMOVE: {
+            if (bOurCapture && dragIndex != -1 && (wParam & MK_LBUTTON)) {
+                int x = (short)LOWORD(lParam);
+                int y = (short)HIWORD(lParam);
+                if (!bDragging) {
+                    if (abs(x - ptDown.x) > GetSystemMetrics(SM_CXDRAG) ||
+                        abs(y - ptDown.y) > GetSystemMetrics(SM_CYDRAG)) {
+                        bDragging = TRUE;
+                    }
+                }
+                if (bDragging) {
+                    SetCursor(LoadCursor(NULL, IDC_HAND));
+                    return 0; 
+                }
+            }
+            break;
+        }
+        case WM_LBUTTONUP: {
+            if (bOurCapture) {
+                ReleaseCapture();
+                bOurCapture = FALSE;
+                
+                if (bDragging && dragIndex != -1) {
+                    bDragging = FALSE;
+                    int x = (short)LOWORD(lParam);
+                    int y = (short)HIWORD(lParam);
+                    
+                    int idx = SendMessage(hwnd, LB_ITEMFROMPOINT, 0, MAKELPARAM(x, y));
+                    int dropIndex = LOWORD(idx);
+                    
+                    if (HIWORD(idx)) {
+                        dropIndex = SendMessage(hwnd, LB_GETCOUNT, 0, 0) - 1;
+                    }
+                    
+                    if (dropIndex >= 0 && dropIndex != dragIndex) {
+                        MoveLeftChunk(dragIndex, dropIndex);
+                        PopulateList(hwnd, g_LeftChunks);
+                        
+                        SendMessage(hwnd, LB_SETSEL, FALSE, -1);
+                        SendMessage(hwnd, LB_SETSEL, TRUE, dropIndex);
+                        
+                        SetStatus("Function order changed (will apply on save).");
+                    }
+                } else if (dragIndex != -1) {
+                    SendMessage(hwnd, LB_SETSEL, FALSE, -1);
+                    SendMessage(hwnd, LB_SETSEL, TRUE, dragIndex);
+                }
+                dragIndex = -1;
+                return 0; 
+            }
+            dragIndex = -1;
+            bDragging = FALSE;
+            break;
+        }
+    }
+    return CallWindowProc(OldListProc, hwnd, msg, wParam, lParam);
+}
+
+void MoveLeftChunk(int fromIdx, int toIdx) {
+    if (fromIdx == toIdx || fromIdx < 0 || toIdx < 0) return;
+
+    int pCount = 0;
+    Chunk* curr = g_LeftChunks;
+    while (curr) {
+        if (curr->isProc) pCount++;
+        curr = curr->next;
+    }
+
+    if (pCount == 0 || fromIdx >= pCount) return;
+    if (toIdx >= pCount) toIdx = pCount - 1;
+
+    ProcGroup* groups = (ProcGroup*)malloc(sizeof(ProcGroup) * pCount);
+    
+    Chunk* headerHead = NULL;
+    Chunk* headerTail = NULL;
+    curr = g_LeftChunks;
+
+    if (curr && !curr->isProc) {
+        headerHead = curr;
+        while (curr && !curr->isProc) {
+            headerTail = curr;
+            curr = curr->next;
+        }
+    }
+
+    int idx = 0;
+    while (curr && idx < pCount) {
+        groups[idx].head = curr;
+        Chunk* tail = curr;
+        curr = curr->next;
+        
+        while (curr && !curr->isProc) {
+            tail = curr;
+            curr = curr->next;
+        }
+        groups[idx].tail = tail;
+        idx++;
+    }
+
+    ProcGroup movingGroup = groups[fromIdx];
+    if (fromIdx < toIdx) {
+        for (int i = fromIdx; i < toIdx; i++) {
+            groups[i] = groups[i + 1];
+        }
+    } else {
+        for (int i = fromIdx; i > toIdx; i--) {
+            groups[i] = groups[i - 1];
+        }
+    }
+    groups[toIdx] = movingGroup;
+
+    g_LeftChunks = headerHead ? headerHead : groups[0].head;
+    
+    if (headerTail) {
+        EnsureCRLF(headerTail);
+        headerTail->next = groups[0].head;
+    }
+
+    for (int i = 0; i < pCount; i++) {
+        EnsureCRLF(groups[i].tail); 
+        if (i < pCount - 1) {
+            groups[i].tail->next = groups[i + 1].head;
+        } else {
+            groups[i].tail->next = NULL;
+        }
+    }
+
+    free(groups);
+}
 
 char* my_strdup(const char* s) {
     char* d = (char*)malloc(strlen(s) + 1);
@@ -111,7 +301,6 @@ void ExtractMasmName(const char* line, char* procName) {
     }
 }
 
-// Pre-processor strips comments/strings to avoid confusing the syntactical parsers
 void CleanLineForParsing(const char* line, char* cleanLine, int* globalInBlock) {
     int i = 0, j = 0;
     while (line[i]) {
@@ -748,6 +937,125 @@ void OnCompile() {
     }
 }
 
+void OnCopyLeft() {
+    int count = SendMessage(hListLeft, LB_GETSELCOUNT, 0, 0);
+    if (count <= 0) {
+        SetStatus("No procedures selected in the left list.");
+        return;
+    }
+
+    int* indices = (int*)malloc(count * sizeof(int));
+    SendMessage(hListLeft, LB_GETSELITEMS, count, (LPARAM)indices);
+
+    int totalLen = 0;
+    char** selectedNames = (char**)malloc(count * sizeof(char*));
+    
+    for (int i = 0; i < count; i++) {
+        selectedNames[i] = (char*)malloc(256);
+        SendMessage(hListLeft, LB_GETTEXT, indices[i], (LPARAM)selectedNames[i]);
+        
+        Chunk* l = g_LeftChunks;
+        while (l) {
+            if (l->isProc && strcmp(l->name, selectedNames[i]) == 0) {
+                totalLen += strlen(l->text) + 4; // Buffer space for "\r\n\r\n"
+                break;
+            }
+            l = l->next;
+        }
+    }
+
+    if (totalLen > 0) {
+        char* clipBuf = (char*)malloc(totalLen + 1);
+        clipBuf[0] = '\0';
+
+        for (int i = 0; i < count; i++) {
+            Chunk* l = g_LeftChunks;
+            while (l) {
+                if (l->isProc && strcmp(l->name, selectedNames[i]) == 0) {
+                    strcat(clipBuf, l->text);
+                    if (i < count - 1) {
+                        strcat(clipBuf, "\r\n\r\n"); // Append the 2 CRLF separators
+                    }
+                    break;
+                }
+                l = l->next;
+            }
+            free(selectedNames[i]);
+        }
+        
+        if (OpenClipboard(hMainWindow)) {
+            EmptyClipboard();
+            HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, strlen(clipBuf) + 1);
+            if (hMem) {
+                memcpy(GlobalLock(hMem), clipBuf, strlen(clipBuf) + 1);
+                GlobalUnlock(hMem);
+                SetClipboardData(CF_TEXT, hMem);
+                
+                char msg[256];
+                sprintf(msg, "Copied %d procedures to clipboard.", count);
+                SetStatus(msg);
+            }
+            CloseClipboard();
+        }
+        free(clipBuf);
+    }
+    
+    free(selectedNames);
+    free(indices);
+}
+
+void OnDeleteLeft() {
+    int count = SendMessage(hListLeft, LB_GETSELCOUNT, 0, 0);
+    if (count <= 0) {
+        SetStatus("No procedures selected to delete.");
+        return;
+    }
+
+    int* indices = (int*)malloc(count * sizeof(int));
+    SendMessage(hListLeft, LB_GETSELITEMS, count, (LPARAM)indices);
+
+    char** selectedNames = (char**)malloc(count * sizeof(char*));
+    for (int i = 0; i < count; i++) {
+        selectedNames[i] = (char*)malloc(256);
+        SendMessage(hListLeft, LB_GETTEXT, indices[i], (LPARAM)selectedNames[i]);
+    }
+    free(indices);
+
+    int deletedCount = 0;
+    for (int i = 0; i < count; i++) {
+        Chunk* curr = g_LeftChunks;
+        Chunk* prev = NULL;
+
+        while (curr) {
+            if (curr->isProc && strcmp(curr->name, selectedNames[i]) == 0) {
+                if (prev) {
+                    prev->next = curr->next;
+                } else {
+                    g_LeftChunks = curr->next;
+                }
+                
+                Chunk* toDelete = curr;
+                curr = curr->next;
+                free(toDelete->text);
+                free(toDelete);
+                deletedCount++;
+                break; 
+            } else {
+                prev = curr;
+                curr = curr->next;
+            }
+        }
+        free(selectedNames[i]);
+    }
+    free(selectedNames);
+
+    PopulateList(hListLeft, g_LeftChunks);
+
+    char msg[256];
+    sprintf(msg, "Deleted %d procedures.", deletedCount);
+    SetStatus(msg);
+}
+
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch(msg) {
         case WM_CREATE: {
@@ -756,25 +1064,29 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             icex.dwICC = ICC_BAR_CLASSES;
             InitCommonControlsEx(&icex);
 
-            hComboMru    = CreateWindow("COMBOBOX", "", WS_CHILD | WS_VISIBLE | CBS_DROPDOWN | WS_VSCROLL, 0, 4, 220, 300, hwnd, (HMENU)IDC_MRUCOMBO, NULL, NULL);
-            hBtnBrowse   = CreateWindow("BUTTON", "Browse", WS_CHILD | WS_VISIBLE, 0, 0, 60, 30, hwnd, (HMENU)IDB_BROWSE, NULL, NULL);
-            hBtnPasteRep = CreateWindow("BUTTON", "Paste & Rep", WS_CHILD | WS_VISIBLE, 0, 0, 90, 30, hwnd, (HMENU)IDB_PASTEREPLACE, NULL, NULL);
-            hBtnPaste    = CreateWindow("BUTTON", "Paste", WS_CHILD | WS_VISIBLE, 0, 0, 50, 30, hwnd, (HMENU)IDB_PASTE, NULL, NULL);
-            hBtnUpdate   = CreateWindow("BUTTON", "Update", WS_CHILD | WS_VISIBLE, 0, 0, 60, 30, hwnd, (HMENU)IDB_UPDATE, NULL, NULL);
-            hBtnSave     = CreateWindow("BUTTON", "Save", WS_CHILD | WS_VISIBLE, 0, 0, 50, 30, hwnd, (HMENU)IDB_SAVE, NULL, NULL);
-            hBtnEdit     = CreateWindow("BUTTON", "Edit", WS_CHILD | WS_VISIBLE, 0, 0, 50, 30, hwnd, (HMENU)IDB_EDIT, NULL, NULL);
-            hBtnCompile  = CreateWindow("BUTTON", "Compile", WS_CHILD | WS_VISIBLE, 0, 0, 70, 30, hwnd, (HMENU)IDB_COMPILE, NULL, NULL);
+            hComboMru      = CreateWindow("COMBOBOX", "", WS_CHILD | WS_VISIBLE | CBS_DROPDOWN | WS_VSCROLL, 0, 4, 220, 300, hwnd, (HMENU)IDC_MRUCOMBO, NULL, NULL);
+            hBtnBrowse     = CreateWindow("BUTTON", "Browse", WS_CHILD | WS_VISIBLE, 0, 0, 60, 30, hwnd, (HMENU)IDB_BROWSE, NULL, NULL);
+            hBtnPasteRep   = CreateWindow("BUTTON", "Paste & Rep", WS_CHILD | WS_VISIBLE, 0, 0, 90, 30, hwnd, (HMENU)IDB_PASTEREPLACE, NULL, NULL);
+            hBtnPaste      = CreateWindow("BUTTON", "Paste", WS_CHILD | WS_VISIBLE, 0, 0, 50, 30, hwnd, (HMENU)IDB_PASTE, NULL, NULL);
+            hBtnUpdate     = CreateWindow("BUTTON", "Update", WS_CHILD | WS_VISIBLE, 0, 0, 60, 30, hwnd, (HMENU)IDB_UPDATE, NULL, NULL);
+            hBtnSave       = CreateWindow("BUTTON", "Save", WS_CHILD | WS_VISIBLE, 0, 0, 50, 30, hwnd, (HMENU)IDB_SAVE, NULL, NULL);
+            hBtnEdit       = CreateWindow("BUTTON", "Edit", WS_CHILD | WS_VISIBLE, 0, 0, 50, 30, hwnd, (HMENU)IDB_EDIT, NULL, NULL);
+            hBtnCompile    = CreateWindow("BUTTON", "Compile", WS_CHILD | WS_VISIBLE, 0, 0, 70, 30, hwnd, (HMENU)IDB_COMPILE, NULL, NULL);
+            hBtnCopyLeft   = CreateWindow("BUTTON", "Copy (L)", WS_CHILD | WS_VISIBLE, 0, 0, 70, 30, hwnd, (HMENU)IDB_COPYLEFT, NULL, NULL);
+            hBtnDeleteLeft = CreateWindow("BUTTON", "Delete", WS_CHILD | WS_VISIBLE, 0, 0, 60, 30, hwnd, (HMENU)IDB_DELETELEFT, NULL, NULL);
 
-            hListLeft  = CreateWindowEx(WS_EX_CLIENTEDGE, "LISTBOX", NULL, WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | LBS_NOTIFY, 0, 0, 0, 0, hwnd, (HMENU)IDL_LEFT, NULL, NULL);
+            hListLeft  = CreateWindowEx(WS_EX_CLIENTEDGE, "LISTBOX", NULL, WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | LBS_EXTENDEDSEL, 0, 0, 0, 0, hwnd, (HMENU)IDL_LEFT, NULL, NULL);
             hListRight = CreateWindowEx(WS_EX_CLIENTEDGE, "LISTBOX", NULL, WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | LBS_EXTENDEDSEL, 0, 0, 0, 0, hwnd, (HMENU)IDL_RIGHT, NULL, NULL);
             
+            // Subclass the left listbox to intercept mouse events for drag and drop
+            OldListProc = (WNDPROC)SetWindowLongPtr(hListLeft, GWLP_WNDPROC, (LONG_PTR)LeftListWndProc);
+
             hStatus = CreateWindowEx(0, STATUSCLASSNAME, NULL, WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP, 0, 0, 0, 0, hwnd, (HMENU)IDS_STATUS, NULL, NULL);
             SetStatus("Ready. Release to Public domain.");
             
             LoadMRU();
             PopulateMRUCombo();
 
-            // Enable drag and drop for the main window
             DragAcceptFiles(hwnd, TRUE);
         } break;
 
@@ -782,12 +1094,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             HDROP hDrop = (HDROP)wParam;
             char droppedFile[MAX_PATH];
             
-            // Extract the path of the first file dropped
             if (DragQueryFile(hDrop, 0, droppedFile, MAX_PATH)) {
                 LoadFile(droppedFile);
             }
             
-            // Release memory allocated by the system for the drop operation
             DragFinish(hDrop);
         } break;
 
@@ -811,6 +1121,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             rightX -= 50; MoveWindow(hBtnPaste, rightX, 0, 50, 30, TRUE);
             rightX -= 90; MoveWindow(hBtnPasteRep, rightX, 0, 90, 30, TRUE);
             rightX -= 60; MoveWindow(hBtnBrowse, rightX, 0, 60, 30, TRUE);
+            rightX -= 60; MoveWindow(hBtnDeleteLeft, rightX, 0, 60, 30, TRUE);
+            rightX -= 70; MoveWindow(hBtnCopyLeft, rightX, 0, 70, 30, TRUE);
 
             int comboWidth = rightX - 8;
             if (comboWidth < 100) comboWidth = 100;
@@ -836,6 +1148,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             else if (LOWORD(wParam) == IDB_SAVE) OnSave();
             else if (LOWORD(wParam) == IDB_EDIT) OnEdit();
             else if (LOWORD(wParam) == IDB_COMPILE) OnCompile();
+            else if (LOWORD(wParam) == IDB_COPYLEFT) OnCopyLeft();
+            else if (LOWORD(wParam) == IDB_DELETELEFT) OnDeleteLeft();
         } break;
 
         case WM_DESTROY:

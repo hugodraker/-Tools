@@ -546,10 +546,30 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                     ShellExecute(NULL, "open", "notepad.exe", filepath, NULL, SW_SHOWNORMAL);
                 }
             }
-            else if (LOWORD(wParam) == ID_BTN_COMPILE) {
-                SaveSettings();
-                CompileFile();
-            }
+else if (LOWORD(wParam) == ID_BTN_COMPILE) {
+    char filepath[MAX_PATH];
+    GetWindowText(hFileCombo, filepath, MAX_PATH);
+    
+    if (strlen(filepath) > 0) {
+        // Find if the current typed text already exists in the dropdown
+        int idx = SendMessage(hFileCombo, CB_FINDSTRINGEXACT, -1, (LPARAM)filepath);
+        
+        // If it exists, remove it from its current position
+        if (idx != CB_ERR) {
+            SendMessage(hFileCombo, CB_DELETESTRING, idx, 0);
+        }
+        
+        // Insert the text at the very top (index 0)
+        SendMessage(hFileCombo, CB_INSERTSTRING, 0, (LPARAM)filepath);
+        
+        // Set the top item as the active selection
+        SendMessage(hFileCombo, CB_SETCURSEL, 0, 0);
+    }
+
+    // Save the newly ordered list to the INI file, then compile
+    SaveSettings();
+    CompileFile();
+}
             else if (LOWORD(wParam) == ID_BTN_RUN) {
                 char filepath[MAX_PATH];
                 GetWindowText(hFileCombo, filepath, MAX_PATH);
