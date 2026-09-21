@@ -68,6 +68,7 @@
 #define IDM_PART_COMPACT   3028
 #define IDM_PART_REPLACE_BOOT 3029
 #define IDM_PART_DEFRAG    3034
+#define IDM_PART_DIAGNOSE_RAW  3037
 
 #define IDM_DISK_MBR_STD     3030
 #define IDM_DISK_TRIM        3031
@@ -89,6 +90,9 @@
 
 #define IDM_MRU_1          3101
 #define IDM_MRU_SEP        3100
+
+#define GET_MFT_SEQ(idx) ((idx >= 2 && idx <= 15) ? (u64)(idx) : 1ULL)
+#define MAKE_MFT_REF(idx) ((u64)(idx) | (GET_MFT_SEQ(idx) << 48))
 
 /* ============================================================ TYPEDEFS */
 typedef unsigned char      u8;
@@ -170,6 +174,12 @@ static int g_view_mode = 0; // 0 = MBR Partitions, 1 = FS Files
 #define NTFS_VOLUME_CHKDSK_RAN       0x0080
 #define NTFS_VOLUME_MODIFIED_CHKDSK  0x4000
 
+#define ADD_ATTR(func) do { \
+    u8 *_old_p = p; \
+    p = (func); \
+    wr16le(_old_p + 0x0E, attr_id++); \
+} while(0)
+
 u64 g_ntfs_mft_mirr_lcn = 0;
 
 int g_ntfs = 0;
@@ -194,16 +204,17 @@ static int ntfs_import_recursive(const char* host_path, u64 parent_ref);
 static int ntfs_extract_file(u64 mft_ref, const char *dest_path);
 static int ntfs_extract_recursive(u64 mft_ref, const char *host_dir);
 static int ntfs_delete_by_ref(u64 mft_ref);
-static int ntfs_add_file(const char *host_path, const char *name, u64 parent_ref);
 static u64 ntfs_mkdir(const char *name, u64 parent_ref);
 static int read_sec(u32 lba, u8 *buf, u32 count);
 static int write_sec(u32 lba, const u8 *buf, u32 count);
 
-static void ntfs_format_init_record(u8 *rec, u16 flags);
+static void ntfs_format_init_record(u8 *rec, u32 mft_index, u16 flags);
 static u8* ntfs_add_attr_std_info(u8 *p, u64 ntfs_time, u32 file_attr);
-static u8* ntfs_add_attr_file_name(u8 *p, u64 parent_ref, const char *name, u64 ntfs_time, u32 file_attr);
 static u8* ntfs_add_attr_data_nonres(u8 *p, u64 total_clusters, u64 lcn, u64 total_bytes);
 static u8* ntfs_add_attr_index_root(u8 *p);
+
+static u8* ntfs_add_attr_file_name(u8 *p, u64 parent_ref, const char *name, u64 ntfs_time, u32 flags, u64 alloc_sz, u64 data_sz, u8 namespace);
+static void insert_indx_entry(u8 *buf, u64 parent_ref, const char *name, u64 child_ref, int is_dir, u8 namespace);
 
 /* Endian read/write forward declarations */
 static u16 rd16le(const u8 *p);
@@ -216,6 +227,344 @@ static void wr32le(u8 *p, u32 v);
 static void wr64le(u8 *p, u64 v);
 
 /* ============================================================ BYTE HELPERS */
+static void append_indx_entry(u8 *blk, u64 parent_ref, const char *name, u64 child_ref, u32 file_attrs, u8 name_type, u64 alloc_sz, u64 real_sz) {
+    u32 ents_off = rd32le(blk + 0x18) + 0x18;
+    u32 end_off  = rd32le(blk + 0x1C) + 0x18;
+    u8 *dummy = blk + end_off - 0x10;
+    
+    int name_len = 0;
+    while (name[name_len]) name_len++;
+    
+    u32 fn_len = 66 + (name_len * 2);
+    u32 entry_len = (16 + fn_len + 7) & ~7;
+    
+    memmove(dummy + entry_len, dummy, 0x10);
+    
+    u8 *e = dummy;
+    memset(e, 0, entry_len);
+    wr64le(e + 0x00, child_ref);
+    wr16le(e + 0x08, entry_len);
+    wr16le(e + 0x0A, fn_len);
+    wr16le(e + 0x0C, 0); 
+    
+    u8 *fn = e + 16;
+    wr64le(fn + 0x00, parent_ref);
+    u64 ntfs_time = 116444736000000000ULL;
+    for(int i=0; i<4; i++) wr64le(fn + 0x08 + (i*8), ntfs_time);
+    
+    wr64le(fn + 0x28, alloc_sz); 
+    wr64le(fn + 0x30, real_sz); 
+    wr32le(fn + 0x38, file_attrs);
+    
+    fn[0x40] = name_len;
+    fn[0x41] = name_type;
+    for (int i = 0; i < name_len; i++) wr16le(fn + 0x42 + (i * 2), (unsigned char)name[i]);
+    
+    wr32le(blk + 0x1C, end_off - 0x18 + entry_len);
+}
+static void apply_usa_fixup(u8 *blk) {
+    u16 usa_off = rd16le(blk + 0x04);
+    u16 usa_cnt = rd16le(blk + 0x06);
+    u16 usn = 1; 
+    wr16le(blk + usa_off, usn);
+    for (u16 i = 1; i < usa_cnt; i++) {
+        u8 *sec_tail = blk + (i * 512) - 2;
+        wr16le(blk + usa_off + (i * 2), rd16le(sec_tail));
+        wr16le(sec_tail, usn);
+    }
+}
+static void copy_to_clipboard(HWND hwnd, const char* text) {
+    if (!OpenClipboard(hwnd)) return;
+    EmptyClipboard();
+
+    size_t len = strlen(text) + 1;
+    HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, len);
+    if (hMem) {
+        void* ptr = GlobalLock(hMem);
+        if (ptr) {
+            memcpy(ptr, text, len);
+            GlobalUnlock(hMem);
+            SetClipboardData(CF_TEXT, hMem);
+        } else {
+            GlobalFree(hMem);
+        }
+    }
+    CloseClipboard();
+}
+static void insert_indx_entry(u8 *buf, u64 parent_ref, const char *name, u64 child_ref, int is_dir, u8 namespace) {
+    int name_len = 0; while (name[name_len]) name_len++;
+    u32 fn_len = 66 + (name_len * 2);
+    u32 entry_len = (16 + fn_len + 7) & ~7;
+    
+    u32 entries_off = rd32le(buf + 0x18);
+    u8 *curr = buf + 0x18 + entries_off;
+    u8 *insert_pos = NULL;
+
+    /* NTFS Collation Rule 1: Case-Insensitive Alphabetic Sort */
+    while (!(rd16le(curr + 0x0C) & 0x02)) { 
+        u8 *fn = curr + 16;
+        int cur_len = fn[0x40];
+        int cmp = 0;
+        int min_len = name_len < cur_len ? name_len : cur_len;
+        
+        for (int i = 0; i < min_len; i++) {
+            u16 c1 = (unsigned char)name[i];
+            if (c1 >= 'a' && c1 <= 'z') c1 -= 32; 
+            u16 c2 = rd16le(fn + 0x42 + (i * 2));
+            if (c2 >= 'a' && c2 <= 'z') c2 -= 32;
+            if (c1 != c2) { cmp = c1 - c2; break; }
+        }
+        if (cmp == 0) cmp = name_len - cur_len;
+        
+        if (cmp < 0) { insert_pos = curr; break; }
+        curr += rd16le(curr + 0x08); 
+    }
+
+    if (!insert_pos) insert_pos = curr;
+
+    u32 used_size = rd32le(buf + 0x1C);
+    u32 shift_size = (buf + 0x18 + used_size) - insert_pos;
+    memmove(insert_pos + entry_len, insert_pos, shift_size);
+    memset(insert_pos, 0, entry_len);
+    
+    wr64le(insert_pos + 0x00, child_ref);
+    wr16le(insert_pos + 0x08, entry_len);
+    wr16le(insert_pos + 0x0A, fn_len);
+    wr16le(insert_pos + 0x0C, 0);
+    
+    u8 *fn = insert_pos + 16;
+    wr64le(fn + 0x00, parent_ref);
+    u64 ntfs_time = (u64)time(NULL) * 10000000ULL + 116444736000000000ULL;
+    wr64le(fn + 0x08, ntfs_time); wr64le(fn + 0x10, ntfs_time);
+    wr64le(fn + 0x18, ntfs_time); wr64le(fn + 0x20, ntfs_time);
+    wr64le(fn + 0x28, 0); wr64le(fn + 0x30, 0);
+    wr32le(fn + 0x38, is_dir ? (0x10000000 | 0x16) : 0x06);
+    fn[0x40] = name_len;
+    fn[0x41] = namespace; 
+    
+    for (int i = 0; i < name_len; i++) wr16le(fn + 0x42 + (i * 2), (unsigned char)name[i]);
+    wr32le(buf + 0x1C, used_size + entry_len);
+}
+static void init_indx_block(u8 *blk, u64 vcn) {
+    memset(blk, 0, 4096);
+    memcpy(blk, "INDX", 4);
+    wr16le(blk + 0x04, 0x28);               
+    wr16le(blk + 0x06, 9);                  
+    wr64le(blk + 0x08, 0);                  
+    wr64le(blk + 0x10, vcn);                
+    
+    wr32le(blk + 0x18, 0x28);               
+    wr32le(blk + 0x1C, 0x38);               
+    wr32le(blk + 0x20, 4096 - 0x18); 
+    blk[0x24] = 0x00;                       
+    
+    u8 *e = blk + 0x18 + 0x28;              
+    wr64le(e + 0x00, 0);
+    wr16le(e + 0x08, 0x10);                 
+    wr16le(e + 0x0A, 0);                    
+    wr16le(e + 0x0C, 0x02);                 
+    wr16le(e + 0x0E, 0);
+    
+    wr16le(blk + 0x28, 1);                  
+}
+static u8* ntfs_add_attr_data_nonres_empty_named(u8 *p, const char *name) {
+    int name_len = 0;
+    while (name[name_len]) name_len++;
+    
+    u32 name_bytes = name_len * 2;
+    u32 name_off = 0x40;
+    u32 runlist_off = (name_off + name_bytes + 7) & ~7u;
+    
+    /* FIX: Allocate 8 bytes explicitly for the runlist 0x00 terminator */
+    u32 total = runlist_off + 8; 
+    
+    wr32le(p + 0, NTFS_AT_DATA);
+    wr32le(p + 4, total);
+    p[8] = 1; /* NON-RESIDENT */
+    p[9] = name_len;
+    wr16le(p + 0x0A, name_off);
+    
+    /* FIX: ATTR_IS_SPARSE flag for non-resident headers is 0x8000 */
+    wr16le(p + 0x0C, 0x8000); 
+    wr16le(p + 0x0E, 0); 
+    
+    wr64le(p + 0x10, 0); /* VCN Start */
+    wr64le(p + 0x18, 0); /* VCN End */
+    
+    /* FIX: Point the runlist offset to the internal buffer and terminate it */
+    wr16le(p + 0x20, runlist_off); 
+    wr16le(p + 0x22, 0);
+    wr32le(p + 0x24, 0);
+    wr64le(p + 0x28, 0); 
+    wr64le(p + 0x30, 0); 
+    wr64le(p + 0x38, 0); 
+    
+    for (int i = 0; i < name_len; i++) {
+        wr16le(p + name_off + (i * 2), (unsigned char)name[i]);
+    }
+    
+    memset(p + runlist_off, 0, 8); /* Guarantee 0x00 end-of-runlist marker */
+    
+    return p + total;
+}
+static u8* ntfs_add_attr_data_res_usn_max(u8 *p) {
+    u32 total = 64; 
+    wr32le(p + 0, NTFS_AT_DATA);
+    wr32le(p + 4, total);
+    p[8] = 0; p[9] = 4;
+    wr16le(p + 0x0A, 24); wr16le(p + 0x0C, 0); wr16le(p + 0x0E, 0);
+    wr32le(p + 0x10, 32); wr16le(p + 0x14, 32); p[0x16] = 0; p[0x17] = 0;
+    
+    /* Name: "$Max" */
+    p[24] = '$'; p[25] = 0; p[26] = 'M'; p[27] = 0; 
+    p[28] = 'a'; p[29] = 0; p[30] = 'x'; p[31] = 0;
+    
+    u8 *val = p + 32;
+    memset(val, 0, 32);
+    wr64le(val + 0, 0x2000000); /* MaximumSize: 32MB */
+    wr64le(val + 8, 0x400000);  /* AllocationDelta: 4MB */
+    
+    return p + total;
+}
+static u8* ntfs_add_attr_security_descriptor(u8 *p) {
+    /* Self-Relative Security Descriptor granting Everyone: Full Control */
+    u8 sd[] = {
+        0x01, 0x00, 0x04, 0x80, /* Revision=1, Sbz1=0, Control=0x8004 (SE_DACL_PRESENT | SE_SELF_RELATIVE) */
+        0x14, 0x00, 0x00, 0x00, /* OffsetOwner = 20 */
+        0x24, 0x00, 0x00, 0x00, /* OffsetGroup = 36 */
+        0x00, 0x00, 0x00, 0x00, /* OffsetSacl  = 0 */
+        0x34, 0x00, 0x00, 0x00, /* OffsetDacl  = 52 */
+        /* Owner SID: Administrators (S-1-5-32-544) */
+        0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x20, 0x00, 0x00, 0x00, 0x20, 0x02, 0x00, 0x00,
+        /* Group SID: Administrators (S-1-5-32-544) */
+        0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x20, 0x00, 0x00, 0x00, 0x20, 0x02, 0x00, 0x00,
+        /* DACL Header: Rev 2, Size 28, 1 ACE */
+        0x02, 0x00, 0x1C, 0x00, 0x01, 0x00, 0x00, 0x00,
+        /* ACE 1: Access Allowed, Everyone (S-1-1-0), Full Control */
+        0x00, 0x03, 0x14, 0x00, 0xFF, 0x01, 0x1F, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00
+    };
+    u32 sd_len = sizeof(sd); /* Exactly 80 bytes */
+    u32 total = (0x18 + sd_len + 7) & ~7u;
+
+    wr32le(p + 0, 0x50);          /* Attribute: $SECURITY_DESCRIPTOR */
+    wr32le(p + 4, total);         
+    p[8] = 0; p[9] = 0;           
+    wr16le(p + 0x0A, 0x18);       
+    wr16le(p + 0x0C, 0);          
+    wr16le(p + 0x0E, 0);          
+    wr32le(p + 0x10, sd_len);     
+    wr16le(p + 0x14, 0x18);       
+    p[0x16] = 0; p[0x17] = 0;     
+
+    memcpy(p + 0x18, sd, sd_len);
+    memset(p + 0x18 + sd_len, 0, total - (0x18 + sd_len));
+    return p + total;
+}
+static u8* ntfs_add_idx_root_named(u8 *p, const char *name, u32 collation_rule) {
+    u32 name_len = (u32)strlen(name);
+    u32 name_size = name_len * 2;
+    u32 attr_hdr_len = (0x18 + name_size + 7) & ~7u; 
+    u32 content_len = 32 + 16; 
+    u32 total = attr_hdr_len + content_len;
+    
+    wr32le(p + 0, 0x90);
+    wr32le(p + 4, total);
+    p[8] = 0; p[9] = (u8)name_len;
+    wr16le(p + 0x0A, 0x18);       
+    wr16le(p + 0x0C, 0);
+    wr16le(p + 0x0E, 0); 
+    wr32le(p + 0x10, content_len);
+    wr16le(p + 0x14, (u16)attr_hdr_len); 
+    p[0x16] = 0; p[0x17] = 0;
+    
+    for(u32 i = 0; i < name_len; i++) wr16le(p + 0x18 + i * 2, name[i]);
+    memset(p + 0x18 + name_size, 0, attr_hdr_len - (0x18 + name_size));
+    
+    u8 *b = p + attr_hdr_len;
+    wr32le(b + 0x00, 0x00);           
+    wr32le(b + 0x04, collation_rule); 
+    wr32le(b + 0x08, 4096);           
+    b[0x0C] = 1; b[0x0D] = 0; b[0x0E] = 0; b[0x0F] = 0; 
+    
+    wr32le(b + 0x10, 16);            
+    wr32le(b + 0x14, 32);            
+    wr32le(b + 0x18, 32);            
+    wr32le(b + 0x1C, 0);             
+    
+    u8 *e = b + 0x20;
+    wr64le(e + 0x00, 0);            
+    wr16le(e + 0x08, 16);            
+    wr16le(e + 0x0A, 0);            
+    wr16le(e + 0x0C, 0x02);          
+    wr16le(e + 0x0E, 0);            
+    
+    return p + total;
+}
+static u8* ntfs_add_attr_data_res_empty(u8 *p, const char *name) {
+    u32 name_len = name ? (u32)strlen(name) : 0;
+    u32 name_size = name_len * 2;
+    u32 attr_hdr_len = (0x18 + name_size + 7) & ~7u; 
+    u32 total = attr_hdr_len; 
+
+    wr32le(p + 0, 0x80);          
+    wr32le(p + 4, total);         
+    p[8] = 0; p[9] = (u8)name_len;    
+    wr16le(p + 0x0A, 0x18);       
+    wr16le(p + 0x0C, 0);          
+    wr16le(p + 0x0E, 0);          
+    wr32le(p + 0x10, 0);          
+    wr16le(p + 0x14, (u16)attr_hdr_len); 
+    p[0x16] = 0; p[0x17] = 0;     
+
+    if (name_len > 0) {
+        for (u32 i = 0; i < name_len; i++) {
+            wr16le(p + 0x18 + (i * 2), (unsigned char)name[i]);
+        }
+    }
+    
+    memset(p + 0x18 + name_size, 0, total - (0x18 + name_size));
+    return p + total;
+}
+static void print_owner_sid(u8 *sd_data) {
+    u32 owner_off = *(u32*)(sd_data + 0x04); /* Offset to Owner SID */
+    if (owner_off == 0) return;
+    
+    u8 *sid = sd_data + owner_off;
+    u8 revision = sid[0];
+    u8 sub_auth_count = sid[1];
+    
+    /* Identifier Authority is a 48-bit Big-Endian value (usually 5 for NT Authority) */
+    u64 authority = 0;
+    for (int i = 0; i < 6; i++) {
+        authority = (authority << 8) | sid[2 + i];
+    }
+    
+    printf("Owner SID: S-%d-%llu", revision, authority);
+    
+    /* Sub-Authorities are 32-bit Little-Endian */
+    for (int i = 0; i < sub_auth_count; i++) {
+        u32 sub_auth = *(u32*)(sid + 8 + (i * 4));
+        printf("-%u", sub_auth);
+    }
+    printf("\n");
+}
+static void vhd_update_checksum(u8 *footer) {
+    u32 sum = 0;
+    /* Zero out the old checksum at offset 0x40 (64) */
+    footer[64] = 0; footer[65] = 0; footer[66] = 0; footer[67] = 0;
+    
+    /* Sum all bytes */
+    for (int i = 0; i < 512; i++) {
+        sum += footer[i];
+    }
+    
+    /* Write 1's complement (Big Endian) */
+    sum = ~sum;
+    footer[64] = (sum >> 24) & 0xFF;
+    footer[65] = (sum >> 16) & 0xFF;
+    footer[66] = (sum >> 8)  & 0xFF;
+    footer[67] = sum & 0xFF;
+}
 static void build_root_index_block(u8 *blk, u64 ntfs_time) {
     memset(blk, 0, 4096);
     memcpy(blk, "INDX", 4);
@@ -540,6 +889,18 @@ static int vhd_translate_lba(u32 lba, u64 *out_file_offset) {
     return -1;
 }
 static u16 rd16le(const u8 *p) { return (u16)p[0] | ((u16)p[1]<<8); }
+static void write_attr_def(u8 *p, const char *name, u32 type, u32 flags, u64 min_sz, u64 max_sz) {
+    for(int i = 0; name[i]; i++) {
+        p[i * 2] = name[i];
+        p[(i * 2) + 1] = 0;
+    }
+    wr32le(p + 128, type);
+    wr32le(p + 132, 0); 
+    wr32le(p + 136, 0); 
+    wr32le(p + 140, flags);
+    wr64le(p + 144, min_sz);
+    wr64le(p + 152, max_sz);
+}
 static void wr16le(u8 *p, u16 v) { p[0]=(u8)v; p[1]=(u8)(v>>8); }
 static u32 rd32le(const u8 *p) { return (u32)p[0] | ((u32)p[1]<<8) | ((u32)p[2]<<16) | ((u32)p[3]<<24); }
 static void wr32le(u8 *p, u32 v) { p[0]=(u8)v; p[1]=(u8)(v>>8); p[2]=(u8)(v>>16); p[3]=(u8)(v>>24); }
@@ -1996,6 +2357,32 @@ static void delete_lost_items(u32 dir_cluster, u32 max_cluster) {
 }
 
 /* ============================================================ NATIVE NTFS ENGINE */
+static const u8* ntfs_find_attr_named(const u8 *rec, u32 type, const char *name) {
+    u16 attr_off = *(u16*)(rec + 0x14);
+    const u8 *a = rec + attr_off;
+    
+    while (*(u32*)a != 0xFFFFFFFF) {
+        if (*(u32*)a == type) {
+            u8 name_len = a[0x09];
+            u16 name_off = *(u16*)(a + 0x0A);
+            
+            /* Compare UTF-16LE name against standard ASCII string */
+            if (name_len == strlen(name)) {
+                int match = 1;
+                for (int i = 0; i < name_len; i++) {
+                    if (a[name_off + (i * 2)] != name[i] || a[name_off + (i * 2) + 1] != 0) {
+                        match = 0; break;
+                    }
+                }
+                if (match) return a;
+            }
+        }
+        u32 len = *(u32*)(a + 4);
+        if (len == 0) break;
+        a += len;
+    }
+    return NULL;
+}
 static int ntfs_read_mft_record(u64 rec, u8 *buf) {
     if (!g_ntfs) return -1;
     
@@ -2288,36 +2675,43 @@ static int ntfs_list_dir(u64 dir_ref) {
     /* 1. Parse Resident $INDEX_ROOT (Small directories) */
     const u8 *ir = ntfs_find_attr(rec, NTFS_AT_INDEX_ROOT, 0);
     if (ir && !(ir[8] & 1)) {
-        u16 voff = rd16le(ir + 0x14);
-        const u8 *rv = ir + voff; 
-        
-        u32 ents_off = rd32le(rv + 0x10); 
-        u32 end_off  = rd32le(rv + 0x14); 
-        
-        const u8 *base = rv + 0x10;
-        const u8 *e = base + ents_off;
-        const u8 *end = base + end_off;
-        
         u32 attr_len = rd32le(ir + 4);
-        if (end > rv + attr_len) end = rv + attr_len;
+        u16 voff     = rd16le(ir + 0x14);
+        
+        /* Strict bounds checking to prevent crashes on corrupted MFTs */
+        if (voff + 0x20 <= attr_len) {
+            const u8 *rv   = ir + voff;
+            const u8 *base = rv + 0x10; /* Start of Index Node Header */
+            
+            u32 ents_off = rd32le(base + 0x00); 
+            u32 end_off  = rd32le(base + 0x04); 
+            
+            const u8 *e   = base + ents_off;
+            const u8 *end = base + end_off;
+            
+            if (end > ir + attr_len) end = ir + attr_len;
 
-        while (e + 0x10 <= end) {
-            u16 step = rd16le(e + 0x08);
-            u16 flags = rd16le(e + 0x0C);
-            
-            if (step < 0x10 || e + step > end) break;
-            
-            if (!(flags & 0x02)) {
-                FsEntry ne;
-                if (ntfs_index_entry_read(e, &ne)) {
-                    if (strcmp(ne.name, ".") != 0 && strcmp(ne.name, "..") != 0) {
-                        if (g_fs_entry_count < FS_MAX_ENTRIES)
-                            g_fs_entries[g_fs_entry_count++] = ne;
+            while (e + 0x10 <= end) {
+                u16 step  = rd16le(e + 0x08);
+                u16 flags = rd16le(e + 0x0C);
+                
+                if (step < 0x10 || e + step > end) break;
+                
+                /* flag 0x02 indicates the last dummy entry in the node */
+                if (!(flags & 0x02)) {
+                    FsEntry ne;
+                    if (ntfs_index_entry_read(e, &ne)) {
+                        if (strcmp(ne.name, ".") != 0 && strcmp(ne.name, "..") != 0) {
+                            if (g_fs_entry_count < FS_MAX_ENTRIES) {
+                                g_fs_entries[g_fs_entry_count++] = ne;
+                            }
+                        }
                     }
                 }
+                
+                if (flags & 0x02) break; /* Reached end of node list */
+                e += step;
             }
-            if (flags & 0x02) break;
-            e += step;
         }
     }
 
@@ -2325,22 +2719,27 @@ static int ntfs_list_dir(u64 dir_ref) {
     const u8 *ia = ntfs_find_attr(rec, NTFS_AT_INDEX_ALLOC, 0);
     if (ia && (ia[8] & 1)) {
         u64 total = rd64le(ia + 0x30); 
-        static u8 pool[262144];        
-        u64 done = 0;
         
-        while (done < total && done < sizeof(pool)) {
-            u64 want = sizeof(pool) - done;
-            if (want > total - done) want = total - done;
-            
-            int got = ntfs_read_attr_range(rec, ia, done, want, pool + done);
-            if (got <= 0) break;
-            done += (u64)got;
-        }
-        
-        for (u64 b = 0; b + g_ntfs_idx_bytes <= done; b += g_ntfs_idx_bytes) {
-            ntfs_indx_fixup_and_parse(pool + b, 0);
+        /* Allocate EXACTLY one INDX block at a time instead of a 256KB static array. 
+           This supports unlimited directory sizes and avoids stack/BSS bloat. */
+        u8 *idx_block = (u8*)malloc(g_ntfs_idx_bytes);
+        if (idx_block) {
+            for (u64 offset = 0; offset + g_ntfs_idx_bytes <= total; offset += g_ntfs_idx_bytes) {
+                
+                int got = ntfs_read_attr_range(rec, ia, offset, g_ntfs_idx_bytes, idx_block);
+                
+                if (got == (int)g_ntfs_idx_bytes) {
+                    /* Process block. ntfs_indx_fixup_and_parse must apply the 512-byte fixups 
+                       internally and verify the "INDX" signature before trusting the block. */
+                    ntfs_indx_fixup_and_parse(idx_block, 0);
+                } else {
+                    break; /* Truncated read or I/O error */
+                }
+            }
+            free(idx_block);
         }
     }
+    
     return g_fs_entry_count;
 }
 
@@ -2485,156 +2884,82 @@ static u64 ntfs_alloc_clusters(u64 num_clusters, u64 *out_lcn) {
     *out_lcn = found_start;
     return num_clusters;
 }
-static int ntfs_index_insert(u8 *rec, u64 parent_ref, const char *name, u64 child_ref, int is_dir) {
-    u8 *ir = (u8*)ntfs_find_attr(rec, NTFS_AT_INDEX_ROOT, 0);
-    if (!ir) return -2;
-
-    u8 fn[1024]; 
-    memset(fn, 0, sizeof(fn));
-    u64 real_parent_ref = parent_ref | ((u64)rd16le(rec + 0x10) << 48);
-    wr64le(fn, real_parent_ref);
+static int ntfs_index_insert(u8 *mft_rec, u64 parent_ref, const char *name, u64 child_ref, int is_dir) {
+    u8 *p = mft_rec + rd16le(mft_rec + 0x14);
+    u8 *idx_root = NULL;
     
+    /* 1. Find the $INDEX_ROOT attribute */
+    while (rd32le(p) != 0xFFFFFFFF) {
+        if (rd32le(p) == 0x90) { idx_root = p; break; }
+        p += rd32le(p + 4);
+    }
+    if (!idx_root) return -1;
+
+    /* 2. Dynamically calculate the offset to the Node Header */
+    u16 content_offset = rd16le(idx_root + 0x14);
+    u8 *node_hdr = idx_root + content_offset + 0x10;
+    u32 first_entry_off = rd32le(node_hdr + 0x00);
+    u32 total_size = rd32le(node_hdr + 0x04);
+    
+    /* 3. Walk the index to find the End of Index (Dummy) entry */
+    u8 *dummy = node_hdr + first_entry_off;
+    while (!(rd16le(dummy + 0x0C) & 0x02)) {
+        dummy += rd16le(dummy + 0x08);
+    }
+    
+    /* 4. Calculate size of the new entry (8-byte aligned) */
+    int name_len = 0;
+    int has_dot = 0;
+    while (name[name_len]) {
+        if (name[name_len] == '.') has_dot = 1;
+        name_len++;
+    }
+    
+    u32 fn_len = 66 + (name_len * 2);
+    u32 entry_len = (16 + fn_len + 7) & ~7; 
+    
+    /* 5. CRITICAL FIX: Shift everything from dummy to the end of the used MFT record */
+    u32 bytes_in_use = rd32le(mft_rec + 0x18);
+    u32 remaining = bytes_in_use - (u32)(dummy - mft_rec);
+    memmove(dummy + entry_len, dummy, remaining);
+    
+    /* 6. Populate the new Index Entry */
+    u8 *e = dummy;
+    memset(e, 0, entry_len);
+    wr64le(e + 0x00, child_ref);
+    wr16le(e + 0x08, entry_len);
+    wr16le(e + 0x0A, fn_len);
+    wr16le(e + 0x0C, 0); 
+    
+    /* 7. Populate the inner File Name attribute */
+    u8 *fn = e + 16;
+    wr64le(fn + 0x00, parent_ref);
     u64 ntfs_time = (u64)time(NULL) * 10000000ULL + 116444736000000000ULL;
-    for (int t = 0; t < 4; t++) wr64le(fn + 8 + t * 8, ntfs_time);
+    wr64le(fn + 0x08, ntfs_time);
+    wr64le(fn + 0x10, ntfs_time);
+    wr64le(fn + 0x18, ntfs_time);
+    wr64le(fn + 0x20, ntfs_time);
+    wr64le(fn + 0x28, 0); 
+    wr64le(fn + 0x30, 0); 
+    wr32le(fn + 0x38, is_dir ? (0x10000000 | 0x16) : 0x06);
+    fn[0x40] = name_len;
+    fn[0x41] = (name_len > 8 && !has_dot) ? 0x01 : 0x03; 
     
-    u32 namelen = (u32)strlen(name);
-    wr64le(fn + 0x28, 0); wr64le(fn + 0x30, 0);
-    wr32le(fn + 0x38, is_dir ? (0x10000000 | 0x10) : 0x20); 
-    wr32le(fn + 0x3C, 0);
-    fn[0x40] = (u8)namelen; fn[0x41] = 1;
-    for (u32 i = 0; i < namelen; i++) wr16le(fn + 0x42 + i * 2, (u16)(u8)toupper((unsigned char)name[i]));
-    
-    u32 fn_len = 0x42 + namelen * 2;
-    u32 body_len = 0x10 + fn_len; 
-    u32 entry_len = (body_len + 7) & ~7u;
-
-    u16 voff = rd16le(ir + 0x14);
-    u8 *rv = ir + voff;
-
-    /* BRANCH 1: Large Directory (Handles Root Dir INDX Blocks) */
-    if (rv[0x1C] & 1) { 
-        u8 *ia = (u8*)ntfs_find_attr(rec, NTFS_AT_INDEX_ALLOC, 0);
-        if (!ia) return -4;
-        
-        u16 run_off = rd16le(ia + 0x20);
-        int pos = 0; s64 lcn_acc = 0; u64 t_len; s64 t_lcn;
-        if (ntfs_run_next(ia + run_off, &pos, &lcn_acc, &t_len, &t_lcn) <= 0 || t_lcn < 0) return -5;
-        
-        u64 lba = g_ntfs_part_lba + t_lcn * g_ntfs_spc;
-        u8 *blk = (u8*)malloc(g_ntfs_idx_bytes);
-        u32 nsecs = g_ntfs_idx_bytes / 512;
-        
-        if (read_sec((u32)lba, blk, nsecs) != 0 || ntfs_apply_fixups(blk, g_ntfs_idx_bytes) != 0) { free(blk); return -6; }
-        
-        u8 *base = blk + 0x18;
-        u8 *e = base + rd32le(blk + 0x18);
-        u8 *end = base + rd32le(blk + 0x1C);
-        
-        while (e + 0x10 <= end) {
-            u16 step = rd16le(e + 0x08);
-            if (step < 0x10) { free(blk); return -1; }
-            
-            u16 flags = rd16le(e + 0x0C);
-            if (flags & 0x02) break; /* Dummy END entry */
-            
-            /* CRITICAL FIX: Alphabetical Sorting */
-            u8 *cur_fn = e + 0x10;
-            u8 cur_nlen = cur_fn[0x40];
-            u8 *cur_str = cur_fn + 0x42;
-            u8 *new_str = fn + 0x42;
-            
-            u32 min_len = (cur_nlen < namelen) ? cur_nlen : namelen;
-            int diff = 0;
-            for(u32 i = 0; i < min_len; i++) {
-                u16 c1 = rd16le(cur_str + i * 2);
-                u16 c2 = rd16le(new_str + i * 2);
-                if (c1 >= 'a' && c1 <= 'z') c1 -= 32; /* Uppercase current */
-                if (c2 < c1) { diff = -1; break; }
-                if (c2 > c1) { diff = 1; break; }
-            }
-            if (diff == 0) {
-                if (namelen < cur_nlen) diff = -1;
-                else if (namelen > cur_nlen) diff = 1;
-            }
-            if (diff < 0) break; /* Insert before this entry */
-            
-            e += step;
-        }
-        
-        u32 blk_used = rd32le(blk + 0x1C);
-        if (blk_used + entry_len > rd32le(blk + 0x20)) { free(blk); return -8; }
-        
-        memmove(e + entry_len, e, blk_used - (u32)(e - base));
-        wr64le(e + 0, child_ref);
-        wr16le(e + 0x08, (u16)entry_len); wr16le(e + 0x0A, (u16)fn_len); wr32le(e + 0x0C, 0);
-        memcpy(e + 0x10, fn, fn_len);
-        memset(e + 0x10 + fn_len, 0, entry_len - body_len);
-        
-        wr32le(blk + 0x1C, blk_used + entry_len); 
-        
-        u16 usa_off = rd16le(blk + 0x04);
-        u16 usn = (u16)(rd16le(blk + usa_off) + 1);
-        if (usn == 0) usn = 1;
-        wr16le(blk + usa_off, usn);
-        for (u32 i = 0; i < nsecs; i++) {
-            u8 *t = blk + i * 512 + 510;
-            wr16le(blk + usa_off + 2 + i * 2, rd16le(t));
-            wr16le(t, usn);
-        }
-        write_sec((u32)lba, blk, nsecs);
-        free(blk);
-        return 0;
+    for (int i = 0; i < name_len; i++) {
+        wr16le(fn + 0x42 + (i * 2), (unsigned char)name[i]);
     }
     
-    /* BRANCH 2: Small Directory (Resident INDEX_ROOT) */
-    u8 *base = rv + 0x10;
-    u8 *e = base + rd32le(rv + 0x10);
-    u8 *end = base + rd32le(rv + 0x14);
+    /* 8. Safely update tree sizes and MFT usage */
+    wr32le(node_hdr + 0x04, total_size + entry_len);
     
-    while (e + 0x10 <= end) {
-        u16 step = rd16le(e + 0x08);
-        if (step < 0x10) return -1;
-        
-        u16 flags = rd16le(e + 0x0C);
-        if (flags & 0x02) break;
-        
-        u8 *cur_fn = e + 0x10;
-        u8 cur_nlen = cur_fn[0x40];
-        u8 *cur_str = cur_fn + 0x42;
-        u8 *new_str = fn + 0x42;
-        
-        u32 min_len = (cur_nlen < namelen) ? cur_nlen : namelen;
-        int diff = 0;
-        for(u32 i = 0; i < min_len; i++) {
-            u16 c1 = rd16le(cur_str + i * 2);
-            u16 c2 = rd16le(new_str + i * 2);
-            if (c1 >= 'a' && c1 <= 'z') c1 -= 32;
-            if (c2 < c1) { diff = -1; break; }
-            if (c2 > c1) { diff = 1; break; }
-        }
-        if (diff == 0) {
-            if (namelen < cur_nlen) diff = -1;
-            else if (namelen > cur_nlen) diff = 1;
-        }
-        if (diff < 0) break;
-        
-        e += step;
-    }
-
-    u32 rec_used = rd32le(rec + 0x18);
-    if (rec_used + entry_len + 8 > rd32le(rec + 0x1C)) return -1; 
-
-    memmove(e + entry_len, e, rec_used - (u32)(e - rec));
-    wr64le(e + 0, child_ref);
-    wr16le(e + 0x08, (u16)entry_len); wr16le(e + 0x0A, (u16)fn_len); wr32le(e + 0x0C, 0);
-    memcpy(e + 0x10, fn, fn_len);
-    memset(e + 0x10 + fn_len, 0, entry_len - body_len);
-
-    wr32le(ir + 0x10, rd32le(ir + 0x10) + entry_len);
-    wr32le(ir + 4, rd32le(ir + 4) + entry_len);
-    wr32le(rv + 0x14, rd32le(rv + 0x14) + entry_len);
-    wr32le(rv + 0x18, rd32le(rv + 0x18) + entry_len);
-    wr32le(rec + 0x18, rec_used + entry_len);
+    u32 attr_len = rd32le(idx_root + 4);
+    u32 attr_content_len = rd32le(idx_root + 0x10);
+    wr32le(idx_root + 4, attr_len + entry_len);
+    wr32le(idx_root + 0x10, attr_content_len + entry_len);
+    
+    /* Update overall MFT bytes in use, ensuring 8-byte alignment */
+    bytes_in_use += entry_len;
+    wr32le(mft_rec + 0x18, (bytes_in_use + 7) & ~7);
     
     return 0;
 }
@@ -2652,13 +2977,14 @@ static int ntfs_add_file(const char *host_path, const char *name, u64 parent_ref
     if (!rec_no) { fclose(fp); return -3; }
 
     u8 rec[8192];
-    ntfs_format_init_record(rec, NTFS_FL_IN_USE);
+    /* CRITICAL FIX: Cast and pass the newly allocated MFT record number */
+    ntfs_format_init_record(rec, (u32)rec_no, NTFS_FL_IN_USE);
     
     u8 *p = rec + 0x38;
     u64 ntfs_time = (u64)time(NULL) * 10000000ULL + 116444736000000000ULL;
 
     p = ntfs_add_attr_std_info(p, ntfs_time, 0x20); /* Archive Flag */
-    p = ntfs_add_attr_file_name(p, parent_ref, name, ntfs_time, 0x20);
+    p = ntfs_add_attr_file_name(p, parent_ref, name, ntfs_time, 0x20, 0, 0, 0x03);
 
     if (sz <= 500) {
         /* Branch A: Resident File (Fits entirely inside MFT Record) */
@@ -2694,7 +3020,9 @@ static int ntfs_add_file(const char *host_path, const char *name, u64 parent_ref
     fclose(fp);
 
     wr32le(p, 0xFFFFFFFF); /* Attribute list terminator */
-    wr32le(rec + 0x18, (u32)(p + 4 - rec));
+    u32 bytes_in_use = (u32)(p + 4 - rec);
+bytes_in_use = (bytes_in_use + 7) & ~7; /* Force 8-byte alignment */
+wr32le(rec + 0x18, bytes_in_use);
 
     if (ntfs_write_mft_record(rec_no, rec) != 0) return -5;
 
@@ -2712,17 +3040,20 @@ static u64 ntfs_mkdir(const char *name, u64 parent_ref) {
     if (!rec_no) return 0;
 
     u8 rec[8192];
-    ntfs_format_init_record(rec, NTFS_FL_IN_USE | NTFS_FL_IS_DIR);
+    /* CRITICAL FIX: Cast and pass the newly allocated MFT record number */
+    ntfs_format_init_record(rec, (u32)rec_no, NTFS_FL_IN_USE | NTFS_FL_IS_DIR);
     
     u8 *p = rec + 0x38;
     u64 ntfs_time = (u64)time(NULL) * 10000000ULL + 116444736000000000ULL;
 
     p = ntfs_add_attr_std_info(p, ntfs_time, 0x10); /* Directory flag */
-    p = ntfs_add_attr_file_name(p, parent_ref, name, ntfs_time, 0x10000000 | 0x10);
+    p = ntfs_add_attr_file_name(p, parent_ref, name, ntfs_time, 0x10000000 | 0x10, 0, 0, 0x03);
     p = ntfs_add_attr_index_root(p);
 
     wr32le(p, 0xFFFFFFFF);
-    wr32le(rec + 0x18, (u32)(p + 4 - rec));
+    u32 bytes_in_use = (u32)(p + 4 - rec);
+bytes_in_use = (bytes_in_use + 7) & ~7; /* Force 8-byte alignment */
+wr32le(rec + 0x18, bytes_in_use);
 
     if (ntfs_write_mft_record(rec_no, rec) != 0) return 0;
 
@@ -2763,17 +3094,31 @@ static int ntfs_import_recursive(const char* host_path, u64 parent_ref) {
     return ntfs_add_file(host_path, basename, parent_ref);
 }
 
-static void ntfs_format_init_record(u8 *rec, u16 flags) {
+static void ntfs_format_init_record(u8 *rec, u32 mft_index, u16 flags) {
     memset(rec, 0, 1024);
     memcpy(rec, "FILE", 4);
-    wr16le(rec + 0x04, 0x30); // USA offset
-    wr16le(rec + 0x06, 3);    // USA count (1 header + 2 sectors)
-    wr16le(rec + 0x10, 1);    // Sequence number
-    wr16le(rec + 0x12, 1);    // Hard link count
-    wr16le(rec + 0x14, 0x38); // Offset to first attribute
-    wr16le(rec + 0x16, flags);
-    wr32le(rec + 0x1C, 1024); // Bytes allocated
-    wr16le(rec + 0x30, 1);    // Initial USN
+    
+    *(u16*)(rec + 0x04) = 0x30; /* USA Offset */
+    *(u16*)(rec + 0x06) = 3;    /* USA Count (1024 / 512 + 1) */
+    *(u64*)(rec + 0x08) = 0;    /* LSN */
+    
+    u16 seq_num = (mft_index >= 2 && mft_index <= 15) ? (u16)mft_index : 1;
+    *(u16*)(rec + 0x10) = seq_num;
+    
+    *(u16*)(rec + 0x12) = 1;    /* Hard link count */
+    *(u16*)(rec + 0x14) = 0x38; /* First attribute offset */
+    *(u16*)(rec + 0x16) = flags;/* Flags (0x01 In-Use, 0x02 Dir) */
+    
+    /* CORRECTED: Force 8-byte alignment immediately */
+    *(u32*)(rec + 0x18) = 0x40; /* Bytes In Use (0x38 + 8 bytes padding) */
+    *(u32*)(rec + 0x1C) = 1024; /* Allocated Size */
+    *(u64*)(rec + 0x20) = 0;    /* Base File Record */
+    *(u16*)(rec + 0x28) = 1;    /* Next Attribute ID */
+    *(u32*)(rec + 0x2C) = mft_index;/* MFT Record Number */
+    
+    /* REMOVED: Premature USN injection at 0x1FE/0x3FE */
+    
+    *(u32*)(rec + 0x38) = 0xFFFFFFFF; /* End of attributes marker */
 }
 
 static int ntfs_encode_run(u8 *out, u64 len, s64 lcn) {
@@ -2798,6 +3143,64 @@ static int ntfs_encode_run(u8 *out, u64 len, s64 lcn) {
     return pos;
 }
 
+static int ntfs_get_security_descriptor(u32 target_sec_id, u8 *out_sd, u32 max_sd_len) {
+    if (target_sec_id == 0) return 0; /* ID 0 means no explicit security applied */
+
+    u8 rec[4096];
+    if (ntfs_read_mft_record(9, rec) != 0) return -1; /* MFT 9 is always $Secure */
+
+    /* Find the $DATA attribute named "$SDS" */
+    const u8 *sds = ntfs_find_attr_named(rec, NTFS_AT_DATA, "$SDS"); 
+    if (!sds) return -2;
+
+    u64 total_size = (sds[8] & 1) ? *(u64*)(sds + 0x30) : *(u32*)(sds + 0x10);
+    
+    u32 chunk_size = 65536; 
+    u8 *chunk = (u8*)malloc(chunk_size);
+    if (!chunk) return -4;
+
+    u64 offset = 0;
+    while (offset < total_size) {
+        u32 want = (total_size - offset > chunk_size) ? chunk_size : (u32)(total_size - offset);
+        
+        /* Assumes your ntfs_read_attr_range uses the runlist decoder */
+        int got = ntfs_read_attr_range(rec, sds, offset, want, chunk);
+        if (got < 0x14) break;
+
+        u32 i = 0;
+        while (i + 0x14 <= (u32)got) {
+            u32 hash   = *(u32*)(chunk + i + 0x00);
+            u32 sec_id = *(u32*)(chunk + i + 0x04);
+            u32 length = *(u32*)(chunk + i + 0x10);
+
+            if (length == 0 || length > 0x100000) { 
+                i += 16; 
+                continue; 
+            }
+
+            if (sec_id == target_sec_id) {
+                /* Target Found: Calculate SD size and read it directly via absolute offset */
+                u32 sd_len = length - 0x14;
+                if (sd_len > max_sd_len) sd_len = max_sd_len;
+                
+                int res = ntfs_read_attr_range(rec, sds, offset + i + 0x14, sd_len, out_sd);
+                free(chunk);
+                return res; /* Returns bytes written to out_sd */
+            }
+
+            /* SDS entries are padded to 16-byte alignments */
+            i += (length + 15) & ~15;
+        }
+        
+        /* If an entry is larger than the remaining chunk, 'i' will correctly 
+           advance 'offset' to the beginning of the next valid entry on the next disk read. */
+        if (i == 0) break; 
+        offset += i; 
+    }
+    
+    free(chunk);
+    return -3; /* Security ID not found */
+}
 static u8* ntfs_add_attr_index_bitmap(u8 *p) {
     u32 total = 0x20;
     wr32le(p + 0, 0xB0); 
@@ -2808,6 +3211,32 @@ static u8* ntfs_add_attr_index_bitmap(u8 *p) {
     p[0x18] = 0x01; /* VCN 0 is allocated */
     memset(p + 0x19, 0, total - 0x19);
     return p + total;
+}
+static void build_upcase_fixed(u8 *buf) {
+    for (u32 i = 0; i < 65536; i++) {
+        u16 c = (u16)i;
+        if (c >= 'a' && c <= 'z') c -= 32; 
+        wr16le(buf + (i * 2), c);
+    }
+}
+static void build_attrdef_fixed(u8 *buf) {
+    memset(buf, 0, 2560);
+    write_attr_def(buf + 0*160, "$STANDARD_INFORMATION", 0x10, 0x40, 48, 72);
+    write_attr_def(buf + 1*160, "$ATTRIBUTE_LIST", 0x20, 0x80, 0, 0xFFFFFFFFFFFFFFFFULL);
+    write_attr_def(buf + 2*160, "$FILE_NAME", 0x30, 0x42, 68, 578);
+    write_attr_def(buf + 3*160, "$OBJECT_ID", 0x40, 0x40, 0, 256);
+    write_attr_def(buf + 4*160, "$SECURITY_DESCRIPTOR", 0x50, 0x80, 0, 0xFFFFFFFFFFFFFFFFULL);
+    write_attr_def(buf + 5*160, "$VOLUME_NAME", 0x60, 0x40, 2, 256);
+    write_attr_def(buf + 6*160, "$VOLUME_INFORMATION", 0x70, 0x40, 12, 12);
+    write_attr_def(buf + 7*160, "$DATA", 0x80, 0x00, 0, 0xFFFFFFFFFFFFFFFFULL); /* 0x00 = Resident or Non-resident */
+    write_attr_def(buf + 8*160, "$INDEX_ROOT", 0x90, 0x40, 0, 0xFFFFFFFFFFFFFFFFULL);
+    write_attr_def(buf + 9*160, "$INDEX_ALLOCATION", 0xA0, 0x80, 0, 0xFFFFFFFFFFFFFFFFULL);
+    write_attr_def(buf + 10*160, "$BITMAP", 0xB0, 0x80, 0, 0xFFFFFFFFFFFFFFFFULL);
+    write_attr_def(buf + 11*160, "$REPARSE_POINT", 0xC0, 0x80, 0, 16384);
+    write_attr_def(buf + 12*160, "$EA_INFORMATION", 0xD0, 0x40, 8, 8);
+    write_attr_def(buf + 13*160, "$EA", 0xE0, 0x00, 0, 65536); /* 0x00 = Resident or Non-resident */
+    write_attr_def(buf + 14*160, "$PROPERTY_SET", 0xF0, 0x80, 0, 0xFFFFFFFFFFFFFFFFULL);
+    write_attr_def(buf + 15*160, "$LOGGED_UTILITY_STREAM", 0x100, 0x80, 0, 65536);
 }
 static u8* ntfs_add_attr_index_alloc(u8 *p, u32 clusters, u64 lcn, u64 bytes) {
     u8 run[16];
@@ -2827,15 +3256,20 @@ static u8* ntfs_add_attr_index_alloc(u8 *p, u32 clusters, u64 lcn, u64 bytes) {
     return p + total;
 }
 static u8* ntfs_add_attr_std_info(u8 *p, u64 ntfs_time, u32 file_attr) {
-    u32 total = 0x18 + 0x48; /* 96 bytes total (72-byte payload for NTFS 3.x) */
+    u32 total = 0x18 + 0x48; /* 96 bytes total payload */
     wr32le(p + 0, 0x10);
     wr32le(p + 4, total);
     p[8] = 0; p[9] = 0;
+    
+    /* FIX: Name offset must point to the end of the header (0x18), even if Name Length is 0 */
+    wr16le(p + 0x0A, 0x18); 
+    
+    wr16le(p + 0x0C, 0);
     wr16le(p + 0x10, 0x48); 
     wr16le(p + 0x14, 0x18);
     for (int i = 0; i < 4; i++) wr64le(p + 0x18 + i * 8, ntfs_time);
     wr32le(p + 0x38, file_attr);
-    memset(p + 0x3C, 0, 0x48 - 0x24); /* Zero-pad remaining NTFS 3.x fields */
+    memset(p + 0x3C, 0, 0x48 - 0x24); 
     return p + total;
 }
 
@@ -2870,30 +3304,6 @@ static u8* ntfs_add_attr_index_root_large(u8 *p) {
 
     return p + total;
 }
-static u8* ntfs_add_attr_file_name(u8 *p, u64 parent_ref, const char *name, u64 ntfs_time, u32 file_attr) {
-    u32 nlen = (u32)strlen(name);
-    u32 fn_body = 0x42 + nlen * 2;
-    u32 total = (0x18 + fn_body + 7) & ~7u;
-
-    wr32le(p + 0, NTFS_AT_FILE_NAME);
-    wr32le(p + 4, total);
-    p[8] = 0; p[9] = 0;
-    wr16le(p + 0x10, (u16)fn_body);
-    wr16le(p + 0x14, 0x18);
-
-    u8 *b = p + 0x18;
-    wr64le(b + 0x00, parent_ref | (parent_ref == NTFS_MFT_ROOT ? ((u64)NTFS_MFT_ROOT << 48) : 0));
-    for (int i = 0; i < 4; i++) wr64le(b + 0x08 + i * 8, ntfs_time);
-    wr64le(b + 0x28, 0);
-    wr64le(b + 0x30, 0);
-    wr32le(b + 0x38, file_attr);
-    b[0x40] = (u8)nlen;
-    b[0x41] = 1;
-    for (u32 i = 0; i < nlen; i++) wr16le(b + 0x42 + i * 2, (u16)(u8)name[i]);
-
-    return p + total;
-}
-
 static u8* ntfs_add_attr_data_nonres(u8 *p, u64 total_clusters, u64 lcn, u64 total_bytes) {
     u8 run[16];
     int rlen = ntfs_encode_run(run, total_clusters, lcn);
@@ -3198,6 +3608,586 @@ static int ntfs_free_clusters(const u8 *runs) {
     free(bitmap);
     return 0;
 }
+static u8* ntfs_add_idx_bitmap_i30(u8 *p, u64 bytes) {
+    u32 attr_len = (32 + bytes + 7) & ~7; 
+    wr32le(p + 0, 0xB0);          
+    wr32le(p + 4, attr_len);      
+    p[8] = 0; p[9] = 4;                                     
+    wr16le(p + 0x0A, 24);         
+    wr16le(p + 0x0C, 0);          
+    wr16le(p + 0x0E, 0);          
+    wr32le(p + 0x10, (u32)bytes);       
+    wr16le(p + 0x14, 32);         
+    p[0x16] = 0; p[0x17] = 0;     
+    
+    p[24] = '$'; p[25] = 0; p[26] = 'I'; p[27] = 0; 
+    p[28] = '3'; p[29] = 0; p[30] = '0'; p[31] = 0;
+    
+    memset(p + 32, 0, attr_len - 32);
+    p[32] = 0x01; 
+    return p + attr_len;
+}
+static u8* ntfs_add_idx_alloc_i30(u8 *p, u32 clusters, u64 lcn, u64 bytes) {
+    u8 run[16];
+    int rlen = ntfs_encode_run(run, clusters, lcn);
+    u32 attr_len = (72 + rlen + 7) & ~7; 
+    
+    wr32le(p + 0, 0xA0);          
+    wr32le(p + 4, attr_len);      
+    p[8] = 1; p[9] = 4;                                     
+    wr16le(p + 0x0A, 64);         
+    wr16le(p + 0x0C, 0);          
+    wr16le(p + 0x0E, 0);          
+    
+    wr64le(p + 16, 0);            
+    wr64le(p + 24, clusters - 1); 
+    wr16le(p + 32, 72);           
+    wr16le(p + 34, 0);            
+    wr32le(p + 36, 0);            
+    
+    /* CORRECTED: Allocated size must align to physical clusters */
+    wr64le(p + 40, (u64)clusters * g_ntfs_clus_size);        
+    wr64le(p + 48, bytes);        
+    wr64le(p + 56, bytes);        
+    
+    p[64] = '$'; p[65] = 0; p[66] = 'I'; p[67] = 0; 
+    p[68] = '3'; p[69] = 0; p[70] = '0'; p[71] = 0;
+    
+    /* CORRECTED: Dynamically generate runlist to support large VHD LCNs */
+    memcpy(p + 72, run, rlen);
+    memset(p + 72 + rlen, 0, attr_len - (72 + rlen));
+    
+    return p + attr_len;
+}
+static u8* ntfs_add_idx_root_i30(u8 *p, int is_large) {
+    u32 entry_len = is_large ? 24 : 16;
+    u32 content_len = 32 + entry_len; 
+    u32 attr_len = (32 + content_len + 7) & ~7; 
+    
+    wr32le(p + 0, 0x90);          
+    wr32le(p + 4, attr_len);            
+    p[8] = 0; p[9] = 4;                                     
+    wr16le(p + 0x0A, 24);         
+    wr16le(p + 0x0C, 0);          
+    wr16le(p + 0x0E, 0); 
+    wr32le(p + 0x10, content_len);         
+    wr16le(p + 0x14, 32);         
+    p[0x16] = 0; p[0x17] = 0;     
+    
+    p[24] = '$'; p[25] = 0; p[26] = 'I'; p[27] = 0; 
+    p[28] = '3'; p[29] = 0; p[30] = '0'; p[31] = 0;
+    
+    u8 *b = p + 32;
+    wr32le(b + 0x00, 0x30);         
+    wr32le(b + 0x04, 0x01);         
+    wr32le(b + 0x08, 4096);         
+    b[0x0C] = 1; b[0x0D] = 0; b[0x0E] = 0; b[0x0F] = 0; 
+    
+    wr32le(b + 0x10, 16);            
+    wr32le(b + 0x14, 16 + entry_len);            
+    wr32le(b + 0x18, 16 + entry_len);            
+    wr32le(b + 0x1C, is_large ? 1 : 0);            
+    
+    u8 *e = b + 0x20;
+    wr64le(e + 0x00, 0);            
+    wr16le(e + 0x08, entry_len);            
+    wr16le(e + 0x0A, 0);            
+    wr16le(e + 0x0C, is_large ? 0x03 : 0x02);          
+    wr16le(e + 0x0E, 0);            
+    if (is_large) wr64le(e + 0x10, 0);
+    
+    memset(p + 32 + content_len, 0, attr_len - (32 + content_len));
+    return p + attr_len;
+}
+static int ntfs_delete_by_ref(u64 mft_ref) {
+    u8 rec[8192];
+    if (ntfs_read_mft_record(mft_ref, rec) != 0) return -1;
+    
+    /* 1. Extract Parent Directory MFT Reference */
+    const u8 *fn = ntfs_find_attr(rec, NTFS_AT_FILE_NAME, 0);
+    u64 parent_ref = NTFS_MFT_ROOT;
+    if (fn && !(fn[8] & 1)) {
+        u16 voff = rd16le(fn + 0x14);
+        parent_ref = rd64le(fn + voff) & 0x0000FFFFFFFFFFFFULL;
+    }
+
+    /* 2. Free Data Clusters in $Bitmap */
+    const u8 *data = ntfs_find_attr(rec, NTFS_AT_DATA, 0);
+    if (data && (data[8] & 1)) { /* Only non-resident data occupies clusters */
+        u16 run_off = rd16le(data + 0x20);
+        ntfs_free_clusters(data + run_off);
+    }
+
+    /* 3. Strip file from Parent Folder UI */
+    ntfs_index_remove(parent_ref, mft_ref);
+
+    /* 4. Kill the MFT Record */
+    u16 fl = rd16le(rec + 0x16);
+    wr16le(rec + 0x16, (u16)(fl & ~NTFS_FL_IN_USE));
+    
+    if (ntfs_write_mft_record(mft_ref, rec) != 0) return -2;
+
+    return 0;
+}
+
+/* ============================================================ NTFS FORMATTER */
+static int fs_format_ntfs_ex(int part_idx, int mark_dirty) {
+    if (!g_vhd.isOpen || !g_vhd.parts[part_idx].used) return -1;
+    u64 nsec = (u64)g_vhd.parts[part_idx].lba_count;
+    if (nsec < 20480) return -2; 
+
+    u32 part_lba = g_vhd.parts[part_idx].lba_begin;
+    u32 spc = 8;
+    u32 clus_sz = spc * 512;
+    u64 tot_clusters = nsec / spc;
+    if (tot_clusters < 100) return -2;
+
+    u32 mft_clusters = 64; 
+    u64 mft_lcn = 4;
+    u64 mft_mirr_lcn = mft_lcn + mft_clusters;
+    u32 mft_mirr_clusters = (4096 + clus_sz - 1) / clus_sz; 
+
+    u64 logfile_lcn = mft_mirr_lcn + mft_mirr_clusters;
+    u32 logfile_clusters = (2048 * 1024) / clus_sz;
+    if (logfile_clusters > tot_clusters / 8) logfile_clusters = (u32)(tot_clusters / 8);
+    if (logfile_clusters < 32) logfile_clusters = 32;
+    u64 logfile_bytes = (u64)logfile_clusters * clus_sz;
+
+    u64 bitmap_lcn = logfile_lcn + logfile_clusters;
+    u32 bitmap_clusters = (u32)(((tot_clusters + 7) / 8 + clus_sz - 1) / clus_sz);
+    if (bitmap_clusters == 0) bitmap_clusters = 1;
+
+    u64 attrdef_lcn = bitmap_lcn + bitmap_clusters;
+    u32 attrdef_clusters = (2560 + clus_sz - 1) / clus_sz;
+
+    u64 upcase_lcn = attrdef_lcn + attrdef_clusters;
+    u32 upcase_clusters = (131072 + clus_sz - 1) / clus_sz; 
+
+    u64 root_idx_lcn = upcase_lcn + upcase_clusters;
+    u32 root_idx_clusters = (4096 + clus_sz - 1) / clus_sz;
+
+    u64 extend_idx_lcn = root_idx_lcn + root_idx_clusters;
+    u32 extend_idx_clusters = (4096 + clus_sz - 1) / clus_sz;
+
+    u32 boot_clusters = (8192 + clus_sz - 1) / clus_sz;
+    u64 total_sys_clusters = extend_idx_lcn + extend_idx_clusters;
+    if (total_sys_clusters >= tot_clusters) return -3;
+
+    ShowProgress(TRUE);
+
+    u8 vbr[512] = {0};
+    vbr[0] = 0xEB; vbr[1] = 0x52; vbr[2] = 0x90;
+    memcpy(vbr + 3, "NTFS    ", 8);
+    wr16le(vbr + 0x0B, 512);
+    vbr[0x0D] = (u8)spc;
+    vbr[0x15] = 0xF8;
+    wr16le(vbr + 0x18, 63);
+    wr16le(vbr + 0x1A, 255);
+    wr32le(vbr + 0x1C, part_lba);
+    wr64le(vbr + 0x28, nsec - 1);
+    wr64le(vbr + 0x30, mft_lcn);
+    wr64le(vbr + 0x38, mft_mirr_lcn);
+    vbr[0x40] = 0xF6; vbr[0x44] = 0xF4; 
+    u64 serial = 0xA24C9E710F823B5DULL ^ (u64)time(NULL);
+    wr64le(vbr + 0x48, serial);
+    vbr[510] = 0x55; vbr[511] = 0xAA;
+
+    write_sec(part_lba, vbr, 1);
+    if (nsec > 1) write_sec(part_lba + (u32)nsec - 1, vbr, 1);
+
+    u8 z[512] = {0};
+    for (u32 s = 1; s < 16; s++) write_sec(part_lba + s, z, 1);
+    
+    u32 wipe_mft_c = (tot_clusters > 512) ? 512 : (u32)tot_clusters;
+    for (u32 c = 0; c < wipe_mft_c; c++) {
+        u32 sec = part_lba + (u32)(mft_lcn + c) * spc;
+        for (u32 s = 0; s < spc; s++) write_sec(sec + s, z, 1);
+    }
+
+    u8 ff[512];
+    memset(ff, 0xFF, sizeof(ff));
+    for (u32 c = 0; c < logfile_clusters; c++) {
+        u32 sec = part_lba + (u32)(logfile_lcn + c) * spc;
+        for (u32 s = 0; s < spc; s++) write_sec(sec + s, ff, 1);
+    }
+    for (u32 c = 0; c < bitmap_clusters; c++) {
+        u32 sec = part_lba + (u32)(bitmap_lcn + c) * spc;
+        for (u32 s = 0; s < spc; s++) write_sec(sec + s, z, 1);
+    }
+
+    u8 *sys_buf = (u8*)calloc(upcase_clusters, clus_sz);
+    if (sys_buf) {
+        build_attrdef_fixed(sys_buf);
+        write_sec(part_lba + (u32)attrdef_lcn * spc, sys_buf, attrdef_clusters * spc);
+        memset(sys_buf, 0, upcase_clusters * clus_sz);
+        build_upcase_fixed(sys_buf);
+        write_sec(part_lba + (u32)upcase_lcn * spc, sys_buf, upcase_clusters * spc);
+        free(sys_buf);
+    }
+
+    g_ntfs = 1; g_fat_type = 7; g_ntfs_part_lba = part_lba; g_ntfs_spc = spc;
+    g_ntfs_clus_size = clus_sz; g_ntfs_mft_lcn = mft_lcn; g_ntfs_mft_mirr_lcn = mft_mirr_lcn;
+    g_ntfs_mft_rec = 1024; g_ntfs_idx_bytes = 4096; g_ntfs_cur_dir = NTFS_MFT_ROOT;
+    u64 ntfs_time = 116444736000000000ULL;
+
+    for (u32 r = 0; r <= 27; r++) {
+        if (r >= 16 && r <= 23) continue;
+        
+        u8 rec[1024];
+        memset(rec, 0, 1024);
+        
+        u16 flags = NTFS_FL_IN_USE; 
+        if (r == 5 || r == 11) flags |= NTFS_FL_IS_DIR; 
+        
+        /* FIX: Ensure the 0x04 flag is fully stripped out. Only 0x08 (View Index) belongs here. */
+        if (r == 9 || r == 24 || r == 25 || r == 26) flags |= 0x08; 
+        
+        ntfs_format_init_record(rec, r, flags); 
+        ntfs_write_mft_record(r, rec);
+    }
+
+    u8 *root_indx_buf = (u8*)calloc(1, 4096);
+    init_indx_block(root_indx_buf, 0);
+
+    u64 parent_ref = MAKE_MFT_REF(5);
+    u32 bytes_in_use;
+    
+    const char *base_names[12] = {
+        "$MFT", "$MFTMirr", "$LogFile", "$Volume", "$AttrDef", ".", 
+        "$Bitmap", "$Boot", "$BadClus", "$Secure", "$UpCase", "$Extend"
+    };
+
+    u64 f_alloc[12] = {0}; u64 f_size[12] = {0};
+    f_alloc[0] = (u64)mft_clusters * clus_sz;     f_size[0] = f_alloc[0];
+    f_alloc[1] = 4096;                            f_size[1] = 4096;
+    f_alloc[2] = (u64)logfile_clusters * clus_sz; f_size[2] = logfile_bytes;
+    f_alloc[4] = attrdef_clusters * clus_sz;      f_size[4] = 2560;
+    f_alloc[6] = bitmap_clusters * clus_sz;       f_size[6] = (tot_clusters + 7) / 8;
+    f_alloc[7] = boot_clusters * clus_sz;         f_size[7] = 8192;
+    f_alloc[10]= upcase_clusters * clus_sz;       f_size[10]= 131072;
+
+    #define APPEND_ATTR(func) do { u8 *_old = p; p = (func); wr16le(_old + 0x0E, attr_id++); } while(0)
+
+    for(int i=0; i<3; i++) {
+        u8 rec[1024];
+        ntfs_read_mft_record(i, rec);
+        u8 *p = rec + 0x38; u16 attr_id = 0;
+        
+        APPEND_ATTR(ntfs_add_attr_std_info(p, ntfs_time, 0x06));
+        APPEND_ATTR(ntfs_add_attr_file_name(p, parent_ref, base_names[i], ntfs_time, 0x06, f_alloc[i], f_size[i], 0x03));
+        u32 clu = (u32)(f_alloc[i] / clus_sz);
+        u64 lcn = (i==0) ? mft_lcn : (i==1 ? mft_mirr_lcn : logfile_lcn);
+        APPEND_ATTR(ntfs_add_attr_data_nonres(p, clu, lcn, f_size[i]));
+        
+        if (i == 0) {
+            u8 *start_p = p;
+            u32 total_records = mft_clusters * (clus_sz / 1024);
+            u32 bmp_bytes = (total_records + 7) / 8;
+            u32 attr_len = (24 + bmp_bytes + 7) & ~7; 
+            wr32le(p, 0xB0); wr32le(p + 4, attr_len);
+            p[8] = 0; p[9] = 0; 
+            wr16le(p + 0x0A, 0); wr16le(p + 0x0C, 0); wr16le(p + 0x0E, attr_id++);
+            wr32le(p + 0x10, bmp_bytes); wr16le(p + 0x14, 24);
+            p[0x16] = 0; p[0x17] = 0;
+            memset(p + 24, 0, attr_len - 24);
+            
+            p[24] = 0xFF; p[25] = 0xFF; 
+            p[26] = 0x00; p[27] = 0x0F; 
+            p += attr_len;
+        }
+        
+        wr32le(p, 0xFFFFFFFF); wr16le(rec + 0x28, attr_id); 
+        bytes_in_use = (u32)(p + 4 - rec);
+        wr32le(rec + 0x18, (bytes_in_use + 7) & ~7);
+        ntfs_write_mft_record(i, rec);
+    }
+
+    /* 3: $Volume */
+    {
+        u8 rec[1024];
+        ntfs_read_mft_record(3, rec);
+        u8 *p = rec + 0x38; u16 attr_id = 0;
+        APPEND_ATTR(ntfs_add_attr_std_info(p, ntfs_time, 0x06));
+        APPEND_ATTR(ntfs_add_attr_file_name(p, parent_ref, base_names[3], ntfs_time, 0x06, 0, 0, 0x03));
+        
+        u8 *start_p = p;
+        wr32le(p, NTFS_AT_VOLUME_NAME); wr32le(p + 4, 40); 
+        p[8] = 0; p[9] = 0; wr16le(p + 0x0A, 0); wr16le(p + 0x0C, 0); wr16le(p + 0x0E, attr_id++); 
+        wr32le(p + 0x10, 16); wr16le(p + 0x14, 0x18); p[0x16] = 0; p[0x17] = 0;
+        memcpy(p + 0x18, "N\0T\0F\0S\0_\0V\0H\0D\0", 16); p += 40;
+        
+        start_p = p;
+        wr32le(p, 0x70); wr32le(p + 4, 40); 
+        p[8] = 0; p[9] = 0; wr16le(p + 0x0A, 0); wr16le(p + 0x0C, 0); wr16le(p + 0x0E, attr_id++); 
+        wr32le(p + 0x10, 12); wr16le(p + 0x14, 0x18); p[0x16] = 0; p[0x17] = 0;
+        memset(p + 0x18, 0, 16); 
+        p[0x18 + 8] = 3; p[0x18 + 9] = 1; p[0x18 + 10] = mark_dirty ? NTFS_VOLUME_IS_DIRTY : 0; 
+        p += 40;
+        
+        APPEND_ATTR(ntfs_add_attr_data_res_empty(p, NULL));
+        wr32le(p, 0xFFFFFFFF); wr16le(rec + 0x28, attr_id);
+        bytes_in_use = (u32)(p + 4 - rec);
+        wr32le(rec + 0x18, (bytes_in_use + 7) & ~7);
+        ntfs_write_mft_record(3, rec);
+    }
+
+    /* 4: $AttrDef */
+    {
+        u8 rec[1024];
+        ntfs_read_mft_record(4, rec);
+        u8 *p = rec + 0x38; u16 attr_id = 0;
+        APPEND_ATTR(ntfs_add_attr_std_info(p, ntfs_time, 0x06));
+        APPEND_ATTR(ntfs_add_attr_file_name(p, parent_ref, base_names[4], ntfs_time, 0x06, f_alloc[4], f_size[4], 0x03));
+        APPEND_ATTR(ntfs_add_attr_data_nonres(p, attrdef_clusters, attrdef_lcn, f_size[4]));
+        wr32le(p, 0xFFFFFFFF); wr16le(rec + 0x28, attr_id);
+        bytes_in_use = (u32)(p + 4 - rec);
+        wr32le(rec + 0x18, (bytes_in_use + 7) & ~7);
+        ntfs_write_mft_record(4, rec);
+    }
+
+    /* 5: Root Directory (.) */
+    {
+        u8 rec[1024];
+        ntfs_read_mft_record(5, rec);
+        u8 *p = rec + 0x38; u16 attr_id = 0;
+        
+        APPEND_ATTR(ntfs_add_attr_std_info(p, ntfs_time, 0x16));
+        APPEND_ATTR(ntfs_add_attr_file_name(p, parent_ref, base_names[5], ntfs_time, 0x10000016, 0, 0, 0x03));
+        
+        APPEND_ATTR(ntfs_add_idx_root_i30(p, 1));
+        APPEND_ATTR(ntfs_add_idx_alloc_i30(p, root_idx_clusters, root_idx_lcn, 4096));
+        APPEND_ATTR(ntfs_add_idx_bitmap_i30(p, 8));
+        
+        wr32le(p, 0xFFFFFFFF); wr16le(rec + 0x28, attr_id);
+        bytes_in_use = (u32)(p + 4 - rec);
+        wr32le(rec + 0x18, (bytes_in_use + 7) & ~7);
+        ntfs_write_mft_record(5, rec);
+    }
+
+    /* 6: $Bitmap */
+    {
+        u8 rec[1024];
+        ntfs_read_mft_record(6, rec);
+        u8 *p = rec + 0x38; u16 attr_id = 0;
+        APPEND_ATTR(ntfs_add_attr_std_info(p, ntfs_time, 0x06));
+        APPEND_ATTR(ntfs_add_attr_file_name(p, parent_ref, base_names[6], ntfs_time, 0x06, f_alloc[6], f_size[6], 0x03));
+        APPEND_ATTR(ntfs_add_attr_data_nonres(p, bitmap_clusters, bitmap_lcn, f_size[6]));
+        wr32le(p, 0xFFFFFFFF); wr16le(rec + 0x28, attr_id);
+        bytes_in_use = (u32)(p + 4 - rec);
+        wr32le(rec + 0x18, (bytes_in_use + 7) & ~7);
+        ntfs_write_mft_record(6, rec);
+    }
+
+    /* 7: $Boot */
+    {
+        u8 rec[1024];
+        ntfs_read_mft_record(7, rec);
+        u8 *p = rec + 0x38; u16 attr_id = 0;
+        APPEND_ATTR(ntfs_add_attr_std_info(p, ntfs_time, 0x06));
+        APPEND_ATTR(ntfs_add_attr_file_name(p, parent_ref, base_names[7], ntfs_time, 0x06, f_alloc[7], f_size[7], 0x03));
+        APPEND_ATTR(ntfs_add_attr_data_nonres(p, boot_clusters, 0, f_size[7])); 
+        wr32le(p, 0xFFFFFFFF); wr16le(rec + 0x28, attr_id);
+        bytes_in_use = (u32)(p + 4 - rec);
+        wr32le(rec + 0x18, (bytes_in_use + 7) & ~7);
+        ntfs_write_mft_record(7, rec);
+    }
+
+    /* 8: $BadClus */
+    {
+        u8 rec[1024];
+        ntfs_read_mft_record(8, rec);
+        u8 *p = rec + 0x38; u16 attr_id = 0;
+        APPEND_ATTR(ntfs_add_attr_std_info(p, ntfs_time, 0x06));
+        APPEND_ATTR(ntfs_add_attr_file_name(p, parent_ref, base_names[8], ntfs_time, 0x06, 0, 0, 0x03));
+        APPEND_ATTR(ntfs_add_attr_data_res_empty(p, NULL));
+
+        u8 *start_p = p;
+        wr32le(p, 0x80); wr32le(p + 4, 32); p[8] = 0; p[9] = 4;
+        wr16le(p + 0x0A, 24); wr16le(p + 0x0C, 0); wr16le(p + 0x0E, attr_id++);
+        wr32le(p + 0x10, 0); wr16le(p + 0x14, 32); p[0x16] = 0; p[0x17] = 0;
+        const char *bad_name = "$Bad";
+        for (int i=0; i<4; i++) { p[24 + i*2] = bad_name[i]; p[24 + i*2 + 1] = 0; }
+        p += 32;
+
+        wr32le(p, 0xFFFFFFFF); wr16le(rec + 0x28, attr_id);
+        bytes_in_use = (u32)(p + 4 - rec);
+        wr32le(rec + 0x18, (bytes_in_use + 7) & ~7);
+        ntfs_write_mft_record(8, rec);
+    }
+
+    /* 9: $Secure */
+    {
+        u8 rec[1024];
+        ntfs_read_mft_record(9, rec);
+        u8 *p = rec + 0x38; u16 attr_id = 0;
+        
+        APPEND_ATTR(ntfs_add_attr_std_info(p, ntfs_time, 0x06));
+        /* FIX: $Secure is universally treated as a View Index file in Windows */
+        APPEND_ATTR(ntfs_add_attr_file_name(p, parent_ref, base_names[9], ntfs_time, 0x20000006, 0, 0, 0x03));
+        
+        APPEND_ATTR(ntfs_add_attr_data_res_empty(p, NULL));   
+        APPEND_ATTR(ntfs_add_attr_data_res_empty(p, "$SDS")); 
+        
+        APPEND_ATTR(ntfs_add_idx_root_named(p, "$SDH", 0x12)); 
+        APPEND_ATTR(ntfs_add_idx_root_named(p, "$SII", 0x10)); 
+
+        wr32le(p, 0xFFFFFFFF); wr16le(rec + 0x28, attr_id);
+        bytes_in_use = (u32)(p + 4 - rec);
+        wr32le(rec + 0x18, (bytes_in_use + 7) & ~7);
+        ntfs_write_mft_record(9, rec);
+    }
+
+    /* 10: $UpCase */
+    {
+        u8 rec[1024];
+        ntfs_read_mft_record(10, rec);
+        u8 *p = rec + 0x38; u16 attr_id = 0;
+        APPEND_ATTR(ntfs_add_attr_std_info(p, ntfs_time, 0x06));
+        APPEND_ATTR(ntfs_add_attr_file_name(p, parent_ref, base_names[10], ntfs_time, 0x06, f_alloc[10], f_size[10], 0x03));
+        APPEND_ATTR(ntfs_add_attr_data_nonres(p, upcase_clusters, upcase_lcn, f_size[10]));
+        wr32le(p, 0xFFFFFFFF); wr16le(rec + 0x28, attr_id);
+        bytes_in_use = (u32)(p + 4 - rec);
+        wr32le(rec + 0x18, (bytes_in_use + 7) & ~7);
+        ntfs_write_mft_record(10, rec);
+    }
+
+    /* 11: $Extend */
+    {
+        u8 rec[1024];
+        ntfs_read_mft_record(11, rec);
+        u8 *p = rec + 0x38; u16 attr_id = 0;
+        APPEND_ATTR(ntfs_add_attr_std_info(p, ntfs_time, 0x16));
+        APPEND_ATTR(ntfs_add_attr_file_name(p, parent_ref, base_names[11], ntfs_time, 0x10000016, 0, 0, 0x03));
+        
+        APPEND_ATTR(ntfs_add_idx_root_i30(p, 1)); 
+        APPEND_ATTR(ntfs_add_idx_alloc_i30(p, extend_idx_clusters, extend_idx_lcn, 4096));
+        APPEND_ATTR(ntfs_add_idx_bitmap_i30(p, 8));
+
+        wr32le(p, 0xFFFFFFFF); wr16le(rec + 0x28, attr_id);
+        bytes_in_use = (u32)(p + 4 - rec);
+        wr32le(rec + 0x18, (bytes_in_use + 7) & ~7);
+        ntfs_write_mft_record(11, rec);
+    }
+
+    /* 12-15: System Reservoirs */
+    for (u32 r = 12; r <= 15; r++) {
+        u8 rec[1024];
+        ntfs_read_mft_record(r, rec);
+        u8 *p = rec + 0x38; 
+        u16 attr_id = 0;
+        
+        APPEND_ATTR(ntfs_add_attr_std_info(p, ntfs_time, 0x06));
+        APPEND_ATTR(ntfs_add_attr_data_res_empty(p, NULL)); 
+        
+        wr32le(p, 0xFFFFFFFF); 
+        wr16le(rec + 0x28, attr_id); 
+        bytes_in_use = (u32)(p + 4 - rec);
+        wr32le(rec + 0x18, (bytes_in_use + 7) & ~7);
+        ntfs_write_mft_record(r, rec);
+    }
+
+    /* FIX: MFT 24-27 ($ObjId, $Quota, $Reparse, $UsnJrnl) */
+    const char *ext_names[4] = { "$ObjId", "$Quota", "$Reparse", "$UsnJrnl" };
+    u64 ext_parent = MAKE_MFT_REF(11);
+    
+    for (u32 i = 0; i < 4; i++) {
+        u32 r = 24 + i;
+        u8 rec[1024];
+        ntfs_read_mft_record(r, rec);
+        u8 *p = rec + 0x38; 
+        u16 attr_id = 0;
+        
+        u32 fn_attrs = (i == 3) ? 0x0206 : 0x20000006; 
+        
+        /* FIX: Ensure standard_information absolutely DOES NOT contain the 0x20000000 view flag. */
+        u32 std_attrs = (i == 3) ? 0x0206 : 0x06; 
+        
+        APPEND_ATTR(ntfs_add_attr_std_info(p, ntfs_time, std_attrs));
+        APPEND_ATTR(ntfs_add_attr_file_name(p, ext_parent, ext_names[i], ntfs_time, fn_attrs, 0, 0, 0x03));
+        
+        /* 24, 25, 26 have empty unnamed data streams */
+        if (i < 3) {
+            APPEND_ATTR(ntfs_add_attr_data_res_empty(p, NULL));
+        }
+        
+        if (i == 0) {
+            APPEND_ATTR(ntfs_add_idx_root_named(p, "$O", 0x13)); 
+        } else if (i == 1) {
+            APPEND_ATTR(ntfs_add_idx_root_named(p, "$O", 0x11)); 
+            APPEND_ATTR(ntfs_add_idx_root_named(p, "$Q", 0x10));
+        } else if (i == 2) {
+            APPEND_ATTR(ntfs_add_idx_root_named(p, "$R", 0x13));
+        } else if (i == 3) {
+            /* FIX: Pass only $Max for $UsnJrnl. Let CHKDSK generate the complex sparse $J data stream automatically to avoid structural rejections */
+            APPEND_ATTR(ntfs_add_attr_data_res_usn_max(p));
+        }
+        
+        wr32le(p, 0xFFFFFFFF); 
+        wr16le(rec + 0x28, attr_id); 
+        bytes_in_use = (u32)(p + 4 - rec);
+        wr32le(rec + 0x18, (bytes_in_use + 7) & ~7);
+        ntfs_write_mft_record(r, rec);
+    }
+    
+    #undef APPEND_ATTR
+
+    int root_order[] = {4, 8, 6, 7, 11, 2, 0, 1, 9, 10, 3, 5}; 
+    for(int i = 0; i < 12; i++) {
+        int idx = root_order[i];
+        
+        u32 attrs = 0x06; 
+        if (idx == 11) attrs = 0x10000016; 
+        else if (idx == 9) attrs = 0x20000006; /* FIX: Mirrored the 0x20 View Index flag for $Secure to avoid potential issues */
+        else if (idx == 5) attrs = 0x10000016; 
+
+        append_indx_entry(root_indx_buf, parent_ref, base_names[idx], MAKE_MFT_REF(idx), attrs, 0x03, f_alloc[idx], f_size[idx]);
+    }
+
+    apply_usa_fixup(root_indx_buf);
+    write_sec(part_lba + (u32)root_idx_lcn * spc, root_indx_buf, 4096 / 512);
+    free(root_indx_buf);
+
+    u8 *ext_indx_buf = (u8*)calloc(1, 4096);
+    init_indx_block(ext_indx_buf, 0);
+
+    u64 ext_mfts[4] = { 24, 25, 26, 27 };
+    for(int i = 0; i < 4; i++) {
+        u32 fn_attrs = (i == 3) ? 0x0206 : 0x20000006;
+        append_indx_entry(ext_indx_buf, ext_parent, ext_names[i], MAKE_MFT_REF(ext_mfts[i]), fn_attrs, 0x03, 0, 0);
+    }
+
+    apply_usa_fixup(ext_indx_buf);
+    write_sec(part_lba + (u32)extend_idx_lcn * spc, ext_indx_buf, 4096 / 512);
+    free(ext_indx_buf);
+
+    u32 bsize = bitmap_clusters * clus_sz;
+    u8 *bmp = (u8*)calloc(1, bsize);
+    if (bmp) {
+        #define MARK_RUN(lcn, count) for(u32 _i=0; _i<(count); _i++) bmp[((lcn) + _i) / 8] |= (1 << (((lcn) + _i) % 8))
+        MARK_RUN(0, boot_clusters);
+        MARK_RUN(mft_lcn, mft_clusters);
+        MARK_RUN(mft_mirr_lcn, mft_mirr_clusters);
+        MARK_RUN(logfile_lcn, logfile_clusters);
+        MARK_RUN(bitmap_lcn, bitmap_clusters);
+        MARK_RUN(attrdef_lcn, attrdef_clusters);
+        MARK_RUN(upcase_lcn, upcase_clusters);
+        MARK_RUN(root_idx_lcn, root_idx_clusters);
+        MARK_RUN(extend_idx_lcn, extend_idx_clusters); 
+        
+        for (u64 c = tot_clusters; c < (u64)bsize * 8; c++) {
+            bmp[c / 8] |= (1 << (c % 8));
+        }
+        
+        for (u32 s = 0; s < bitmap_clusters * spc; s++) {
+            write_sec(part_lba + (u32)bitmap_lcn * spc + s, bmp + s * 512, 1);
+        }
+        free(bmp);
+    }
+
+    g_vhd.parts[part_idx].type = 0x07; update_mbr_in_ram();
+    ShowProgress(FALSE); return 0;
+}
+
 static int ntfs_defrag_file(u64 mft_ref, u8 *bitmap, u32 tot_clusters, int *moved) {
     u8 rec[8192];
     if (ntfs_read_mft_record(mft_ref, rec) != 0) return -1;
@@ -3311,38 +4301,6 @@ static int ntfs_defrag_file(u64 mft_ref, u8 *bitmap, u32 tot_clusters, int *move
     (*moved)++;
     return 0;
 }
-static int ntfs_delete_by_ref(u64 mft_ref) {
-    u8 rec[8192];
-    if (ntfs_read_mft_record(mft_ref, rec) != 0) return -1;
-    
-    /* 1. Extract Parent Directory MFT Reference */
-    const u8 *fn = ntfs_find_attr(rec, NTFS_AT_FILE_NAME, 0);
-    u64 parent_ref = NTFS_MFT_ROOT;
-    if (fn && !(fn[8] & 1)) {
-        u16 voff = rd16le(fn + 0x14);
-        parent_ref = rd64le(fn + voff) & 0x0000FFFFFFFFFFFFULL;
-    }
-
-    /* 2. Free Data Clusters in $Bitmap */
-    const u8 *data = ntfs_find_attr(rec, NTFS_AT_DATA, 0);
-    if (data && (data[8] & 1)) { /* Only non-resident data occupies clusters */
-        u16 run_off = rd16le(data + 0x20);
-        ntfs_free_clusters(data + run_off);
-    }
-
-    /* 3. Strip file from Parent Folder UI */
-    ntfs_index_remove(parent_ref, mft_ref);
-
-    /* 4. Kill the MFT Record */
-    u16 fl = rd16le(rec + 0x16);
-    wr16le(rec + 0x16, (u16)(fl & ~NTFS_FL_IN_USE));
-    
-    if (ntfs_write_mft_record(mft_ref, rec) != 0) return -2;
-
-    return 0;
-}
-
-/* ============================================================ NTFS FORMATTER */
 static void ntfs_defrag_recursive(u64 dir_ref, u8 *bitmap, u32 tot_clusters, int *moved) {
     ntfs_list_dir(dir_ref);
     int count = g_fs_entry_count;
@@ -3363,6 +4321,153 @@ static void ntfs_defrag_recursive(u64 dir_ref, u8 *bitmap, u32 tot_clusters, int
         }
     }
     free(entries);
+}
+static void ntfs_diagnose_part(u32 part_lba) {
+    u8 vbr[512];
+    int errors = 0;
+    char status_msg[128];
+
+    if (read_sec(part_lba, vbr, 1) != 0) {
+        SetWindowTextA(g_hStatusBar, "NTFS Diag: [FAIL] Could not read VBR sector.");
+        return;
+    }
+
+    /* 1. Verify VBR Magic Numbers */
+    if (vbr[0] != 0xEB || vbr[1] != 0x52 || vbr[2] != 0x90) errors++;
+    if (memcmp(vbr + 3, "NTFS    ", 8) != 0) errors++;
+    
+    u16 bps = (u16)vbr[0x0B] | ((u16)vbr[0x0C] << 8);
+    if (bps != 512 && bps != 4096) errors++;
+    
+    if (vbr[0x15] != 0xF8) errors++;
+    if (vbr[0x1FE] != 0x55 || vbr[0x1FF] != 0xAA) errors++;
+
+    /* 2. Verify the "Hidden Sectors" Trap */
+    u32 hidden_sectors = (u32)vbr[0x1C] | ((u32)vbr[0x1D] << 8) | ((u32)vbr[0x1E] << 16) | ((u32)vbr[0x1F] << 24);
+    if (hidden_sectors != part_lba) errors++;
+
+    /* 3. Get Geometry Metrics */
+    u32 spc = vbr[0x0D]; 
+    if (spc == 0) {
+        SetWindowTextA(g_hStatusBar, "NTFS Diag: [FAIL] Sectors Per Cluster is 0.");
+        return;
+    }
+
+    u64 total_sectors = (u64)vbr[0x28] | ((u64)vbr[0x29] << 8) | ((u64)vbr[0x2A] << 16) | ((u64)vbr[0x2B] << 24) |
+                        ((u64)vbr[0x2C] << 32) | ((u64)vbr[0x2D] << 40) | ((u64)vbr[0x2E] << 48) | ((u64)vbr[0x2F] << 56);
+    
+    u64 mft_lcn      = (u64)vbr[0x30] | ((u64)vbr[0x31] << 8) | ((u64)vbr[0x32] << 16) | ((u64)vbr[0x33] << 24) |
+                       ((u64)vbr[0x34] << 32) | ((u64)vbr[0x35] << 40) | ((u64)vbr[0x36] << 48) | ((u64)vbr[0x37] << 56);
+    
+    u64 mft_mirr_lcn = (u64)vbr[0x38] | ((u64)vbr[0x39] << 8) | ((u64)vbr[0x3A] << 16) | ((u64)vbr[0x3B] << 24) |
+                       ((u64)vbr[0x3C] << 32) | ((u64)vbr[0x3D] << 40) | ((u64)vbr[0x3E] << 48) | ((u64)vbr[0x3F] << 56);
+
+    /* 4. Total Sectors Sanity & MBR Alignment */
+    if (total_sectors == 0) errors++;
+    
+    for (int i = 0; i < MAX_MBR_PARTS; i++) {
+        if (g_vhd.parts[i].used && g_vhd.parts[i].lba_begin == part_lba) {
+            if (total_sectors > g_vhd.parts[i].lba_count) {
+                errors++; 
+            }
+            break;
+        }
+    }
+
+    /* 5. $MFT & $MFTMirr Out-of-Bounds Check */
+    u64 total_clusters = total_sectors / spc;
+    if (mft_lcn >= total_clusters) errors++;
+    if (mft_mirr_lcn >= total_clusters) errors++;
+
+    /* 6. MFT and Index Record Sizes Check */
+    signed char mft_sz = (signed char)vbr[0x40];
+    if (mft_sz > 0 && mft_sz > 4) errors++;       
+    else if (mft_sz < 0 && mft_sz != -10) errors++; 
+
+    signed char idx_sz = (signed char)vbr[0x44];
+    if (idx_sz > 0 && idx_sz > 16) errors++;
+    else if (idx_sz < 0 && idx_sz < -16) errors++;  
+
+    /* 7. Check the $MFT Target */
+    u64 mft_lba = part_lba + (mft_lcn * spc);
+    u8 mft_rec[512];
+    if (read_sec((u32)mft_lba, mft_rec, 1) != 0) {
+        errors++;
+    } else if (memcmp(mft_rec, "FILE", 4) != 0) {
+        errors++;
+    }
+
+    /* 8. Validate Core System Files (MFT Records 0 through 3) */
+    u32 mft_rec_size = (mft_sz < 0) ? (1U << (-mft_sz)) : ((u32)mft_sz * spc * bps);
+    u32 mft_secs = mft_rec_size / 512;
+    if (mft_secs == 0) mft_secs = 2; /* Failsafe to 1024 bytes */
+    
+    u8 rec_buf[4096]; 
+    for (int i = 0; i <= 3; i++) {
+        u64 rec_lba = mft_lba + (i * mft_secs);
+        
+        if (read_sec((u32)rec_lba, rec_buf, mft_secs) != 0) {
+            errors++;
+            continue;
+        }
+
+        /* Check FRS (File Record Segment) Magic Number */
+        if (memcmp(rec_buf, "FILE", 4) != 0) {
+            errors++;
+            continue;
+        }
+
+        /* Check In-Use Flag (Offset 0x16) */
+        u16 flags = (u16)rec_buf[0x16] | ((u16)rec_buf[0x17] << 8);
+        if (!(flags & 0x01)) {
+            errors++;
+        }
+
+        /* Special Check for Record 3 ($Volume) */
+        if (i == 3) {
+            int found_vol_info = 0;
+            u16 attr_off = (u16)rec_buf[0x14] | ((u16)rec_buf[0x15] << 8);
+            
+            if (attr_off < mft_rec_size) {
+                u8 *a = rec_buf + attr_off;
+                
+                while (a + 8 <= rec_buf + mft_rec_size) {
+                    u32 atype = (u32)a[0] | ((u32)a[1] << 8) | ((u32)a[2] << 16) | ((u32)a[3] << 24);
+                    if (atype == 0xFFFFFFFF) break; 
+                    
+                    if (atype == 0x70) { /* $VOLUME_INFORMATION */
+                        found_vol_info = 1;
+                        u16 data_off = (u16)a[0x14] | ((u16)a[0x15] << 8);
+                        
+                        /* Check NTFS Version (Expected: Major 3, Minor 1) */
+                        if (data_off + 10 <= mft_rec_size) {
+                            u8 major_ver = a[data_off + 8];
+                            u8 minor_ver = a[data_off + 9];
+                            if (major_ver != 3 || minor_ver != 1) {
+                                errors++; 
+                            }
+                        }
+                        break;
+                    }
+                    
+                    u32 alen = (u32)a[4] | ((u32)a[5] << 8) | ((u32)a[6] << 16) | ((u32)a[7] << 24);
+                    if (alen == 0 || a + alen > rec_buf + mft_rec_size) break; 
+                    a += alen;
+                }
+            }
+            if (!found_vol_info) {
+                errors++;
+            }
+        }
+    }
+
+    /* Output Final Results to Statusbar */
+    if (errors == 0) {
+        SetWindowTextA(g_hStatusBar, "NTFS Diag: [PASS] Geometry, Bounds, and VBR valid.");
+    } else {
+        snprintf(status_msg, sizeof(status_msg), "NTFS Diag: [FAIL] Found %d structural error(s).", errors);
+        SetWindowTextA(g_hStatusBar, status_msg);
+    }
 }
 static int ntfs_defrag_partition(int *moved) {
     *moved = 0;
@@ -3412,23 +4517,6 @@ static int ntfs_defrag_partition(int *moved) {
     free(bitmap);
     return 0;
 }
-static u8* ntfs_add_attr_mft_bitmap(u8 *p, u32 total_records) {
-    u32 bytes = (total_records + 7) / 8;
-    u32 total = (0x18 + bytes + 7) & ~7u;
-    wr32le(p + 0, 0xB0); /* $BITMAP */
-    wr32le(p + 4, total);
-    p[8] = 0; p[9] = 0;
-    wr16le(p + 0x10, (u16)bytes);
-    wr16le(p + 0x14, 0x18);
-    
-    u8 *b = p + 0x18;
-    memset(b, 0, bytes);
-    /* Mark records 0-23 as IN USE to protect system files and padding */
-    for (int i = 0; i < 24; i++) b[i / 8] |= (1 << (i % 8));
-    
-    memset(p + 0x18 + bytes, 0, total - (0x18 + bytes));
-    return p + total;
-}
 static int ntfs_set_dirty(int dirty) {
     return ntfs_set_volume_flags(NTFS_VOLUME_IS_DIRTY, dirty ? 1 : 0);
 }
@@ -3441,262 +4529,95 @@ static int ntfs_is_dirty(void) {
     return 0;
 }
 
-static int fs_format_ntfs_ex(int part_idx, int mark_dirty) {
-    if (!g_vhd.isOpen || !g_vhd.parts[part_idx].used) return -1;
-    u64 nsec = (u64)g_vhd.parts[part_idx].lba_count;
-    if (nsec < 20480) return -2; 
+static u8* ntfs_add_attr_file_name(u8 *p, u64 parent_ref, const char *name, u64 ntfs_time, u32 flags, u64 alloc_sz, u64 data_sz, u8 namespace) {
+    int name_len = 0; while (name[name_len]) name_len++;
+    u32 content_len = 66 + (name_len * 2);
+    u32 attr_len = (24 + content_len + 7) & ~7; 
 
-    u32 part_lba = g_vhd.parts[part_idx].lba_begin;
-    u32 spc = 8;
-    u32 clus_sz = spc * 512;
-    u64 tot_clusters = nsec / spc;
-    if (tot_clusters < 100) return -2;
+    wr32le(p + 0, 0x30); wr32le(p + 4, attr_len); p[8] = 0; p[9] = 0;                             
+    wr16le(p + 0x0A, 24); wr16le(p + 0x0C, 0); wr16le(p + 0x0E, 0);                  
+    wr32le(p + 0x10, content_len); wr16le(p + 0x14, 24); p[0x16] = 1; p[0x17] = 0;                          
 
-    u32 mft_clusters = 64; 
-    u64 mft_lcn = 4;
-    u64 mft_mirr_lcn = mft_lcn + mft_clusters;
-    u32 mft_mirr_clusters = 4;
+    wr64le(p + 24, parent_ref); wr64le(p + 32, ntfs_time); wr64le(p + 40, ntfs_time);            
+    wr64le(p + 48, ntfs_time); wr64le(p + 56, ntfs_time);            
+    wr64le(p + 64, alloc_sz); wr64le(p + 72, data_sz);              
+    wr32le(p + 80, flags); wr32le(p + 84, 0);                    
+    p[88] = (u8)name_len; p[89] = namespace; 
 
-    u64 logfile_lcn = mft_mirr_lcn + mft_mirr_clusters;
-    u32 logfile_clusters = (2048 * 1024) / clus_sz;
-    if (logfile_clusters > tot_clusters / 8) logfile_clusters = (u32)(tot_clusters / 8);
-    if (logfile_clusters < 32) logfile_clusters = 32;
-    u64 logfile_bytes = (u64)logfile_clusters * clus_sz;
-
-    u64 bitmap_lcn = logfile_lcn + logfile_clusters;
-    u32 bitmap_clusters = (u32)(((tot_clusters + 7) / 8 + clus_sz - 1) / clus_sz);
-    if (bitmap_clusters == 0) bitmap_clusters = 1;
-
-    u64 attrdef_lcn = bitmap_lcn + bitmap_clusters;
-    u32 attrdef_clusters = (2560 + clus_sz - 1) / clus_sz;
-
-    u64 upcase_lcn = attrdef_lcn + attrdef_clusters;
-    u32 upcase_clusters = (131072 + clus_sz - 1) / clus_sz; 
-
-    u64 root_idx_lcn = upcase_lcn + upcase_clusters;
-    u32 root_idx_clusters = (4096 + clus_sz - 1) / clus_sz;
-
-    u64 total_sys_clusters = root_idx_lcn + root_idx_clusters;
-    if (total_sys_clusters >= tot_clusters) return -3;
-
-    ShowProgress(TRUE);
-
-    u8 vbr[512] = {0};
-    vbr[0] = 0xEB; vbr[1] = 0x52; vbr[2] = 0x90;
-    memcpy(vbr + 3, "NTFS    ", 8);
-    wr16le(vbr + 0x0B, 512);
-    vbr[0x0D] = (u8)spc;
-    vbr[0x15] = 0xF8;
-    wr16le(vbr + 0x18, 63);
-    wr16le(vbr + 0x1A, 255);
-    wr32le(vbr + 0x1C, part_lba);
-    wr64le(vbr + 0x28, nsec - 1);
-    wr64le(vbr + 0x30, mft_lcn);
-    wr64le(vbr + 0x38, mft_mirr_lcn);
-    vbr[0x40] = 0xF6; 
-    vbr[0x44] = 0xF4; /* CRITICAL FIX: Universally forces 4096-byte index blocks (-12 shift) */
-    u64 serial = 0xA24C9E710F823B5DULL ^ (u64)time(NULL);
-    wr64le(vbr + 0x48, serial);
-    vbr[510] = 0x55; vbr[511] = 0xAA;
-
-    write_sec(part_lba, vbr, 1);
-    if (nsec > 1) write_sec(part_lba + (u32)nsec - 1, vbr, 1);
-
-    u8 z[512] = {0};
-    for (u32 s = 1; s < 16; s++) write_sec(part_lba + s, z, 1);
-
-    for (u32 c = 0; c < mft_clusters + mft_mirr_clusters; c++) {
-        u32 sec = part_lba + (u32)(mft_lcn + c) * spc;
-        for (u32 s = 0; s < spc; s++) write_sec(sec + s, z, 1);
-    }
-
-    u8 ff[512];
-    memset(ff, 0xFF, sizeof(ff));
-    for (u32 c = 0; c < logfile_clusters; c++) {
-        u32 sec = part_lba + (u32)(logfile_lcn + c) * spc;
-        for (u32 s = 0; s < spc; s++) write_sec(sec + s, ff, 1);
-    }
-
-    for (u32 c = 0; c < bitmap_clusters; c++) {
-        u32 sec = part_lba + (u32)(bitmap_lcn + c) * spc;
-        for (u32 s = 0; s < spc; s++) write_sec(sec + s, z, 1);
-    }
-
-    u8 *sys_buf = (u8*)calloc(upcase_clusters, clus_sz);
-    if (sys_buf) {
-        build_attrdef(sys_buf);
-        write_sec(part_lba + (u32)attrdef_lcn * spc, sys_buf, attrdef_clusters * spc);
-        
-        memset(sys_buf, 0, upcase_clusters * clus_sz);
-        build_upcase(sys_buf);
-        write_sec(part_lba + (u32)upcase_lcn * spc, sys_buf, upcase_clusters * spc);
-        
-        memset(sys_buf, 0, 4096);
-        u64 ntfs_time = (u64)time(NULL) * 10000000ULL + 116444736000000000ULL;
-        build_root_index_block(sys_buf, ntfs_time);
-        write_sec(part_lba + (u32)root_idx_lcn * spc, sys_buf, 8);
-        free(sys_buf);
-    }
-
-    g_ntfs = 1; g_fat_type = 7; g_ntfs_part_lba = part_lba; g_ntfs_spc = spc;
-    g_ntfs_clus_size = clus_sz; g_ntfs_mft_lcn = mft_lcn; g_ntfs_mft_mirr_lcn = mft_mirr_lcn;
-    g_ntfs_mft_rec = 1024; g_ntfs_idx_bytes = 4096; g_ntfs_cur_dir = NTFS_MFT_ROOT;
-    u64 ntfs_time = (u64)time(NULL) * 10000000ULL + 116444736000000000ULL;
-
-    u32 total_records = mft_clusters * (clus_sz / 1024);
-    for (u32 r = 0; r < total_records; r++) {
-        u8 rec[1024];
-        ntfs_format_init_record(rec, 0);
-        wr32le(rec + 0x18, 0x38 + 8);
-        wr32le(rec + 0x38, 0xFFFFFFFF);
-        ntfs_write_mft_record(r, rec);
-    }
-
-    u64 parent_ref = 5ULL | (1ULL << 48);
-
-    /* 0..2: $MFT, $MFTMirr, $LogFile */
-    {
-        const char *names[3] = {"$MFT", "$MFTMirr", "$LogFile"};
-        u32 clus[3] = {mft_clusters, mft_mirr_clusters, logfile_clusters};
-        u64 lcns[3] = {mft_lcn, mft_mirr_lcn, logfile_lcn};
-        u64 bytes[3] = {(u64)mft_clusters * clus_sz, (u64)mft_mirr_clusters * clus_sz, logfile_bytes};
-        for(int i=0; i<3; i++) {
-            u8 rec[1024];
-            ntfs_format_init_record(rec, NTFS_FL_IN_USE);
-            u8 *p = rec + 0x38;
-            p = ntfs_add_attr_std_info(p, ntfs_time, 0x06);
-            p = ntfs_add_attr_file_name(p, parent_ref, names[i], ntfs_time, 0x06);
-            p = ntfs_add_attr_data_nonres(p, clus[i], lcns[i], bytes[i]);
-            
-            /* Add MFT Bitmap to Record 0 */
-            if (i == 0) p = ntfs_add_attr_mft_bitmap(p, total_records);
-            
-            wr32le(p, 0xFFFFFFFF);
-            wr32le(rec + 0x18, (u32)(p + 4 - rec));
-            ntfs_write_mft_record(i, rec);
-        }
-    }
-
-    /* 3: $Volume */
-    {
-        u8 rec[1024];
-        ntfs_format_init_record(rec, NTFS_FL_IN_USE);
-        u8 *p = rec + 0x38;
-        p = ntfs_add_attr_std_info(p, ntfs_time, 0x06);
-        p = ntfs_add_attr_file_name(p, parent_ref, "$Volume", ntfs_time, 0x06);
-        wr32le(p, NTFS_AT_VOLUME_NAME); wr32le(p + 4, 0x18 + 16);
-        p[8] = 0; p[9] = 0; wr16le(p + 0x10, 16); wr16le(p + 0x14, 0x18);
-        memcpy(p + 0x18, L"NTFS_VHD", 16);
-        p += 0x18 + 16;
-        p = ntfs_add_attr_volume_info(p, 3, 1, NTFS_VOLUME_IS_DIRTY); 
-        wr32le(p, 0xFFFFFFFF);
-        wr32le(rec + 0x18, (u32)(p + 4 - rec));
-        ntfs_write_mft_record(3, rec);
-    }
-
-    /* 4: $AttrDef */
-    {
-        u8 rec[1024];
-        ntfs_format_init_record(rec, NTFS_FL_IN_USE);
-        u8 *p = rec + 0x38;
-        p = ntfs_add_attr_std_info(p, ntfs_time, 0x06);
-        p = ntfs_add_attr_file_name(p, parent_ref, "$AttrDef", ntfs_time, 0x06);
-        p = ntfs_add_attr_data_nonres(p, attrdef_clusters, attrdef_lcn, 2560);
-        wr32le(p, 0xFFFFFFFF);
-        wr32le(rec + 0x18, (u32)(p + 4 - rec));
-        ntfs_write_mft_record(4, rec);
-    }
-
-    /* 5: Root Directory (.) */
-    {
-        u8 rec[1024];
-        ntfs_format_init_record(rec, NTFS_FL_IN_USE | NTFS_FL_IS_DIR);
-        u8 *p = rec + 0x38;
-        p = ntfs_add_attr_std_info(p, ntfs_time, 0x10);
-        p = ntfs_add_attr_file_name(p, parent_ref, ".", ntfs_time, 0x10000000 | 0x06);
-        p = ntfs_add_attr_index_root_large(p);
-        p = ntfs_add_attr_index_alloc(p, root_idx_clusters, root_idx_lcn, 4096);
-        p = ntfs_add_attr_index_bitmap(p);
-        wr32le(p, 0xFFFFFFFF);
-        wr32le(rec + 0x18, (u32)(p + 4 - rec));
-        ntfs_write_mft_record(5, rec);
-    }
-
-    /* 6: $Bitmap */
-    {
-        u8 rec[1024];
-        ntfs_format_init_record(rec, NTFS_FL_IN_USE);
-        u8 *p = rec + 0x38;
-        p = ntfs_add_attr_std_info(p, ntfs_time, 0x06);
-        p = ntfs_add_attr_file_name(p, parent_ref, "$Bitmap", ntfs_time, 0x06);
-        p = ntfs_add_attr_data_nonres(p, bitmap_clusters, bitmap_lcn, (tot_clusters + 7) / 8);
-        wr32le(p, 0xFFFFFFFF);
-        wr32le(rec + 0x18, (u32)(p + 4 - rec));
-        ntfs_write_mft_record(6, rec);
-    }
-
-    /* 7: $Boot */
-    {
-        u8 rec[1024];
-        u32 boot_clusters = (8192 + clus_sz - 1) / clus_sz; /* CRITICAL FIX: Must be 8192 bytes */
-        ntfs_format_init_record(rec, NTFS_FL_IN_USE);
-        u8 *p = rec + 0x38;
-        p = ntfs_add_attr_std_info(p, ntfs_time, 0x06);
-        p = ntfs_add_attr_file_name(p, parent_ref, "$Boot", ntfs_time, 0x06);
-        p = ntfs_add_attr_data_nonres(p, boot_clusters, 0, 8192); 
-        wr32le(p, 0xFFFFFFFF);
-        wr32le(rec + 0x18, (u32)(p + 4 - rec));
-        ntfs_write_mft_record(7, rec);
-    }
-
-    /* 8..11: $BadClus, $Secure, $UpCase, $Extend */
-    {
-        const char *sys_names[4] = {"$BadClus", "$Secure", "$UpCase", "$Extend"};
-        for (int i = 0; i < 4; i++) {
-            u8 rec[1024];
-            ntfs_format_init_record(rec, (i == 3) ? (NTFS_FL_IN_USE | NTFS_FL_IS_DIR) : NTFS_FL_IN_USE);
-            u8 *p = rec + 0x38;
-            p = ntfs_add_attr_std_info(p, ntfs_time, (i == 3) ? 0x10 : 0x06);
-            p = ntfs_add_attr_file_name(p, parent_ref, sys_names[i], ntfs_time, (i == 3) ? 0x10000000 | 0x06 : 0x06);
-            
-            if (i == 0) p = ntfs_add_attr_data_res(p, NULL, 0); 
-            else if (i == 1) p = ntfs_add_attr_data_res(p, NULL, 0); 
-            else if (i == 2) p = ntfs_add_attr_data_nonres(p, upcase_clusters, upcase_lcn, 131072); 
-            else if (i == 3) p = ntfs_add_attr_index_root(p); 
-            
-            wr32le(p, 0xFFFFFFFF);
-            wr32le(rec + 0x18, (u32)(p + 4 - rec));
-            ntfs_write_mft_record(8 + i, rec);
-        }
-    }
-
-    for (u32 r = 0; r < 4; r++) {
-        u8 mrec[1024];
-        ntfs_read_mft_record(r, mrec);
-        u64 mirr_byte_off = mft_mirr_lcn * clus_sz + r * 1024;
-        write_sec(part_lba + (u32)(mirr_byte_off / 512), mrec, 2);
-    }
-
-    u32 bsize = bitmap_clusters * clus_sz;
-    u8 *bmp = (u8*)calloc(1, bsize);
-    if (bmp) {
-        for (u64 c = 0; c < total_sys_clusters; c++) bmp[c / 8] |= (1 << (c % 8));
-        u32 bmp_sec = part_lba + (u32)bitmap_lcn * spc;
-        for (u32 s = 0; s < bitmap_clusters * spc; s++) write_sec(bmp_sec + s, bmp + s * 512, 1);
-        free(bmp);
-    }
-
-    g_vhd.parts[part_idx].type = 0x07;
-    update_mbr_in_ram();
-    ShowProgress(FALSE);
-    return 0;
+    for (int i = 0; i < name_len; i++) wr16le(p + 90 + (i * 2), (unsigned char)name[i]);
+    memset(p + 90 + (name_len * 2), 0, attr_len - (90 + (name_len * 2)));
+    return p + attr_len;
 }
 
-static int fs_format_ntfs(int part_idx) {
-    return fs_format_ntfs_ex(part_idx, 0);
-}
+static void verify_my_generated_record_3_gui(u32 part_lba) {
+    u8 vbr[512];
+    char msg[1024] = {0};
+    char temp[128];
 
-/* ============================================================ UI LISTVIEW */
+    if (read_sec(part_lba, vbr, 1) != 0) {
+        MessageBoxA(g_hMainWnd, "Failed to read VBR sector.", "MFT Record 3 Check", MB_ICONERROR);
+        return;
+    }
+
+    u32 spc = vbr[0x0D]; 
+    u64 mft_lcn = (u64)vbr[0x30] | ((u64)vbr[0x31] << 8) | ((u64)vbr[0x32] << 16) | ((u64)vbr[0x33] << 24);
+    
+    u64 rec3_lba = part_lba + (mft_lcn * spc) + 6; 
+    
+    u8 rec3[1024];
+    if (read_sec((u32)rec3_lba, rec3, 2) != 0) {
+        MessageBoxA(g_hMainWnd, "Failed to read MFT Record 3 sectors.", "MFT Record 3 Check", MB_ICONERROR);
+        return;
+    }
+
+    sprintf(msg, "--- Checking Generated MFT Record 3 ---\n\n");
+    
+    sprintf(temp, "Signature: %.4s\n", rec3);
+    strcat(msg, temp);
+    
+    u16 usa_off = *(u16*)(rec3 + 0x04);
+    sprintf(temp, "USA Offset: %u (Should be 48 / 0x30)\n", usa_off);
+    strcat(msg, temp);
+    
+    sprintf(temp, "USA Count: %u (Should be 3 for 1024b)\n", *(u16*)(rec3 + 0x06));
+    strcat(msg, temp);
+    
+    u16 seq_num = *(u16*)(rec3 + 0x10);
+    sprintf(temp, "Sequence Number: %u (MUST BE 3! If 0 or 1, ntfs.sys crashes)\n", seq_num);
+    strcat(msg, temp);
+    
+    u16 fixup_usn = *(u16*)(rec3 + usa_off); 
+    sprintf(temp, "Fixup USN: %04X\n", fixup_usn);
+    strcat(msg, temp);
+    
+    u16 sec1_end = *(u16*)(rec3 + 0x1FE);
+    sprintf(temp, "Sector 1 End (0x1FE): %04X (Must match Fixup USN)\n", sec1_end);
+    strcat(msg, temp);
+    
+    u16 sec2_end = *(u16*)(rec3 + 0x3FE);
+    sprintf(temp, "Sector 2 End (0x3FE): %04X (Must match Fixup USN)\n", sec2_end);
+    strcat(msg, temp);
+
+    /* ==================================================
+       AUTOMATICALLY COPY THE GATHERED DATA TO CLIPBOARD 
+       ================================================== */
+    copy_to_clipboard(g_hMainWnd, msg);
+
+    /* Automated Failure Detection */
+    if (memcmp(rec3, "FILE", 4) != 0) {
+        strcat(msg, "\n\n[CRITICAL FAILURE]: Missing 'FILE' signature!");
+        MessageBoxA(g_hMainWnd, msg, "MFT Record 3 Check - FAILED", MB_ICONERROR);
+    } else if (seq_num != 3) {
+        strcat(msg, "\n\n[CRITICAL FAILURE]: Sequence Number is NOT 3! This specifically causes the Bad FRS event.");
+        MessageBoxA(g_hMainWnd, msg, "MFT Record 3 Check - FAILED", MB_ICONERROR);
+    } else if (sec1_end != fixup_usn || sec2_end != fixup_usn) {
+        strcat(msg, "\n\n[CRITICAL FAILURE]: Fixup array (USA) not applied to sector ends! ntfs.sys will reject this.");
+        MessageBoxA(g_hMainWnd, msg, "MFT Record 3 Check - FAILED", MB_ICONERROR);
+    } else {
+        strcat(msg, "\n\n[PASS]: Structure looks correct for Record 3.");
+        MessageBoxA(g_hMainWnd, msg, "MFT Record 3 Check - PASSED", MB_ICONINFORMATION);
+    }
+}
 static void set_local_path(const char* path) {
     strcpy(g_current_local_path, path);
     ListView_DeleteAllItems(g_hLocalListView);
@@ -3728,6 +4649,11 @@ static void set_local_path(const char* path) {
     }
 }
 
+static int fs_format_ntfs(int part_idx) {
+    return fs_format_ntfs_ex(part_idx, 0);
+}
+
+/* ============================================================ UI LISTVIEW */
 static void populate_vhd_listview(void) {
     ListView_DeleteAllItems(g_hVhdListView);
     if (!g_vhd.isOpen) return;
@@ -4464,6 +5390,7 @@ AppendMenuA(hFile, MF_STRING, IDM_IMAGE_CLOSE, "&Close");
             AppendMenuA(hPart, MF_STRING, IDM_PART_REPLACE_BOOT, "Replace OS &Boot File...");
             AppendMenuA(hPart, MF_STRING, IDM_PART_FORMAT, "&Format (FAT)...");
 AppendMenuA(hPart, MF_STRING, IDM_PART_FORMAT_NTFS, "Format (&NTFS)...");
+AppendMenuA(hPart, MF_STRING, IDM_PART_DIAGNOSE_RAW, "Diagnose RAW Issue");
 AppendMenuA(hPart, MF_STRING, IDM_PART_NTFS_DIRTY,  "Toggle NTFS &Dirty Flag");
             AppendMenuA(hPart, MF_STRING, IDM_PART_DELETE, "&Delete Partition...");
             AppendMenuA(hMenu, MF_POPUP, (UINT_PTR)hPart, "&Partition");
@@ -4609,13 +5536,14 @@ AppendMenuA(hPart, MF_STRING, IDM_PART_NTFS_DIRTY,  "Toggle NTFS &Dirty Flag");
                     AppendMenuA(hCreatePart, MF_STRING, IDM_PART_CREATE_FAT16L, "FAT16 LBA (0x0E)");
                     AppendMenuA(hCreatePart, MF_SEPARATOR, 0, NULL);
                     AppendMenuA(hCreatePart, MF_STRING, IDM_PART_CREATE_NTFS,   "NTFS/exFAT (0x07)");
-                    
                     AppendMenuA(hMenu, MF_POPUP, (UINT_PTR)hCreatePart, "Create Partition");
                     AppendMenuA(hMenu, MF_STRING, IDM_PART_FORMAT, "Format (FAT)");
 AppendMenuA(hMenu, MF_STRING, IDM_PART_FORMAT_NTFS, "Format (NTFS)");
+AppendMenuA(hMenu, MF_STRING, IDM_PART_DIAGNOSE_RAW, "Diagnose RAW Issue");
 AppendMenuA(hMenu, MF_STRING, IDM_PART_NTFS_DIRTY,  "Toggle NTFS &Dirty Flag");
                     AppendMenuA(hMenu, MF_STRING, IDM_PART_COMPACT, "Compact (Zero Free Space)");
                     AppendMenuA(hMenu, MF_STRING, IDM_PART_DEFRAG, "Defragment Files");
+
                     AppendMenuA(hMenu, MF_STRING, IDM_PART_ACTIVE, "Set Active");
                     AppendMenuA(hMenu, MF_STRING, IDM_PART_RESIZE, "Resize Partition");
                     AppendMenuA(hMenu, MF_STRING, IDM_PART_VBR_FILE, "Write VBR from File");
@@ -4675,6 +5603,18 @@ case IDM_PART_CREATE_NTFS:
         }
     }
     break;
+case IDM_PART_DIAGNOSE_RAW: {
+    if (!g_vhd.isOpen || g_view_mode != 0) break;
+    int sel = ListView_GetNextItem(g_hVhdListView, -1, LVNI_SELECTED);
+    if (sel >= 0 && sel < 4 && g_vhd.parts[sel].used) {
+        ntfs_diagnose_part(g_vhd.parts[sel].lba_begin);
+u32 target_lba = g_vhd.parts[sel].lba_begin;
+verify_my_generated_record_3_gui(target_lba);
+    } else {
+        MessageBoxA(hwnd, "Please select a valid partition.", "VHD Master", MB_ICONWARNING);
+    }
+    break;
+}
 case IDM_PART_NTFS_DIRTY: {
     if (!g_vhd.isOpen) break;
     int sel = (g_view_mode == 0) ? ListView_GetNextItem(g_hVhdListView, -1, LVNI_SELECTED) : -1;
@@ -4709,6 +5649,7 @@ case IDM_PART_FORMAT_NTFS: {
             if (fs_format_ntfs(sel) == 0) {
                 populate_vhd_listview();
                 SetWindowTextA(g_hStatusBar, "Formatted partition as NTFS successfully.");
+
             } else {
                 MessageBoxA(hwnd, "Failed to format NTFS (partition must be >= 10 MB).", "Error", MB_ICONERROR);
             }
