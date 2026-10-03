@@ -11,6 +11,9 @@
  *
  * COMPILATION INSTRUCTIONS:
  *   gcc -Os -s -mwindows -o taskbar.exe taskbar.c -lcomdlg32 -lshell32 -lgdi32 -luser32
+ *
+ * THIS WORK IS NOT FIT FOR ANY FUNCTION OR PURPOSE, COMES WITH NO WARRANTY,
+ * AND IS BEING RELEASED INTO THE PUBLIC DOMAIN.
  * ============================================================================ */
 
 #include <windows.h>
@@ -165,6 +168,9 @@ typedef struct {
     HMENU hMenu;
     char hotkey[16];
 } IniShortcut;
+
+static char g_DropTarget[MAX_PATH] = "";
+static char g_DropName[MAX_PATH] = "";
 
 static HINSTANCE g_hInst;
 static HWND g_hTaskbar = NULL;
@@ -354,7 +360,7 @@ static void SaveAllToIni(void) {
 }
 
 /* --------------------------------------------------------------------------
-   Corrected Shortcut Properties Dialog (Added Memory Scrubbing)
+   Shortcut Dialog Proc (Pre-fills inputs based on the Drag-and-Drop data)
    -------------------------------------------------------------------------- */
 LRESULT CALLBACK ShortcutDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     static HWND hName, hTarget, hParams, hIcon, hMinCheck, hFolderCheck, hMapDirCheck, hParentFolder, hHotkey, hTargetLbl;
@@ -363,7 +369,23 @@ LRESULT CALLBACK ShortcutDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             char name[MAX_PATH] = "", target[MAX_PATH] = "", params[MAX_PATH] = "", iconF[MAX_PATH] = "", parentId[16] = "0"; 
             int minimized = 0, isFolder = 0, bMapDir = 0, vkCode = 0, i;
             
-            if (g_EditShortcutId[0] != '\0') {
+            /* If launched from a drag-and-drop file event */
+            if (g_DropTarget[0] != '\0') {
+                lstrcpy(name, g_DropName);
+                lstrcpy(target, g_DropTarget);
+                lstrcpy(parentId, g_ContextId);
+                
+                DWORD attr = GetFileAttributes(target);
+                if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY)) {
+                    isFolder = 1;
+                    bMapDir = 1;
+                }
+                
+                g_DropTarget[0] = '\0';
+                g_DropName[0] = '\0';
+            } 
+            /* Editing existing shortcut */
+            else if (g_EditShortcutId[0] != '\0') {
                 for (i = 0; i < g_IniShortcutCount; i++) {
                     if (lstrcmp(g_IniShortcuts[i].id, g_EditShortcutId) == 0) {
                         lstrcpy(name, g_IniShortcuts[i].name); lstrcpy(target, g_IniShortcuts[i].exe); lstrcpy(params, g_IniShortcuts[i].params); lstrcpy(iconF, g_IniShortcuts[i].icon);
@@ -522,7 +544,6 @@ LRESULT CALLBACK ShortcutDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 space = strchr(parentSel, ' '); if (space) *space = '\0';
 
                 if (name[0] && (target[0] || SendMessage(hFolderCheck, BM_GETCHECK, 0, 0))) {
-                    /* Fix: Zero out stack memory to prevent garbage strings entering INI */
                     IniShortcut sh; memset(&sh, 0, sizeof(IniShortcut)); 
                     int i, maxId = 0, foundIdx = -1;
                     
@@ -558,7 +579,6 @@ LRESULT CALLBACK ShortcutDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     return DefWindowProc(hwnd, msg, wp, lp);
 }
-
 static void SetFont(HWND hwnd, HFONT font) {
     if (!font) font = (HFONT)GetStockObject(ANSI_VAR_FONT);
     if (!font) font = (HFONT)GetStockObject(SYSTEM_FONT);
@@ -1506,7 +1526,51 @@ LRESULT CALLBACK TaskBtnProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     return CallWindowProc(OldTaskBtnProc, hwnd, msg, wParam, lParam);
 }
 
+/* --------------------------------------------------------------------------
+   Start Button Procedure (Fixed window re-enabling after Drag and Drop)
+   -------------------------------------------------------------------------- */
 LRESULT CALLBACK StartBtnProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_DROPFILES) {
+        HDROP hDrop = (HDROP)wParam;
+        char path[MAX_PATH];
+        if (DragQueryFile(hDrop, 0, path, MAX_PATH)) {
+            SweepDesktopIcons(g_hInst, NULL);
+            lstrcpy(g_DropTarget, path);
+            
+            /* Extract base name and strip extension */
+            char base[MAX_PATH], *p, *dot;
+            lstrcpy(base, path);
+            p = strrchr(base, '\\');
+            if (p) lstrcpy(base, p + 1);
+            dot = strrchr(base, '.');
+            if (dot) *dot = '\0';
+            if (base[0]) {
+                AnsiLower((LPSTR)base);
+                if (base[0] >= 'a' && base[0] <= 'z') base[0] -= 32; 
+            }
+            lstrcpy(g_DropName, base);
+
+            /* Default to the Programs folder */
+            lstrcpy(g_ContextId, "0");
+            int i;
+            for (i = 0; i < g_IniShortcutCount; i++) {
+                if (g_IniShortcuts[i].isFolder && lstrcmpi(g_IniShortcuts[i].name, "Programs") == 0) {
+                    lstrcpy(g_ContextId, g_IniShortcuts[i].id);
+                    break;
+                }
+            }
+            
+            g_ContextIsFolder = TRUE;
+            g_EditShortcutId[0] = '\0';
+            SetForegroundWindow(g_hTaskbar);
+            
+            /* Fix: Explicitly pass g_hTaskbar so the dialog re-enables the correct UI layer */
+            CreateCenteredDialog(g_hInst, g_hTaskbar, "ShortcutDlgClass", "Create Shortcut", 360, 300);
+        }
+        DragFinish(hDrop);
+        return 0;
+    }
+    
     if (msg == WM_ERASEBKGND) return 1; 
     if (msg == WM_PAINT) {
         PAINTSTRUCT ps; HDC hdc = BeginPaint(hwnd, &ps); RECT rc; HBRUSH hBlue, hRed, hGreen, hYellow, hOldBrush, hGray; HPEN hBlack, hOldPen, hShadow, hHighlight, hTL, hBR; BOOL isPushed;
@@ -1557,7 +1621,6 @@ LRESULT CALLBACK StartBtnProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     }
     return CallWindowProc(OldStartBtnProc, hwnd, msg, wParam, lParam);
 }
-
 /* --------------------------------------------------------------------------
    Window Layout and Enum
    -------------------------------------------------------------------------- */
@@ -1709,14 +1772,19 @@ static void SnapToEdge(POINT pt) {
 
 BOOL CALLBACK MinimizeEnumProc(HWND hwnd, LPARAM lParam) {
     if (IsWindowVisible(hwnd) && !IsIconic(hwnd) && IsWindowEnabled(hwnd)) {
-        char cls[64]; GetClassName(hwnd, cls, sizeof(cls));
+        char cls[64], title[128]; 
+        GetClassName(hwnd, cls, sizeof(cls));
+        GetWindowText(hwnd, title, sizeof(title));
+        
+        /* Omit windows named "Desktop" from being minimized */
+        if (lstrcmp(title, "Desktop") == 0) return TRUE;
+        
         if (lstrcmp(cls, "CalmiraTaskbarClass") != 0 && lstrcmp(cls, "Progman") != 0 && lstrcmp(cls, "RunDlgClass") != 0 && lstrcmp(cls, "ShortcutDlgClass") != 0 && lstrcmp(cls, "PromptDlgClass") != 0) {
             ShowWindow(hwnd, SW_MINIMIZE);
         }
     }
     return TRUE;
 }
-
 static void DoShowDesktop(void) { EnumWindows(MinimizeEnumProc, 0); }
 
 static void ApplyLayout(void) {
@@ -1799,7 +1867,7 @@ LRESULT CALLBACK TaskListProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 /* --------------------------------------------------------------------------
-   2. Main TaskbarProc (Properly flags Resize/Drag changes)
+   Main Taskbar Procedure (Added DragAcceptFiles and WM_DROPFILES router)
    -------------------------------------------------------------------------- */
 LRESULT CALLBACK TaskbarProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
@@ -1812,6 +1880,7 @@ LRESULT CALLBACK TaskbarProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             g_hStartBtn = CreateWindow("BUTTON", "Start", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, (HMENU)ID_START_BUTTON, g_hInst, NULL);
             SetFont(g_hStartBtn, g_hFontMenu); 
             OldStartBtnProc = (WNDPROC)SetWindowLongPtr(g_hStartBtn, GWLP_WNDPROC, (LONG_PTR)StartBtnProc);
+            DragAcceptFiles(g_hStartBtn, TRUE); /* Allows the Start Button to physically receive drops */
             
             for (i = 0; i < QUICK_LAUNCH_COUNT; i++) g_hQuickLaunch[i] = CreateWindow("BUTTON", "", WS_CHILD | BS_OWNERDRAW, 0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)(ID_QUICK_BASE + i), g_hInst, NULL);
             if (g_QLActiveCount == 0) {
@@ -1833,6 +1902,10 @@ LRESULT CALLBACK TaskbarProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             SetTimer(hwnd, TIMER_CLOCK, 1000, NULL); SetTimer(hwnd, TIMER_REFRESH, 2000, NULL); SetTimer(hwnd, TIMER_HOTKEY, 100, NULL);
             ApplyLayout(); SweepDesktopIcons(g_hInst, NULL); RunStartupItems(); return 0;
         }
+
+        /* If files are dropped onto the Taskbar background, route it to the Start Menu logic */
+        case WM_DROPFILES:
+            return StartBtnProc(g_hStartBtn, msg, wParam, lParam);
 
         case WM_PAINT: {
             PAINTSTRUCT ps; HDC hdc = BeginPaint(hwnd, &ps); RECT rc; GetClientRect(hwnd, &rc);
@@ -1974,7 +2047,6 @@ LRESULT CALLBACK TaskbarProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         }
 
         case WM_LBUTTONUP: {
-            /* Sets flag to trigger SaveAllToIni() on process exit */
             if (g_bDragging || g_bResizing) { g_bDragging = FALSE; g_bResizing = FALSE; ReleaseCapture(); g_bIniChanged = TRUE; }
             return 0;
         }
@@ -2127,7 +2199,7 @@ LRESULT CALLBACK TaskbarProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 }
             }
             
-            SaveAllToIni(); /* Triggers the full memory-to-disk dump safely */
+            SaveAllToIni();
             
             if (g_hMemODItems) { GlobalUnlock(g_hMemODItems); GlobalFree(g_hMemODItems); }
             if (g_hMemIniShortcuts) { GlobalUnlock(g_hMemIniShortcuts); GlobalFree(g_hMemIniShortcuts); }
@@ -2138,6 +2210,7 @@ LRESULT CALLBACK TaskbarProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     }
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
+
 LRESULT CALLBACK PromptDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     static HWND hEdit, hParentFolder;
     switch(msg) {
