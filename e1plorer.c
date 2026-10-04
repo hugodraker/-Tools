@@ -5,7 +5,7 @@
  *
 * COMPILATION INSTRUCTIONS:
  * Using GCC on Windows (MinGW/MinGW-w64):
- *   gcc -O2 -mwindows -o e1plorer.exe e1plorer.c -lshell32 -lcomdlg32 -lgdi32 -lcomctl32 -lole32 -luuid
+ *   gcc -Os -s -mwindows -o e1plorer.exe e1plorer.c -lshell32 -lcomdlg32 -lgdi32 -lcomctl32 -lole32 -luuid
  *
  * PUBLIC DOMAIN NOTICE
  * Free and unencumbered software released into the public domain.
