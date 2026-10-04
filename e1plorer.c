@@ -402,6 +402,59 @@ void DoRecursiveSearch(ListItemData FAR* FAR* arr, ListItemData FAR* block, cons
     free(subDirs);
 }
 
+LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch(msg) {
+        case WM_CREATE: {
+            char buf[32];
+            CreateWindow("STATIC", "Large Icon Size:", WS_CHILD|WS_VISIBLE, 10, 15, 120, 20, hwnd, NULL, g_hInst, NULL);
+            sprintf(buf, "%d", g_IconSizeLarge);
+            CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", buf, WS_CHILD|WS_VISIBLE|WS_BORDER|WS_TABSTOP, 140, 12, 60, 22, hwnd, (HMENU)101, g_hInst, NULL);
+            
+            CreateWindow("STATIC", "Small Icon Size:", WS_CHILD|WS_VISIBLE, 10, 45, 120, 20, hwnd, NULL, g_hInst, NULL);
+            sprintf(buf, "%d", g_IconSizeSmall);
+            CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", buf, WS_CHILD|WS_VISIBLE|WS_BORDER|WS_TABSTOP, 140, 42, 60, 22, hwnd, (HMENU)102, g_hInst, NULL);
+            
+            CreateWindow("BUTTON", "Show Toolbar", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX|WS_TABSTOP, 10, 80, 150, 20, hwnd, (HMENU)103, g_hInst, NULL);
+            if (g_bShowToolbar) SendMessage(GetDlgItem(hwnd, 103), BM_SETCHECK, 1, 0);
+            
+            CreateWindow("BUTTON", "Show Status Bar", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX|WS_TABSTOP, 10, 105, 150, 20, hwnd, (HMENU)104, g_hInst, NULL);
+            if (g_bShowStatusBar) SendMessage(GetDlgItem(hwnd, 104), BM_SETCHECK, 1, 0);
+            
+            CreateWindow("BUTTON", "OK", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_DEFPUSHBUTTON, 30, 150, 80, 24, hwnd, (HMENU)IDOK, g_hInst, NULL);
+            CreateWindow("BUTTON", "Cancel", WS_CHILD|WS_VISIBLE|WS_TABSTOP, 130, 150, 80, 24, hwnd, (HMENU)IDCANCEL, g_hInst, NULL);
+            return 0;
+        }
+        case WM_COMMAND: {
+            if (wp == IDOK) {
+                char buf[32];
+                if (GetWindowText(GetDlgItem(hwnd, 101), buf, 32)) g_IconSizeLarge = atoi(buf);
+                if (GetWindowText(GetDlgItem(hwnd, 102), buf, 32)) g_IconSizeSmall = atoi(buf);
+                if (g_IconSizeLarge < 16) g_IconSizeLarge = 16;
+                if (g_IconSizeSmall < 8) g_IconSizeSmall = 8;
+                
+                g_bShowToolbar = SendMessage(GetDlgItem(hwnd, 103), BM_GETCHECK, 0, 0);
+                g_bShowStatusBar = SendMessage(GetDlgItem(hwnd, 104), BM_GETCHECK, 0, 0);
+                
+                SaveConfig();
+                
+                HWND hParent = GetParent(hwnd);
+                if (hParent) {
+                    EnableWindow(hParent, TRUE);
+                    RECT rc; GetClientRect(hParent, &rc);
+                    SendMessage(hParent, WM_SIZE, 0, MAKELONG(rc.right, rc.bottom));
+                    InvalidateRect(hParent, NULL, TRUE);
+                }
+                DestroyWindow(hwnd);
+            } else if (wp == IDCANCEL) {
+                HWND hParent = GetParent(hwnd); if (hParent) EnableWindow(hParent, TRUE);
+                DestroyWindow(hwnd);
+            }
+            return 0;
+        }
+        case WM_CLOSE: { HWND hParent = GetParent(hwnd); if (hParent) EnableWindow(hParent, TRUE); DestroyWindow(hwnd); return 0; }
+    }
+    return DefWindowProc(hwnd, msg, wp, lp);
+}
 void ShowTabControls(HWND hwnd, int tab) {
     int i;
     for (i = 600; i <= 610; i++) ShowWindow(GetDlgItem(hwnd, i), tab == 0 ? SW_SHOW : SW_HIDE);
@@ -611,22 +664,29 @@ static void LoadIniShortcuts(void) {
     free(keys); free(val);
     
     {
+        DWORD drives = GetLogicalDrives();
         int d;
         for (d = 0; d < 26 && g_IniShortcutCount < MAX_INI_SHORTCUTS; d++) {
-            char drvPath[8]; sprintf(drvPath, "%c:\\", 'A' + d);
-            int type = GetDriveType(drvPath);
-            if (type == DRIVE_REMOVABLE || type == DRIVE_FIXED || type == DRIVE_REMOTE) {
+            if (drives & (1 << d)) {
+                char drvPath[8]; sprintf(drvPath, "%c:\\", 'A' + d);
+                int type = GetDriveType(drvPath);
                 BOOL exists = FALSE; int j;
                 for (j = 0; j < g_IniShortcutCount; j++) { if (lstrcmpi(g_IniShortcuts[j]->exe, drvPath) == 0 && lstrcmp(g_IniShortcuts[j]->parentId, "0") == 0) { exists = TRUE; break; } }
                 if (!exists) {
                     IniShortcut FAR* sh = (IniShortcut FAR*)malloc(sizeof(IniShortcut));
-                    if (sh) { sprintf(sh->id, "DRV_%c", 'A' + d); sprintf(sh->name, "Local Disk (%c:)", 'A' + d); lstrcpy(sh->exe, drvPath); sh->params[0] = '\0'; sh->icon[0] = '\0'; sh->hotkey[0] = '\0'; lstrcpy(sh->parentId, "0"); sh->minimized = 0; sh->isFolder = TRUE; lstrcpy(sh->minimizedStr, "2"); g_IniShortcuts[g_IniShortcutCount++] = sh; }
+                    if (sh) { 
+                        sprintf(sh->id, "DRV_%c", 'A' + d); 
+                        if (type == DRIVE_CDROM) sprintf(sh->name, "CD Drive (%c:)", 'A' + d);
+                        else if (type == DRIVE_REMOVABLE) sprintf(sh->name, "Removable Disk (%c:)", 'A' + d);
+                        else if (type == DRIVE_REMOTE) sprintf(sh->name, "Network Drive (%c:)", 'A' + d);
+                        else sprintf(sh->name, "Local Disk (%c:)", 'A' + d);
+                        lstrcpy(sh->exe, drvPath); sh->params[0] = '\0'; sh->icon[0] = '\0'; sh->hotkey[0] = '\0'; lstrcpy(sh->parentId, "0"); sh->minimized = 0; sh->isFolder = TRUE; lstrcpy(sh->minimizedStr, "2"); g_IniShortcuts[g_IniShortcutCount++] = sh; 
+                    }
                 }
             }
         }
     }
 }
-
 void GetNewIniId(char* outId) {
     int maxId = 0, i; for (i = 0; i < g_IniShortcutCount; i++) { int id = atoi(g_IniShortcuts[i]->id); if (id > maxId) maxId = id; } sprintf(outId, "%08d", maxId + 1);
 }
@@ -757,6 +817,7 @@ void RecursiveAddTreeVirtual(HWND hTree, const char* parentId, int level, BOOL* 
 static void RebuildTree(HWND hTree, WindowState FAR* state) {
     int i, count, targetOccurrence = 0, currentOccurrence = 0; char targetSel[MAX_PATH]; BOOL rootArr[MAX_TREE_LEVEL]; BOOL targetIsVirtual;
     int selIdx = SendMessage(hTree, LB_GETCURSEL, 0, 0);
+    int topIdx = SendMessage(hTree, LB_GETTOPINDEX, 0, 0);
     if (selIdx != LB_ERR) {
         TreeItemData FAR* selItem = (TreeItemData FAR*)SendMessage(hTree, LB_GETITEMDATA, selIdx, 0);
         if (selItem) {
@@ -777,9 +838,9 @@ static void RebuildTree(HWND hTree, WindowState FAR* state) {
             currentOccurrence++;
         } 
     }
+    SendMessage(hTree, LB_SETTOPINDEX, topIdx, 0);
     SendMessage(hTree, WM_SETREDRAW, TRUE, 0); InvalidateRect(hTree, NULL, TRUE);
 }
-
 void LayoutListItems(HWND hList, ListItemData FAR* FAR* arr, int count, int viewMode) {
     int i;
     SendMessage(hList, WM_SETREDRAW, FALSE, 0);
@@ -933,14 +994,18 @@ static void DrawGDIFolder(HDC hdc, int x, int y, BOOL bOpen, BOOL bSelected, BOO
     if (bOpen) {
         Rectangle(hdc, x + 2, y, x + tabW, y + tabH);
         Rectangle(hdc, x, y + tabH - 2, x + w - 2, y + h);
-        MoveToEx(hdc, x, y + h, NULL); LineTo(hdc, x + w / 4, y + tabH + 2); LineTo(hdc, x + w + w / 8, y + tabH + 2); LineTo(hdc, x + w - 2, y + h);
+        POINT pts[4];
+        pts[0].x = x; pts[0].y = y + h;
+        pts[1].x = x + w / 4; pts[1].y = y + tabH + 2;
+        pts[2].x = x + w + w / 8; pts[2].y = y + tabH + 2;
+        pts[3].x = x + w - 2; pts[3].y = y + h;
+        Polygon(hdc, pts, 4);
     } else {
         Rectangle(hdc, x + 2, y, x + tabW, y + tabH);
         Rectangle(hdc, x, y + tabH - 2, x + w, y + h);
     }
     SelectObject(hdc, hOldP); SelectObject(hdc, hOld); DeleteObject(hBr);
 }
-
 static void DrawGDIFile(HDC hdc, int x, int y, BOOL bSelected, BOOL bLarge) {
     HBRUSH hBr = CreateSolidBrush(bSelected ? GetSysColor(COLOR_HIGHLIGHT) : RGB(255, 255, 255)); HBRUSH hOld = SelectObject(hdc, hBr); HPEN hPen = GetStockObject(BLACK_PEN); HPEN hOldP = SelectObject(hdc, hPen);
     int size = bLarge ? g_IconSizeLarge : g_IconSizeSmall;
@@ -971,40 +1036,99 @@ static void ShowContextMenu(HWND hwnd, int x, int y, BOOL isDir, BOOL isBackgrou
 }
 
 LRESULT CALLBACK FilePropDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    static BOOL isDrive = FALSE;
+    static char rootPath[8];
     switch(msg) {
         case WM_CREATE: {
-            HANDLE hFind; WIN32_FIND_DATA f; char buf[256];
-            hFind = FindFirstFile(g_ContextId, &f);
-            if (hFind != INVALID_HANDLE_VALUE) {
-                CreateWindow("STATIC", "Name:", WS_CHILD|WS_VISIBLE, 10, 10, 80, 20, hwnd, NULL, g_hInst, NULL);
-                CreateWindow("STATIC", f.cFileName, WS_CHILD|WS_VISIBLE, 100, 10, 200, 20, hwnd, NULL, g_hInst, NULL);
-                CreateWindow("STATIC", "Type:", WS_CHILD|WS_VISIBLE, 10, 35, 80, 20, hwnd, NULL, g_hInst, NULL);
-                CreateWindow("STATIC", (f.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? "File Folder" : "File", WS_CHILD|WS_VISIBLE, 100, 35, 200, 20, hwnd, NULL, g_hInst, NULL);
-                CreateWindow("STATIC", "Location:", WS_CHILD|WS_VISIBLE, 10, 60, 80, 20, hwnd, NULL, g_hInst, NULL);
-                CreateWindow("STATIC", g_ContextId, WS_CHILD|WS_VISIBLE|SS_NOPREFIX|SS_LEFTNOWORDWRAP, 100, 60, 240, 20, hwnd, NULL, g_hInst, NULL);
-                CreateWindow("STATIC", "Size:", WS_CHILD|WS_VISIBLE, 10, 85, 80, 20, hwnd, NULL, g_hInst, NULL);
-                FormatSizeStr(f.nFileSizeLow, buf); CreateWindow("STATIC", buf, WS_CHILD|WS_VISIBLE, 100, 85, 200, 20, hwnd, NULL, g_hInst, NULL);
-                CreateWindow("STATIC", "MS-DOS name:", WS_CHILD|WS_VISIBLE, 10, 110, 80, 20, hwnd, NULL, g_hInst, NULL);
-                CreateWindow("STATIC", f.cFileName, WS_CHILD|WS_VISIBLE, 100, 110, 200, 20, hwnd, NULL, g_hInst, NULL);
-                CreateWindow("STATIC", "Modified:", WS_CHILD|WS_VISIBLE, 10, 135, 80, 20, hwnd, NULL, g_hInst, NULL);
-                WORD dosDate = 0, dosTime = 0; FileTimeToDosDateTime(&f.ftLastWriteTime, &dosDate, &dosTime);
-                FormatDateStr(dosDate, dosTime, buf); CreateWindow("STATIC", buf, WS_CHILD|WS_VISIBLE, 100, 135, 200, 20, hwnd, NULL, g_hInst, NULL);
-                CreateWindow("BUTTON", "Read-only", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX|WS_DISABLED, 100, 160, 80, 20, hwnd, (HMENU)101, g_hInst, NULL);
-                CreateWindow("BUTTON", "Hidden", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX|WS_DISABLED, 190, 160, 80, 20, hwnd, (HMENU)102, g_hInst, NULL);
-                CreateWindow("BUTTON", "Archive", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX|WS_DISABLED, 100, 185, 80, 20, hwnd, (HMENU)103, g_hInst, NULL);
-                CreateWindow("BUTTON", "System", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX|WS_DISABLED, 190, 185, 80, 20, hwnd, (HMENU)104, g_hInst, NULL);
-                if (f.dwFileAttributes & FILE_ATTRIBUTE_READONLY) SendMessage(GetDlgItem(hwnd, 101), BM_SETCHECK, 1, 0);
-                if (f.dwFileAttributes & FILE_ATTRIBUTE_HIDDEN) SendMessage(GetDlgItem(hwnd, 102), BM_SETCHECK, 1, 0);
-                if (f.dwFileAttributes & FILE_ATTRIBUTE_ARCHIVE) SendMessage(GetDlgItem(hwnd, 103), BM_SETCHECK, 1, 0);
-                if (f.dwFileAttributes & FILE_ATTRIBUTE_SYSTEM) SendMessage(GetDlgItem(hwnd, 104), BM_SETCHECK, 1, 0);
-                FindClose(hFind);
+            isDrive = FALSE;
+            if (lstrlen(g_ContextId) <= 3 && g_ContextId[1] == ':') {
+                isDrive = TRUE;
+                lstrcpyn(rootPath, g_ContextId, 4);
+                if (lstrlen(rootPath) == 2) { rootPath[2] = '\\'; rootPath[3] = '\0'; }
             }
-            CreateWindow("BUTTON", "OK", WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON, 130, 230, 80, 24, hwnd, (HMENU)IDOK, g_hInst, NULL); return 0;
+            
+            if (isDrive) {
+                char volName[MAX_PATH] = "";
+                GetVolumeInformation(rootPath, volName, MAX_PATH, NULL, NULL, NULL, NULL, 0);
+                CreateWindow("STATIC", "Volume Label:", WS_CHILD|WS_VISIBLE, 10, 10, 100, 20, hwnd, NULL, g_hInst, NULL);
+                CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", volName, WS_CHILD|WS_VISIBLE|WS_TABSTOP|WS_BORDER|ES_AUTOHSCROLL, 120, 10, 200, 22, hwnd, (HMENU)201, g_hInst, NULL);
+                
+                ULARGE_INTEGER freeBytes, totalBytes;
+                if (GetDiskFreeSpaceEx(rootPath, &freeBytes, &totalBytes, NULL)) {
+                    unsigned long long total = totalBytes.QuadPart;
+                    unsigned long long freeB = freeBytes.QuadPart;
+                    unsigned long long used = total - freeB;
+                    char buf[64];
+                    
+                    CreateWindow("STATIC", "Used Space:", WS_CHILD|WS_VISIBLE, 10, 50, 100, 20, hwnd, NULL, g_hInst, NULL);
+                    sprintf(buf, "%I64u bytes", used);
+                    CreateWindow("STATIC", buf, WS_CHILD|WS_VISIBLE, 120, 50, 200, 20, hwnd, NULL, g_hInst, NULL);
+                    
+                    CreateWindow("STATIC", "Free Space:", WS_CHILD|WS_VISIBLE, 10, 80, 100, 20, hwnd, NULL, g_hInst, NULL);
+                    sprintf(buf, "%I64u bytes", freeB);
+                    CreateWindow("STATIC", buf, WS_CHILD|WS_VISIBLE, 120, 80, 200, 20, hwnd, NULL, g_hInst, NULL);
+                    
+                    CreateWindow("STATIC", "Capacity:", WS_CHILD|WS_VISIBLE, 10, 110, 100, 20, hwnd, NULL, g_hInst, NULL);
+                    sprintf(buf, "%I64u bytes", total);
+                    CreateWindow("STATIC", buf, WS_CHILD|WS_VISIBLE, 120, 110, 200, 20, hwnd, NULL, g_hInst, NULL);
+                }
+            } else {
+                HANDLE hFind; WIN32_FIND_DATA f; char buf[256];
+                hFind = FindFirstFile(g_ContextId, &f);
+                if (hFind != INVALID_HANDLE_VALUE) {
+                    CreateWindow("STATIC", "Name:", WS_CHILD|WS_VISIBLE, 10, 10, 80, 20, hwnd, NULL, g_hInst, NULL);
+                    CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", f.cFileName, WS_CHILD|WS_VISIBLE|ES_AUTOHSCROLL|ES_READONLY, 100, 10, 220, 22, hwnd, NULL, g_hInst, NULL);
+                    CreateWindow("STATIC", "Type:", WS_CHILD|WS_VISIBLE, 10, 40, 80, 20, hwnd, NULL, g_hInst, NULL);
+                    CreateWindow("STATIC", (f.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? "File Folder" : "File", WS_CHILD|WS_VISIBLE, 100, 40, 220, 20, hwnd, NULL, g_hInst, NULL);
+                    CreateWindow("STATIC", "Location:", WS_CHILD|WS_VISIBLE, 10, 65, 80, 20, hwnd, NULL, g_hInst, NULL);
+                    CreateWindowEx(0, "EDIT", g_ContextId, WS_CHILD|WS_VISIBLE|ES_AUTOHSCROLL|ES_READONLY, 100, 65, 220, 20, hwnd, NULL, g_hInst, NULL);
+                    CreateWindow("STATIC", "Size:", WS_CHILD|WS_VISIBLE, 10, 90, 80, 20, hwnd, NULL, g_hInst, NULL);
+                    FormatSizeStr(f.nFileSizeLow, buf); CreateWindow("STATIC", buf, WS_CHILD|WS_VISIBLE, 100, 90, 220, 20, hwnd, NULL, g_hInst, NULL);
+                    
+                    CreateWindow("STATIC", "Modified:", WS_CHILD|WS_VISIBLE, 10, 115, 80, 20, hwnd, NULL, g_hInst, NULL);
+                    WORD dosDate = 0, dosTime = 0; FileTimeToDosDateTime(&f.ftLastWriteTime, &dosDate, &dosTime);
+                    FormatDateStr(dosDate, dosTime, buf); CreateWindow("STATIC", buf, WS_CHILD|WS_VISIBLE, 100, 115, 220, 20, hwnd, NULL, g_hInst, NULL);
+                    
+                    CreateWindow("BUTTON", "Read-only", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX|WS_TABSTOP, 100, 150, 80, 20, hwnd, (HMENU)101, g_hInst, NULL);
+                    CreateWindow("BUTTON", "Hidden", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX|WS_TABSTOP, 190, 150, 80, 20, hwnd, (HMENU)102, g_hInst, NULL);
+                    CreateWindow("BUTTON", "Archive", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX|WS_TABSTOP, 100, 175, 80, 20, hwnd, (HMENU)103, g_hInst, NULL);
+                    CreateWindow("BUTTON", "System", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX|WS_TABSTOP, 190, 175, 80, 20, hwnd, (HMENU)104, g_hInst, NULL);
+                    if (f.dwFileAttributes & FILE_ATTRIBUTE_READONLY) SendMessage(GetDlgItem(hwnd, 101), BM_SETCHECK, 1, 0);
+                    if (f.dwFileAttributes & FILE_ATTRIBUTE_HIDDEN) SendMessage(GetDlgItem(hwnd, 102), BM_SETCHECK, 1, 0);
+                    if (f.dwFileAttributes & FILE_ATTRIBUTE_ARCHIVE) SendMessage(GetDlgItem(hwnd, 103), BM_SETCHECK, 1, 0);
+                    if (f.dwFileAttributes & FILE_ATTRIBUTE_SYSTEM) SendMessage(GetDlgItem(hwnd, 104), BM_SETCHECK, 1, 0);
+                    FindClose(hFind);
+                }
+            }
+            CreateWindow("BUTTON", "OK", WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON|WS_TABSTOP, 80, 230, 80, 24, hwnd, (HMENU)IDOK, g_hInst, NULL); 
+            CreateWindow("BUTTON", "Cancel", WS_CHILD|WS_VISIBLE|WS_TABSTOP, 180, 230, 80, 24, hwnd, (HMENU)IDCANCEL, g_hInst, NULL); 
+            return 0;
         }
         case WM_PAINT: {
-            PAINTSTRUCT ps; HDC hdc = BeginPaint(hwnd, &ps); HPEN hSh = CreatePen(PS_SOLID, 1, GetSysColor(COLOR_BTNSHADOW)); HPEN hHi = CreatePen(PS_SOLID, 1, GetSysColor(COLOR_BTNHIGHLIGHT)); HPEN hOld = SelectObject(hdc, hSh); MoveToEx(hdc, 10, 155, NULL); LineTo(hdc, 340, 155); SelectObject(hdc, hHi); MoveToEx(hdc, 10, 156, NULL); LineTo(hdc, 340, 156); SelectObject(hdc, hOld); DeleteObject(hSh); DeleteObject(hHi); EndPaint(hwnd, &ps); return 0;
+            PAINTSTRUCT ps; HDC hdc = BeginPaint(hwnd, &ps); HPEN hSh = CreatePen(PS_SOLID, 1, GetSysColor(COLOR_BTNSHADOW)); HPEN hHi = CreatePen(PS_SOLID, 1, GetSysColor(COLOR_BTNHIGHLIGHT)); HPEN hOld = SelectObject(hdc, hSh); MoveToEx(hdc, 10, 140, NULL); LineTo(hdc, 340, 140); SelectObject(hdc, hHi); MoveToEx(hdc, 10, 141, NULL); LineTo(hdc, 340, 141); SelectObject(hdc, hOld); DeleteObject(hSh); DeleteObject(hHi); EndPaint(hwnd, &ps); return 0;
         }
-        case WM_COMMAND: if (wp == IDOK || wp == IDCANCEL) { HWND hParent = GetParent(hwnd); if (hParent) EnableWindow(hParent, TRUE); DestroyWindow(hwnd); } return 0;
+        case WM_COMMAND: 
+            if (wp == IDOK) { 
+                if (isDrive) {
+                    char newLabel[MAX_PATH];
+                    if (GetWindowText(GetDlgItem(hwnd, 201), newLabel, MAX_PATH)) {
+                        SetVolumeLabel(rootPath, newLabel);
+                    } else {
+                        SetVolumeLabel(rootPath, NULL);
+                    }
+                } else {
+                    DWORD attr = GetFileAttributes(g_ContextId);
+                    if (attr != INVALID_FILE_ATTRIBUTES) {
+                        if (SendMessage(GetDlgItem(hwnd, 101), BM_GETCHECK, 0, 0)) attr |= FILE_ATTRIBUTE_READONLY; else attr &= ~FILE_ATTRIBUTE_READONLY;
+                        if (SendMessage(GetDlgItem(hwnd, 102), BM_GETCHECK, 0, 0)) attr |= FILE_ATTRIBUTE_HIDDEN; else attr &= ~FILE_ATTRIBUTE_HIDDEN;
+                        if (SendMessage(GetDlgItem(hwnd, 103), BM_GETCHECK, 0, 0)) attr |= FILE_ATTRIBUTE_ARCHIVE; else attr &= ~FILE_ATTRIBUTE_ARCHIVE;
+                        if (SendMessage(GetDlgItem(hwnd, 104), BM_GETCHECK, 0, 0)) attr |= FILE_ATTRIBUTE_SYSTEM; else attr &= ~FILE_ATTRIBUTE_SYSTEM;
+                        SetFileAttributes(g_ContextId, attr);
+                    }
+                }
+                HWND hParent = GetParent(hwnd); if (hParent) EnableWindow(hParent, TRUE); DestroyWindow(hwnd); PostMessage(hParent, WM_COMMAND, 4028, 0);
+            } else if (wp == IDCANCEL) { HWND hParent = GetParent(hwnd); if (hParent) EnableWindow(hParent, TRUE); DestroyWindow(hwnd); } 
+            return 0;
         case WM_CLOSE: { HWND hParent = GetParent(hwnd); if (hParent) EnableWindow(hParent, TRUE); DestroyWindow(hwnd); return 0; }
     } return DefWindowProc(hwnd, msg, wp, lp);
 }
@@ -1170,8 +1294,8 @@ void HandleListCommand(HWND hwnd, WPARAM wp, LPARAM lp, WindowState FAR* state) 
     else if (id == 4022) ChangeViewMode(hwnd, 0, state); else if (id == 4023) ChangeViewMode(hwnd, 1, state); else if (id == 4024) ChangeViewMode(hwnd, 2, state); else if (id == 4025) ChangeViewMode(hwnd, 3, state);
     else if (id == 4020) { g_bShowToolbar = !g_bShowToolbar; ShowWindow(GetDlgItem(hwnd, ID_TOOLBAR), g_bShowToolbar ? SW_SHOW : SW_HIDE); CheckMenuItem(GetMenu(hwnd), 4020, MF_BYCOMMAND | (g_bShowToolbar ? MF_CHECKED : MF_UNCHECKED)); RECT rc; GetClientRect(hwnd, &rc); SendMessage(hwnd, WM_SIZE, 0, MAKELONG(rc.right, rc.bottom)); SaveConfig(); }
     else if (id == 4021) { g_bShowStatusBar = !g_bShowStatusBar; ShowWindow(GetDlgItem(hwnd, 300), g_bShowStatusBar ? SW_SHOW : SW_HIDE); CheckMenuItem(GetMenu(hwnd), 4021, MF_BYCOMMAND | (g_bShowStatusBar ? MF_CHECKED : MF_UNCHECKED)); RECT rc; GetClientRect(hwnd, &rc); SendMessage(hwnd, WM_SIZE, 0, MAKELONG(rc.right, rc.bottom)); SaveConfig(); }
-    else if (id == 4028) { LoadIniShortcuts(); if(hTree) RebuildTree(hTree, state); RebuildList(hwnd, state); }
-    else if (id == 4029) { MessageBox(hwnd, "View Options not yet implemented.", "Options", MB_OK | MB_ICONINFORMATION); }
+else if (id == 4028) { LoadIniShortcuts(); if(hTree) RebuildTree(hTree, state); RebuildList(hwnd, state); }
+    else if (id == 4029) { CreateCenteredDialog(g_hInst, hwnd, "OptionsDlgClass", "Options", 260, 230); }
     else if (id == 4030 || id == 5003) { const char* target = (id == 5003 && g_ContextIsFolder && g_ContextId[0]) ? g_ContextId : state->pathOrId; CreateWindowEx(0, "Win95SearchClass", "Find: All Files", WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT, 480, 420, NULL, NULL, g_hInst, (LPVOID)target); }
     else if (id == 4033) { MessageBox(hwnd, "Go To not yet implemented.", "Go To", MB_OK | MB_ICONINFORMATION); }
     else if (id == 4051) { 
@@ -1307,10 +1431,12 @@ void HandleDrawItem(HWND hwnd, WPARAM wp, LPARAM lp) {
         int px = (item->level * indent) + (indent / 2) + 4;
         int iconX = px + (indent / 2);
 
-        /* Draw dotted lines for the current item */
-        int yEnd = item->isLastChild[item->level] ? lyHalf : rc.bottom;
-        for (int y = rc.top; y <= yEnd; y++) if (y % 2 == 0) SetPixel(hdc, px, y, RGB(128, 128, 128));
-        for (int x = px; x <= iconX; x++) if (x % 2 == 0) SetPixel(hdc, x, lyHalf, RGB(128, 128, 128));
+        /* Draw dotted lines for the current item ONLY if level > 0 */
+        if (item->level > 0) {
+            int yEnd = item->isLastChild[item->level] ? lyHalf : rc.bottom;
+            for (int y = rc.top; y <= yEnd; y++) if (y % 2 == 0) SetPixel(hdc, px, y, RGB(128, 128, 128));
+            for (int x = px; x <= iconX; x++) if (x % 2 == 0) SetPixel(hdc, x, lyHalf, RGB(128, 128, 128));
+        }
         
         int pmSize = 9;
         int pmY = lyHalf - (pmSize / 2);
@@ -2180,8 +2306,12 @@ LRESULT CALLBACK SearchWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 
                 SetProp(hwnd, "BulkBlock", (HANDLE)block);
                 free(arr);
-            } else if (wp == 105) { g_bStopSearch = TRUE; EnableWindow(GetDlgItem(hwnd, 105), FALSE); EnableWindow(GetDlgItem(hwnd, 103), TRUE);
-            } else if (wp == 104) { SetWindowText(GetDlgItem(hwnd, 601), "*.*"); SendMessage(GetDlgItem(hwnd, ID_LIST), LB_RESETCONTENT, 0, 0); } else if (wp >= 4001 && wp <= 4060) { HandleListCommand(hwnd, wp, lp, state); }
+} else if (wp == 105) { g_bStopSearch = TRUE; EnableWindow(GetDlgItem(hwnd, 105), FALSE); EnableWindow(GetDlgItem(hwnd, 103), TRUE);
+            } else if (wp == 104) { SetWindowText(GetDlgItem(hwnd, 601), "*.*"); SendMessage(GetDlgItem(hwnd, ID_LIST), LB_RESETCONTENT, 0, 0); 
+            } else if (wp == 4028) { 
+                LoadIniShortcuts(); 
+                InvalidateRect(GetDlgItem(hwnd, ID_LIST), NULL, TRUE); 
+            } else if (wp >= 4001 && wp <= 4060) { HandleListCommand(hwnd, wp, lp, state); }
             return 0;
         }
         case WM_CLOSE: {
@@ -2237,8 +2367,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdSh
     memset(&wc, 0, sizeof(WNDCLASS)); wc.lpfnWndProc = ShortcutDlgProc; wc.hInstance = hInst; wc.lpszClassName = "ShortcutDlgClass"; wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1); RegisterClass(&wc);
     memset(&wc, 0, sizeof(WNDCLASS)); wc.lpfnWndProc = CopyProgressDlgProc; wc.hInstance = hInst; wc.lpszClassName = "CopyProgressDlgClass"; wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1); RegisterClass(&wc);
     memset(&wc, 0, sizeof(WNDCLASS)); wc.lpfnWndProc = DeleteProgressDlgProc; wc.hInstance = hInst; wc.lpszClassName = "DeleteProgressDlgClass"; wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1); RegisterClass(&wc);
-    memset(&wc, 0, sizeof(WNDCLASS)); wc.lpfnWndProc = ReplaceDlgProc; wc.hInstance = hInst; wc.lpszClassName = "ReplaceDlgClass"; wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1); RegisterClass(&wc);
+memset(&wc, 0, sizeof(WNDCLASS)); wc.lpfnWndProc = ReplaceDlgProc; wc.hInstance = hInst; wc.lpszClassName = "ReplaceDlgClass"; wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1); RegisterClass(&wc);
     memset(&wc, 0, sizeof(WNDCLASS)); wc.lpfnWndProc = FilePropDlgProc; wc.hInstance = hInst; wc.lpszClassName = "FilePropDlgClass"; wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1); RegisterClass(&wc);
+    memset(&wc, 0, sizeof(WNDCLASS)); wc.lpfnWndProc = OptionsDlgProc; wc.hInstance = hInst; wc.lpszClassName = "OptionsDlgClass"; wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1); RegisterClass(&wc);
 
     LoadConfig();
 
