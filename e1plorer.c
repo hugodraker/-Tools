@@ -13,6 +13,10 @@
  */
 
 #include <windows.h>
+#include <commctrl.h>
+#include <stdio.h>
+#include <tchar.h>
+#pragma comment(lib, "comctl32.lib")
 #include <shellapi.h>
 #include <shlobj.h>
 #include <objbase.h>
@@ -55,6 +59,18 @@
 #define PROMPT_RENAME 1
 #define PROMPT_NEWFOLDER 2
 #define SEARCH_MAX_ITEMS 250000
+// --- Definitions & Global State ---
+#define MAX_RECENTS 30
+#define IDC_MYTOOLBAR 1001
+#define IDC_MYADDRESSBAR 1002
+#define ID_VIEW_TOOLBAR 2001 // Example menu ID to toggle visibility
+
+TCHAR g_recents[MAX_RECENTS][MAX_PATH];
+int g_recentCount = 0;
+
+HWND hToolBar = NULL;
+HWND hAddressBar = NULL;
+
 typedef struct {
     DWORD pFiles;
     POINT pt;
@@ -94,7 +110,8 @@ typedef struct {
     BOOL isVirtual;
     BOOL isLastChild[MAX_TREE_LEVEL];
     char expandId[MAX_PATH + 32];
-} TreeItemData;
+} 
+TreeItemData;
 
 typedef struct {
     int type; /* 1 = ListItem */
@@ -192,7 +209,83 @@ int g_ReplaceResult = 0;
 
 /* --- Forward Declarations --- */
 // --- COM OLE Drag & Drop Implementation ---
-typedef struct { IDropSourceVtbl *lpVtbl; LONG refCount; } CDropSource;
+typedef struct { IDropSourceVtbl *lpVtbl; LONG refCount; } 
+CDropSource;
+void AddRecent(HWND hComboBox, const char* newPath) 
+{
+    if (!newPath || lstrlen(newPath) == 0) return;
+    
+    char normPath[MAX_PATH];
+    lstrcpyn(normPath, newPath, MAX_PATH);
+    
+    // Normalize path to prevent duplicates: strip trailing slash unless it's a root drive (e.g. "C:\")
+    int len = lstrlen(normPath);
+    if (len > 3 && normPath[len - 1] == '\\') {
+        normPath[len - 1] = '\0';
+    }
+
+    // 1. Check for duplicates (case-insensitive) and find its index
+    int dupIndex = -1;
+    for (int i = 0; i < g_recentCount; i++) 
+    {
+        if (lstrcmpi(g_recents[i], normPath) == 0) 
+        {
+            dupIndex = i;
+            break;
+        }
+    }
+
+    // 2. If it is already the newest item, do nothing
+    if (dupIndex == 0) return;
+
+    // 3. Shift older items down to make room at index 0
+    int startShift = (dupIndex != -1) ? dupIndex : 
+                     (g_recentCount < MAX_RECENTS ? g_recentCount : MAX_RECENTS - 1);
+                     
+    for (int i = startShift; i > 0; i--) 
+    {
+        lstrcpy(g_recents[i], g_recents[i-1]);
+    }
+
+    // 4. Insert the new path at the top
+    lstrcpy(g_recents[0], normPath);
+    if (g_recentCount < MAX_RECENTS && dupIndex == -1) g_recentCount++;
+
+    // 5. Update the ComboBox UI
+    SendMessage(hComboBox, CB_RESETCONTENT, 0, 0);
+    for (int i = 0; i < g_recentCount; i++) 
+    {
+        SendMessage(hComboBox, CB_ADDSTRING, 0, (LPARAM)g_recents[i]);
+    }
+    SendMessage(hComboBox, CB_SETCURSEL, 0, 0); // Select the top item
+
+    // 6. Save back to recents.csv
+    FILE *fp = fopen("recents.csv", "w");
+    if (fp) 
+    {
+        for (int i = 0; i < g_recentCount; i++) 
+        {
+            fprintf(fp, "%s\n", g_recents[i]);
+        }
+        fclose(fp);
+    }
+}
+LRESULT CALLBACK AddressBarSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData) 
+{
+    // Catch the Enter key in the internal Edit control of the ComboBox
+    if (uMsg == WM_KEYDOWN && wParam == VK_RETURN) 
+    {
+        HWND hComboBox = GetParent(hWnd);
+        HWND hParent = GetParent(hComboBox);
+        
+        // Forward custom execution command '9999' to the parent FolderWndProc
+        SendMessage(hParent, WM_COMMAND, MAKEWPARAM(IDC_MYADDRESSBAR, 9999), (LPARAM)hComboBox);
+        
+        return 0; // Consume the key so Windows doesn't play a "ding" error sound
+    }
+    
+    return DefSubclassProc(hWnd, uMsg, wParam, lParam);
+}
 HRESULT STDMETHODCALLTYPE DS_QueryInterface(IDropSource* This, REFIID riid, void** ppv) {
     if (IsEqualIID(riid, &IID_IUnknown) || IsEqualIID(riid, &IID_IDropSource)) { *ppv = This; This->lpVtbl->AddRef(This); return S_OK; }
     *ppv = NULL; return E_NOINTERFACE;
@@ -400,6 +493,35 @@ void DoRecursiveSearch(ListItemData FAR* FAR* arr, ListItemData FAR* block, cons
         free(subDirs[i]);
     }
     free(subDirs);
+}
+
+// --- Helper Functions for History ---
+
+void LoadRecents(HWND hComboBox) 
+{
+    FILE *fp = _tfopen(_T("recents.csv"), _T("r"));
+    SendMessage(hComboBox, CB_RESETCONTENT, 0, 0);
+    g_recentCount = 0;
+
+    if (fp) 
+    {
+        TCHAR line[MAX_PATH];
+        while (_fgetts(line, MAX_PATH, fp) && g_recentCount < MAX_RECENTS) 
+        {
+            // Strip trailing newlines
+            size_t len = _tcslen(line);
+            while (len > 0 && (line[len-1] == _T('\n') || line[len-1] == _T('\r'))) {
+                line[--len] = _T('\0');
+            }
+
+            if (len > 0) 
+            {
+                _tcscpy_s(g_recents[g_recentCount++], MAX_PATH, line);
+                SendMessage(hComboBox, CB_ADDSTRING, 0, (LPARAM)line);
+            }
+        }
+        fclose(fp);
+    }
 }
 
 LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -917,6 +1039,29 @@ static void RebuildList(HWND hwnd, WindowState FAR* state) {
     HWND hList = GetDlgItem(hwnd, ID_LIST); int i, count = 0; unsigned long totalBytes = 0; char statBuf[128]; char sizeStr[64];
     HANDLE oldBlock; ListItemData FAR* FAR* arr; ListItemData FAR* block; HANDLE hFind; WIN32_FIND_DATA file; char searchPath[MAX_PATH];
     
+    // --- Sync Address Bar ---
+    HWND hAddr = GetDlgItem(hwnd, IDC_MYADDRESSBAR);
+    if (hAddr) {
+        char addrText[MAX_PATH];
+        if (state->isVirtual) {
+            if (lstrcmp(state->pathOrId, "0") == 0) {
+                lstrcpy(addrText, "Desktop");
+            } else {
+                BOOL found = FALSE;
+                for (int k = 0; k < g_IniShortcutCount; k++) {
+                    if (lstrcmp(g_IniShortcuts[k]->id, state->pathOrId) == 0) {
+                        lstrcpy(addrText, g_IniShortcuts[k]->name);
+                        found = TRUE; break;
+                    }
+                }
+                if (!found) lstrcpy(addrText, state->pathOrId);
+            }
+        } else {
+            lstrcpy(addrText, state->pathOrId);
+        }
+        SetWindowText(hAddr, addrText);
+    }
+    
     SendMessage(hList, WM_SETREDRAW, FALSE, 0);
     SendMessage(hList, LB_RESETCONTENT, 0, 0);
     
@@ -977,7 +1122,6 @@ static void RebuildList(HWND hwnd, WindowState FAR* state) {
         HWND hStat = GetDlgItem(hwnd, 300); if (hStat) SetWindowText(hStat, statBuf); 
     }
 }
-
 static void Draw3DButton(HDC hdc, int left, int top, int right, int bottom, BOOL bPushed) {
     HPEN hHi = CreatePen(PS_SOLID, 1, GetSysColor(COLOR_BTNHIGHLIGHT)); HPEN hSh = CreatePen(PS_SOLID, 1, GetSysColor(COLOR_BTNSHADOW)); HPEN hOld = SelectObject(hdc, bPushed ? hSh : hHi);
     MoveToEx(hdc, left, bottom - 1, NULL); LineTo(hdc, left, top); LineTo(hdc, right - 1, top); SelectObject(hdc, bPushed ? hHi : hSh); MoveToEx(hdc, right - 1, top, NULL); LineTo(hdc, right - 1, bottom - 1); LineTo(hdc, left, bottom - 1);
@@ -1954,8 +2098,28 @@ LRESULT CALLBACK DesktopProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case WM_TIMER: {
             if (wp == 1000 && !g_bIsWindowed) {
+                int cx = GetSystemMetrics(SM_CXSCREEN);
+                int cy = GetSystemMetrics(SM_CYSCREEN);
+                RECT rcWnd; 
+                GetWindowRect(hwnd, &rcWnd);
+                
+                // Failsafe: If the screen size changed, resize the desktop window
+                if ((rcWnd.right - rcWnd.left) != cx || (rcWnd.bottom - rcWnd.top) != cy) {
+                    SetWindowPos(hwnd, NULL, 0, 0, cx, cy, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+                }
+                
+                // Continually force a layout update to dynamically dodge taskbar changes
                 RECT rc; GetClientRect(hwnd, &rc);
                 SendMessage(hwnd, WM_SIZE, 0, MAKELONG(rc.right, rc.bottom));
+            }
+            return 0;
+        }
+        case WM_DISPLAYCHANGE: {
+            // Instant response to rotation/resolution changes
+            if (!g_bIsWindowed) {
+                int cx = LOWORD(lp);
+                int cy = HIWORD(lp);
+                SetWindowPos(hwnd, NULL, 0, 0, cx, cy, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
             }
             return 0;
         }
@@ -2029,7 +2193,6 @@ LRESULT CALLBACK DesktopProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
     } return DefWindowProc(hwnd, msg, wp, lp);
 }
-
 LRESULT CALLBACK FolderWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     WindowState FAR* state = (WindowState FAR*)GetWindowLongPtr(hwnd, 0);
     switch(msg) {
@@ -2060,6 +2223,20 @@ LRESULT CALLBACK FolderWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             hHelp = CreatePopupMenu(); AppendMenu(hHelp, MF_STRING, 4040, "&Help Topics"); AppendMenu(hHelp, MF_SEPARATOR, 0, NULL); AppendMenu(hHelp, MF_STRING, 4041, "&About Calmira"); AppendMenu(hMenu, MF_POPUP, (UINT)hHelp, "&Help"); SetMenu(hwnd, hMenu); DrawMenuBar(hwnd);
             
             hToolbar = CreateWindowEx(0, "STATIC", "", WS_CHILD | (g_bShowToolbar ? WS_VISIBLE : 0) | SS_NOTIFY, 0, 0, 0, 0, hwnd, (HMENU)ID_TOOLBAR, g_hInst, NULL); g_lpfnOldToolbarProc = (FARPROC)SetWindowLongPtr(hToolbar, GWLP_WNDPROC, (LONG_PTR)ToolbarProc);
+            
+            // Address Bar Initialization
+            HWND hAddressBarLocal = CreateWindowEx(0, WC_COMBOBOX, NULL, 
+                WS_CHILD | (g_bShowToolbar ? WS_VISIBLE : 0) | CBS_DROPDOWN | CBS_AUTOHSCROLL, 
+                0, 0, 0, 0, hwnd, (HMENU)IDC_MYADDRESSBAR, g_hInst, NULL);
+                
+            SendMessage(hAddressBarLocal, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+            LoadRecents(hAddressBarLocal);
+
+            COMBOBOXINFO cbi = { sizeof(COMBOBOXINFO) };
+            if (GetComboBoxInfo(hAddressBarLocal, &cbi)) {
+                SetWindowSubclass(cbi.hwndItem, AddressBarSubclassProc, 1, 0);
+            }
+
             CreateWindow("BUTTON", "Name", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, (HMENU)ID_HDR_NAME, g_hInst, NULL); 
             CreateWindow("BUTTON", "Modified", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, (HMENU)ID_HDR_DATE, g_hInst, NULL); 
             CreateWindow("BUTTON", "Size", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, (HMENU)ID_HDR_SIZE, g_hInst, NULL); 
@@ -2084,7 +2261,30 @@ LRESULT CALLBACK FolderWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_SIZE: {
             if (!state) return DefWindowProc(hwnd, msg, wp, lp);
             int cx = LOWORD(lp); int cy = HIWORD(lp); int tbH = g_bShowToolbar ? (g_IconSizeSmall + 16) : 0; int statH = g_bShowStatusBar ? 22 : 0; int listX = g_SplitX + 4; int listW = cx - listX; int hdrH = (state->viewMode == 3) ? 22 : 0;
-            if (g_bShowToolbar) MoveWindow(GetDlgItem(hwnd, ID_TOOLBAR), 0, 0, cx, tbH, TRUE); MoveWindow(GetDlgItem(hwnd, ID_TREE), 0, tbH, g_SplitX, cy - statH - tbH, TRUE);
+            
+            // Layout Address Bar and Toolbar
+            if (g_bShowToolbar) {
+                int btnW = g_IconSizeSmall + 8;
+                int tbWidth = 4 + 6 * (btnW + 4); 
+                
+                MoveWindow(GetDlgItem(hwnd, ID_TOOLBAR), 0, 0, tbWidth, tbH, TRUE);
+                
+                HWND hAddr = GetDlgItem(hwnd, IDC_MYADDRESSBAR);
+                if (hAddr) {
+                    int addrX = tbWidth + 4;
+                    int addrW = cx - addrX - 4;
+                    if (addrW < 0) addrW = 0;
+                    
+                    // Force the inner edit box height to match the toolbar
+                    SendMessage(hAddr, CB_SETITEMHEIGHT, (WPARAM)-1, tbH - 6);
+                    MoveWindow(hAddr, addrX, 3, addrW, 200, TRUE);
+                    ShowWindow(hAddr, SW_SHOW);
+                }
+            } else {
+                HWND hAddr = GetDlgItem(hwnd, IDC_MYADDRESSBAR);
+                if (hAddr) ShowWindow(hAddr, SW_HIDE);
+            }
+            MoveWindow(GetDlgItem(hwnd, ID_TREE), 0, tbH, g_SplitX, cy - statH - tbH, TRUE);
             
             int nameColW = g_IconSizeSmall > 32 ? g_IconSizeSmall + 120 : 150;
             if (state->viewMode == 3) { 
@@ -2130,6 +2330,54 @@ LRESULT CALLBACK FolderWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (wp == ID_HDR_DATE) { if (g_SortCol==3) g_SortOrder*=-1; else { g_SortCol=3; g_SortOrder=1; } RebuildList(hwnd, state); return 0; }
             if (wp == ID_HDR_SIZE) { if (g_SortCol==1) g_SortOrder*=-1; else { g_SortCol=1; g_SortOrder=1; } RebuildList(hwnd, state); return 0; }
             if (wp == ID_HDR_TYPE) { if (g_SortCol==2) g_SortOrder*=-1; else { g_SortCol=2; g_SortOrder=1; } RebuildList(hwnd, state); return 0; }
+            
+            // Handle Address Bar execution (Enter pressed or Selection confirmed)
+            if (LOWORD(wp) == IDC_MYADDRESSBAR) {
+                if (HIWORD(wp) == CBN_SELENDOK || HIWORD(wp) == 9999) {
+                    HWND hAddr = GetDlgItem(hwnd, IDC_MYADDRESSBAR);
+                    char szText[MAX_PATH];
+                    
+                    if (HIWORD(wp) == CBN_SELENDOK) {
+                        int selIndex = SendMessage(hAddr, CB_GETCURSEL, 0, 0);
+                        if (selIndex != CB_ERR) {
+                            SendMessage(hAddr, CB_GETLBTEXT, selIndex, (LPARAM)szText);
+                        } else return 0;
+                    } else {
+                        GetWindowText(hAddr, szText, MAX_PATH);
+                    }
+                    
+                    if (szText[0] != '\0') {
+                        AddRecent(hAddr, szText);
+                        
+                        // Check if the path is a file or a folder
+                        DWORD attr = GetFileAttributes(szText);
+                        if (attr != INVALID_FILE_ATTRIBUTES) {
+                            if (attr & FILE_ATTRIBUTE_DIRECTORY) {
+                                // Path is a Folder: Navigate e1plorer
+                                if (state) {
+                                    lstrcpy(state->pathOrId, szText);
+                                    state->isVirtual = FALSE; 
+                                    SetWindowText(hwnd, szText);
+                                    ExpandAllParentsFS(szText);
+                                    RebuildTree(GetDlgItem(hwnd, ID_TREE), state);
+                                    RebuildList(hwnd, state);
+                                }
+                            } else {
+                                // Path is a File: Launch it
+                                ShellExecute(hwnd, "open", szText, NULL, NULL, SW_SHOWNORMAL);
+                            }
+                        } else {
+                            // Let Windows try parsing it (URL, virtual path, or unhandled file)
+                            HINSTANCE hInst = ShellExecute(hwnd, "open", szText, NULL, NULL, SW_SHOWNORMAL);
+                            if ((INT_PTR)hInst <= 32) {
+                                MessageBox(hwnd, "Path or file not found.", "Error", MB_OK | MB_ICONERROR);
+                            }
+                        }
+                    }
+                    return 0;
+                }
+            }
+
             if (state) HandleListCommand(hwnd, wp, lp, state); return 0; 
         }
         case WM_CLOSE: { DestroyWindow(hwnd); return 0; }
@@ -2147,7 +2395,6 @@ LRESULT CALLBACK FolderWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
     } return DefWindowProc(hwnd, msg, wp, lp);
 }
-
 LRESULT CALLBACK SearchWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     WindowState FAR* state = (WindowState FAR*)GetWindowLongPtr(hwnd, 0);
     switch(msg) {
@@ -2334,6 +2581,125 @@ LRESULT CALLBACK SearchWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0; 
         }
     } return DefWindowProc(hwnd, msg, wp, lp);
+}
+// --- Main Window Procedure ---
+
+LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    switch (message)
+    {
+        case WM_CREATE:
+        {
+            HINSTANCE hInst = ((LPCREATESTRUCT)lParam)->hInstance;
+
+            // 1. Create the Toolbar with CCS_NORESIZE
+            hToolBar = CreateWindowEx(0, TOOLBARCLASSNAME, NULL, 
+                WS_CHILD | WS_VISIBLE | TBSTYLE_FLAT | CCS_NORESIZE, 
+                0, 0, 0, 0, hWnd, (HMENU)IDC_MYTOOLBAR, hInst, NULL);
+            
+            // (Add standard toolbar buttons here via TB_ADDBUTTONS / TB_BUTTONSTRUCT)
+
+            // 2. Create the Address Bar (ComboBox)
+            hAddressBar = CreateWindowEx(0, WC_COMBOBOX, NULL, 
+                WS_CHILD | WS_VISIBLE | CBS_DROPDOWN | CBS_AUTOHSCROLL, 
+                0, 0, 0, 0, hWnd, (HMENU)IDC_MYADDRESSBAR, hInst, NULL);
+                
+            SendMessage(hAddressBar, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+
+            // 3. Load MRU history
+            LoadRecents(hAddressBar);
+
+            // 4. Subclass internal Edit control to handle 'Enter' key
+            COMBOBOXINFO cbi = { sizeof(COMBOBOXINFO) };
+            if (GetComboBoxInfo(hAddressBar, &cbi)) 
+            {
+                SetWindowSubclass(cbi.hwndItem, AddressBarSubclassProc, 1, 0);
+            }
+            break;
+        }
+
+        case WM_SIZE:
+        {
+            int clientWidth = LOWORD(lParam);
+            int clientHeight = HIWORD(lParam);
+
+            // Only layout if the toolbar is visible
+            if (hToolBar && (GetWindowLong(hToolBar, GWL_STYLE) & WS_VISIBLE))
+            {
+                // Get toolbar width based on its buttons
+                SIZE tbSize = {0};
+                SendMessage(hToolBar, TB_GETMAXSIZE, 0, (LPARAM)&tbSize);
+
+                // Lock Toolbar to the left
+                SetWindowPos(hToolBar, NULL, 0, 0, tbSize.cx, tbSize.cy, SWP_NOZORDER);
+
+                // Stretch Address Bar across the remaining width
+                int addressX = tbSize.cx + 2; 
+                int addressWidth = clientWidth - addressX - 2;
+                if (addressWidth < 0) addressWidth = 0;
+                
+                // Height (200) determines the dropdown menu length, not the box height
+                SetWindowPos(hAddressBar, NULL, addressX, 2, addressWidth, 200, SWP_NOZORDER);
+            }
+            break;
+        }
+
+        case WM_COMMAND:
+        {
+            int wmId = LOWORD(wParam);
+            int wmEvent = HIWORD(wParam);
+
+            switch (wmId)
+            {
+                // Toggle Toolbar and Address Bar visibility
+                case ID_VIEW_TOOLBAR: 
+                {
+                    BOOL bIsVisible = (GetWindowLong(hToolBar, GWL_STYLE) & WS_VISIBLE);
+                    int showCmd = bIsVisible ? SW_HIDE : SW_SHOW;
+                    
+                    ShowWindow(hToolBar, showCmd);
+                    ShowWindow(hAddressBar, showCmd);
+
+                    // Force WM_SIZE to immediately reorganize layout
+                    RECT rc;
+                    GetClientRect(hWnd, &rc);
+                    SendMessage(hWnd, WM_SIZE, 0, MAKELPARAM(rc.right, rc.bottom));
+                    break;
+                }
+
+                // Handle Address Bar mouse interactions
+                case IDC_MYADDRESSBAR:
+                {
+                    // User clicked an item in the dropdown
+                    if (wmEvent == CBN_SELENDOK) 
+                    {
+                        int selIndex = SendMessage(hAddressBar, CB_GETCURSEL, 0, 0);
+                        if (selIndex != CB_ERR) 
+                        {
+                            TCHAR szText[MAX_PATH];
+                            SendMessage(hAddressBar, CB_GETLBTEXT, selIndex, (LPARAM)szText);
+                            
+                            // Move to top of MRU and save
+                            AddRecent(hAddressBar, szText);
+                            
+                            // TODO: Call your folder navigation logic here!
+                            // NavigateToPath(szText);
+                        }
+                    }
+                    break;
+                }
+            }
+            break;
+        }
+
+        case WM_DESTROY:
+            PostQuitMessage(0);
+            break;
+
+        default:
+            return DefWindowProc(hWnd, message, wParam, lParam);
+    }
+    return 0;
 }
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdShow) {
     WNDCLASS wc; MSG msg; char startPath[MAX_PATH] = ""; char searchPath[MAX_PATH] = ""; char* p = lpCmdLine; g_hInst = hInst; int i; HWND hExistingDesktop;
