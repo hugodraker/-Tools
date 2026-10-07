@@ -140,6 +140,9 @@ typedef LONG (WINAPI *RTLGETVERSION)(PNTDLL_OSVERSIONINFOW);
 #define PROMPT_NEWFOLDER    1
 #define PROMPT_RENAME       2
 #define IDM_FS_BASE 15000
+#define WM_USER_CONTEXTMENU   (WM_USER + 100)
+#define WM_USER_APPLYLAYOUT   (WM_USER + 101)
+#define WM_USER_LAUNCH_FOLDER (WM_USER + 102)
 /* ??????????????????????????????????????????????????????????????????????????
    Data Structures & Globals
    ?????????????????????????????????????????????????????????????????????????? */
@@ -176,6 +179,14 @@ typedef struct {
 } ODMenuItem;
 
 typedef struct {
+    BOOL isIni;
+    int iniIdx;
+    BOOL isFsFolder;
+    char path[MAX_PATH];
+    char display[64];
+} SearchResultItem;
+
+typedef struct {
     char id[12];
     char name[64];
     char exe[MAX_PATH];
@@ -185,6 +196,7 @@ typedef struct {
     char parentId[12];
     BOOL minimized;
     BOOL isFolder;
+    BOOL isRecursive; 
     HMENU hMenu;
     char hotkey[16];
 } IniShortcut;
@@ -229,6 +241,7 @@ static int g_TbMenuCount = 0;
 
 static ODMenuItem* g_ODItems = NULL;
 static int g_ODCount = 0;
+static ODMenuItem* g_HoveredFolderItem = NULL; /* <-- ADD IT HERE */
 
 static IniShortcut* g_IniShortcuts = NULL;
 static int g_IniShortcutCount = 0;
@@ -273,7 +286,22 @@ static HHOOK g_hMsgHook = NULL;
 
 static HGLOBAL g_hMemODItems = NULL;
 static HGLOBAL g_hMemIniShortcuts = NULL;
-static HANDLE g_hProcessSnap = NULL;
+typedef struct { DWORD pid; char exeName[MAX_PATH]; } ProcessCacheEntry;
+static ProcessCacheEntry g_ProcCache[512];
+static int g_ProcCacheCount = 0;
+
+static char g_szExplorerExe[MAX_PATH] = "e1plorer.exe";
+/* --------------------------------------------------------------------------
+   Dialog Procedures (Now supporting the Recursive Folder checkmark)
+   -------------------------------------------------------------------------- */
+static HWND hRecursiveCheck;
+
+static SearchResultItem g_SearchResults[200];
+static int g_SearchCount = 0;
+/* Add these to your Data Structures & Globals section */
+static int g_IconSizeLarge = 32;
+static int g_IconSizeSmall = 16;
+static int g_UseSmallMenuIcons = 1;
 
 /* Prototypes */
 static void ApplyLayout(void);
@@ -302,6 +330,48 @@ LRESULT CALLBACK MsgFilterProc(int code, WPARAM wParam, LPARAM lParam);
 BOOL CALLBACK    TaskbarEnumWindowsProc(HWND hwnd, LPARAM lParam);
 BOOL CALLBACK    MinimizeEnumProc(HWND hwnd, LPARAM lParam);
 
+static void DoFsSearch(const char* dirPath, const char* queryUpper, BOOL recursive, int depth) {
+    WIN32_FIND_DATA fd; HANDLE hFind; char searchPath[MAX_PATH];
+    if (depth > 3 || g_SearchCount >= 200) return; /* Prevent UI freezing on massive drives */
+    
+    lstrcpy(searchPath, dirPath);
+    if (searchPath[lstrlen(searchPath) - 1] != '\\') lstrcat(searchPath, "\\");
+    lstrcat(searchPath, "*.*");
+    
+    hFind = FindFirstFile(searchPath, &fd);
+    if (hFind != INVALID_HANDLE_VALUE) {
+        do {
+            if (lstrcmp(fd.cFileName, ".") != 0 && lstrcmp(fd.cFileName, "..") != 0) {
+                char nameUpper[MAX_PATH]; lstrcpy(nameUpper, fd.cFileName); AnsiUpper((LPSTR)nameUpper);
+                
+                if (strstr(nameUpper, queryUpper)) {
+                    if (g_SearchCount < 200) {
+                        g_SearchResults[g_SearchCount].isIni = FALSE;
+                        g_SearchResults[g_SearchCount].isFsFolder = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? TRUE : FALSE;
+                        
+                        lstrcpy(g_SearchResults[g_SearchCount].path, dirPath);
+                        if (g_SearchResults[g_SearchCount].path[lstrlen(g_SearchResults[g_SearchCount].path) - 1] != '\\') lstrcat(g_SearchResults[g_SearchCount].path, "\\");
+                        lstrcat(g_SearchResults[g_SearchCount].path, fd.cFileName);
+                        
+                        lstrcpyn(g_SearchResults[g_SearchCount].display, fd.cFileName, 63);
+                        
+                        int pos = SendMessage(g_hSearchList, LB_ADDSTRING, 0, (LPARAM)g_SearchResults[g_SearchCount].display);
+                        SendMessage(g_hSearchList, LB_SETITEMDATA, pos, g_SearchCount);
+                        g_SearchCount++;
+                    }
+                }
+                
+                if (recursive && (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                    char subPath[MAX_PATH]; lstrcpy(subPath, dirPath);
+                    if (subPath[lstrlen(subPath) - 1] != '\\') lstrcat(subPath, "\\");
+                    lstrcat(subPath, fd.cFileName);
+                    DoFsSearch(subPath, queryUpper, TRUE, depth + 1);
+                }
+            }
+        } while (FindNextFile(hFind, &fd) && g_SearchCount < 200);
+        FindClose(hFind);
+    }
+}
 /* ??????????????????????????????????????????????????????????????????????????
    Utility Functions & Tray Exe Extraction
    ?????????????????????????????????????????????????????????????????????????? */
@@ -323,18 +393,36 @@ static void UpdateClock(void) {
     if (g_hClock) InvalidateRect(g_hClock, NULL, FALSE);
 }
 
+/* --------------------------------------------------------------------------
+   System Tray API Hooks (Now uses a high-speed O(1) Memory Cache)
+   -------------------------------------------------------------------------- */
 static void GetExeNameFromHwnd(HWND hwnd, char* outName, int maxLen) {
-    DWORD pid = 0; outName[0] = '\0';
+    DWORD pid = 0; int i;
+    outName[0] = '\0';
     GetWindowThreadProcessId(hwnd, &pid);
-    if (pid && g_hProcessSnap && g_hProcessSnap != INVALID_HANDLE_VALUE) {
-        PROCESSENTRY32 pe; pe.dwSize = sizeof(PROCESSENTRY32);
-        if (Process32First(g_hProcessSnap, &pe)) {
-            do {
-                if (pe.th32ProcessID == pid) {
-                    lstrcpyn(outName, pe.szExeFile, maxLen);
-                    break;
-                }
-            } while (Process32Next(g_hProcessSnap, &pe));
+    if (pid) {
+        /* 1. High-speed lookup during EnumWindows Refresh */
+        for (i = 0; i < g_ProcCacheCount; i++) {
+            if (g_ProcCache[i].pid == pid) {
+                lstrcpyn(outName, g_ProcCache[i].exeName, maxLen);
+                return;
+            }
+        }
+        
+        /* 2. Fallback for manual user clicks outside of the refresh cycle */
+        HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (hSnap != INVALID_HANDLE_VALUE) {
+            PROCESSENTRY32 pe; pe.dwSize = sizeof(PROCESSENTRY32);
+            if (Process32First(hSnap, &pe)) {
+                do {
+                    if (pe.th32ProcessID == pid) {
+                        lstrcpyn(outName, pe.szExeFile, maxLen);
+                        AnsiLower((LPSTR)outName);
+                        break;
+                    }
+                } while (Process32Next(hSnap, &pe));
+            }
+            CloseHandle(hSnap);
         }
     }
 }
@@ -548,6 +636,9 @@ static void ParseContextMenuItem(const char* val, ContextMenuItem* out) {
     out->isSeparator = (lstrcmp(out->name, "-") == 0);
 }
 
+/* --------------------------------------------------------------------------
+   Config Parsers & Loaders (Now handles isRecursive and e1plorer.exe)
+   -------------------------------------------------------------------------- */
 static void ParseIniEntry(const char* id, const char* val, IniShortcut* out) {
     const char* p = val; int i; char* dests[7];
     dests[0] = out->name; dests[1] = out->exe; dests[2] = out->params; dests[3] = out->icon; dests[4] = out->minimizedStr; dests[5] = out->parentId; dests[6] = out->hotkey;
@@ -561,8 +652,10 @@ static void ParseIniEntry(const char* id, const char* val, IniShortcut* out) {
     }
     {
         int flags = atoi(out->minimizedStr);
-        out->minimized = (flags & 1) != 0; out->isFolder = (flags & 2) != 0;
-        if (out->exe[0] == '\0' && flags == 0 && lstrcmp(out->minimizedStr, "0") == 0) out->isFolder = TRUE;
+        out->minimized = (flags & 1) != 0; 
+        out->isFolder = (flags & 2) != 0;
+        out->isRecursive = (flags & 4) != 0;
+        if (out->exe[0] == '\0' && flags == 0 && lstrcmp(out->minimizedStr, "0") == 0 && lstrcmp(out->name, "-") != 0) out->isFolder = TRUE;
     }
     out->hMenu = NULL;
 }
@@ -690,12 +783,19 @@ static void RunStartupItems(void) {
     }
 }
 
+/* -------------------------------------------------------------------------- */
+
 static void LoadConfig(void) {
     int i; char trayApps[512]; char* token;
     GetAppFilePath("taskbar.ini", g_szIniPath);
     g_TbPosition = GetPrivateProfileInt("Taskbar", "Position", POS_BOTTOM, g_szIniPath);
     g_TbHeight = GetPrivateProfileInt("Taskbar", "Height", 30, g_szIniPath);
     g_TbWidthVert = GetPrivateProfileInt("Taskbar", "WidthVert", 72, g_szIniPath);
+    
+    g_IconSizeLarge = GetPrivateProfileInt("Taskbar", "IconSizeLarge", 32, g_szIniPath);
+    g_IconSizeSmall = GetPrivateProfileInt("Taskbar", "IconSizeSmall", 16, g_szIniPath);
+    g_UseSmallMenuIcons = GetPrivateProfileInt("Taskbar", "UseSmallMenuIcons", 1, g_szIniPath);
+    
     if (g_TbHeight < 24) g_TbHeight = 24; if (g_TbWidthVert < 48) g_TbWidthVert = 48;
     g_TrayAppCount = 0;
     
@@ -715,6 +815,8 @@ static void LoadConfig(void) {
     
     GetPrivateProfileString("Run", "History", "", g_RunHistory, sizeof(g_RunHistory), g_szIniPath);
     GetPrivateProfileString("Taskbar", "VersionText", "Windows 11", g_szWinVer, sizeof(g_szWinVer), g_szIniPath);
+    
+    GetPrivateProfileString("Paths", "e1plorer.exe", "e1plorer.exe", g_szExplorerExe, MAX_PATH, g_szIniPath);
 
     LoadMenusFromIni(); 
     LoadIniShortcuts();
@@ -735,6 +837,12 @@ static void SaveAllToIni(void) {
     sprintf(buf, "%d", g_TbHeight); WritePrivateProfileString("Taskbar", "Height", buf, g_szIniPath);
     sprintf(buf, "%d", g_TbWidthVert); WritePrivateProfileString("Taskbar", "WidthVert", buf, g_szIniPath);
     WritePrivateProfileString("Taskbar", "VersionText", g_szWinVer, g_szIniPath);
+    
+    sprintf(buf, "%d", g_IconSizeLarge); WritePrivateProfileString("Taskbar", "IconSizeLarge", buf, g_szIniPath);
+    sprintf(buf, "%d", g_IconSizeSmall); WritePrivateProfileString("Taskbar", "IconSizeSmall", buf, g_szIniPath);
+    sprintf(buf, "%d", g_UseSmallMenuIcons); WritePrivateProfileString("Taskbar", "UseSmallMenuIcons", buf, g_szIniPath);
+    
+    WritePrivateProfileString("Paths", "e1plorer.exe", g_szExplorerExe, g_szIniPath);
     
     char trayApps[512] = "";
     for (i=0; i<g_TrayAppCount; i++) { lstrcat(trayApps, g_TrayAppList[i]); lstrcat(trayApps, "|"); }
@@ -765,7 +873,7 @@ static void SaveAllToIni(void) {
     
     for (i=0; i<g_IniShortcutCount; i++) {
         char val[1024];
-        int flags = (g_IniShortcuts[i].minimized ? 1 : 0) | (g_IniShortcuts[i].isFolder ? 2 : 0);
+        int flags = (g_IniShortcuts[i].minimized ? 1 : 0) | (g_IniShortcuts[i].isFolder ? 2 : 0) | (g_IniShortcuts[i].isRecursive ? 4 : 0);
         sprintf(val, "%s|%s|%s|%s|%d|%s|%s", g_IniShortcuts[i].name, g_IniShortcuts[i].exe, g_IniShortcuts[i].params, g_IniShortcuts[i].icon, flags, g_IniShortcuts[i].parentId, g_IniShortcuts[i].hotkey);
         WritePrivateProfileString("Shortcut", g_IniShortcuts[i].id, val, g_szIniPath);
     }
@@ -785,7 +893,7 @@ static ODMenuItem* AddODItem(const char* text, BOOL isRoot, BOOL isSeparator, in
     return item;
 }
 
-static void BuildMenuFromFileSystemFolder(HMENU hMenu, const char* dirPath) {
+static void BuildMenuFromFileSystemFolder(HMENU hMenu, const char* dirPath, BOOL recursive) {
     WIN32_FIND_DATA fd; HANDLE hFind;
     char searchPath[MAX_PATH]; int totalItems = 0, currentItem = 0, itemsPerCol;
     
@@ -813,11 +921,25 @@ static void BuildMenuFromFileSystemFolder(HMENU hMenu, const char* dirPath) {
                 if (fullPath[lstrlen(fullPath) - 1] != '\\') lstrcat(fullPath, "\\");
                 lstrcat(fullPath, fd.cFileName);
                 
+                char displayName[MAX_PATH];
+                lstrcpy(displayName, fd.cFileName);
+                if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                    char* dot = strrchr(displayName, '.');
+                    if (dot && lstrcmpi(dot, ".lnk") == 0) *dot = '\0';
+                }
+                
                 if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-                    pItem = AddODItem(fd.cFileName, FALSE, FALSE, 0); 
-                    if (pItem) { lstrcpy(pItem->targetPath, fullPath); pItem->isFsFolder = TRUE; AppendMenu(hMenu, flags, pItem->cmdId, (LPSTR)pItem); }
+                    if (recursive) {
+                        HMENU hSub = CreatePopupMenu();
+                        pItem = AddODItem(displayName, FALSE, FALSE, 0); 
+                        BuildMenuFromFileSystemFolder(hSub, fullPath, TRUE);
+                        if (pItem) { lstrcpy(pItem->targetPath, fullPath); pItem->isFsFolder = TRUE; AppendMenu(hMenu, flags | MF_POPUP, (UINT_PTR)hSub, (LPSTR)pItem); }
+                    } else {
+                        pItem = AddODItem(displayName, FALSE, FALSE, 0); 
+                        if (pItem) { lstrcpy(pItem->targetPath, fullPath); pItem->isFsFolder = TRUE; AppendMenu(hMenu, flags, pItem->cmdId, (LPSTR)pItem); }
+                    }
                 } else {
-                    pItem = AddODItem(fd.cFileName, FALSE, FALSE, 5); 
+                    pItem = AddODItem(displayName, FALSE, FALSE, 5); 
                     if (pItem) { lstrcpy(pItem->targetPath, fullPath); pItem->isFsFolder = FALSE; AppendMenu(hMenu, flags, pItem->cmdId, (LPSTR)pItem); }
                 }
                 currentItem++;
@@ -840,8 +962,15 @@ static void BuildMenuFromIni(HMENU hMenu, const char* parentId, BOOL isRoot) {
                 if (pItem) AppendMenu(hMenu, MF_OWNERDRAW, 0, (LPSTR)pItem);
             } else if (g_IniShortcuts[i].isFolder) {
                 HMENU hSub = CreatePopupMenu(); ODMenuItem* pItem = AddODItem(g_IniShortcuts[i].name, isRoot, FALSE, poly); g_IniShortcuts[i].hMenu = hSub;
-                if (g_IniShortcuts[i].exe[0] != '\0') BuildMenuFromFileSystemFolder(hSub, g_IniShortcuts[i].exe); else BuildMenuFromIni(hSub, g_IniShortcuts[i].id, FALSE);
-                if (pItem) AppendMenu(hMenu, MF_OWNERDRAW | MF_POPUP, (UINT_PTR)hSub, (LPSTR)pItem);
+                if (g_IniShortcuts[i].exe[0] != '\0') {
+                    BuildMenuFromFileSystemFolder(hSub, g_IniShortcuts[i].exe, g_IniShortcuts[i].isRecursive); 
+                }
+                else BuildMenuFromIni(hSub, g_IniShortcuts[i].id, FALSE);
+                
+                if (pItem) {
+                    if (g_IniShortcuts[i].exe[0] != '\0') { lstrcpy(pItem->targetPath, g_IniShortcuts[i].exe); pItem->isFsFolder = TRUE; }
+                    AppendMenu(hMenu, MF_OWNERDRAW | MF_POPUP, (UINT_PTR)hSub, (LPSTR)pItem);
+                }
             } else {
                 ODMenuItem* pItem = AddODItem(g_IniShortcuts[i].name, isRoot, FALSE, poly);
                 if (pItem) AppendMenu(hMenu, MF_OWNERDRAW | MF_STRING, IDM_START_BASE + i, (LPSTR)pItem);
@@ -849,11 +978,23 @@ static void BuildMenuFromIni(HMENU hMenu, const char* parentId, BOOL isRoot) {
         }
     }
 }
-
 static void ShowStartMenu(HWND hBtn) {
     HMENU hMenu = CreatePopupMenu(); POINT pt; RECT rc; int i, curY = 0; g_ODCount = 0; BuildMenuFromIni(hMenu, "0", TRUE);
-    for (i = 0; i < g_ODCount; i++) { if (g_ODItems[i].isRoot) { g_ODItems[i].yOffset = curY; curY += g_ODItems[i].isSeparator ? 8 : 36; } }
+    
+    for (i = 0; i < g_ODCount; i++) { 
+        if (g_ODItems[i].isRoot) { 
+            g_ODItems[i].yOffset = curY; 
+            if (g_ODItems[i].isSeparator) {
+                curY += 8;
+            } else {
+                int h = g_IconSizeLarge + 4;
+                if (h < 24) h = 24;
+                curY += h;
+            }
+        } 
+    }
     for (i = 0; i < g_ODCount; i++) { if (g_ODItems[i].isRoot) g_ODItems[i].totalHeight = curY; }
+    
     GetWindowRect(hBtn, &rc);
     
     UINT flags = TPM_LEFTALIGN;
@@ -874,7 +1015,6 @@ static void ShowStartMenu(HWND hBtn) {
     UnhookWindowsHookEx(g_hMsgHook); 
     DestroyMenu(hMenu);
 }
-
 static void ShowFolderMenu(HWND hAnchor, const char* folderId) {
     HMENU hMenu = CreatePopupMenu(); POINT pt; RECT rc;
     BuildMenuFromIni(hMenu, folderId, FALSE);
@@ -927,9 +1067,9 @@ static void LaunchShortcut(HWND hwnd, IniShortcut* sh) {
     }
 }
 
-/* ??????????????????????????????????????????????????????????????????????????
-   EnumWindows Routines
-   ?????????????????????????????????????????????????????????????????????????? */
+/* --------------------------------------------------------------------------
+   EnumWindows Routines (Optimized string & PID comparisons)
+   -------------------------------------------------------------------------- */
 BOOL CALLBACK TaskbarEnumWindowsProc(HWND hwnd, LPARAM lParam) {
     char cls[64];
     GetClassName(hwnd, cls, sizeof(cls));
@@ -939,29 +1079,35 @@ BOOL CALLBACK TaskbarEnumWindowsProc(HWND hwnd, LPARAM lParam) {
         lstrcmp(cls, "ShortcutDlgClass") == 0 || 
         lstrcmp(cls, "PromptDlgClass") == 0) return TRUE;
 
-    char exeName[MAX_PATH] = ""; int i; BOOL isTrayApp = FALSE;
-    GetExeNameFromHwnd(hwnd, exeName, MAX_PATH);
-    if (exeName[0] != '\0') {
-        AnsiLower((LPSTR)exeName);
-        for (i = 0; i < g_TrayAppCount; i++) {
-            if (lstrcmpi(exeName, g_TrayAppList[i]) == 0) { isTrayApp = TRUE; break; }
+    BOOL isManualTray = (BOOL)(INT_PTR)GetProp(hwnd, "TrayMin");
+    BOOL isTrayApp = FALSE;
+    char exeName[MAX_PATH] = "";
+    
+    /* Optimization: Only do EXE lookup if we actually have Tray Apps to search for */
+    if (g_TrayAppCount > 0 && !isManualTray) {
+        GetExeNameFromHwnd(hwnd, exeName, MAX_PATH);
+        if (exeName[0] != '\0') {
+            int i;
+            for (i = 0; i < g_TrayAppCount; i++) {
+                if (lstrcmp(exeName, g_TrayAppList[i]) == 0) { isTrayApp = TRUE; break; }
+            }
         }
     }
 
-    BOOL isManualTray = (BOOL)(INT_PTR)GetProp(hwnd, "TrayMin");
     if (isTrayApp || isManualTray) {
         BOOL alreadyAdded = FALSE;
+        /* Optimization: Compare PIDs instead of doing heavy EXE string extractions for already-added icons */
         if (isTrayApp && !isManualTray) {
-            int j;
+            int j; DWORD pidA = 0; GetWindowThreadProcessId(hwnd, &pidA);
             for (j = 0; j < s_EnumTrayCount; j++) {
-                char existingExe[MAX_PATH] = "";
-                GetExeNameFromHwnd(s_EnumTrayTasks[j], existingExe, MAX_PATH);
-                if (lstrcmpi(exeName, existingExe) == 0) { alreadyAdded = TRUE; break; }
+                DWORD pidB = 0; GetWindowThreadProcessId(s_EnumTrayTasks[j], &pidB);
+                if (pidA == pidB) { alreadyAdded = TRUE; break; }
             }
         }
         if (!alreadyAdded && s_EnumTrayCount < MAX_TRAY_ICONS) s_EnumTrayTasks[s_EnumTrayCount++] = hwnd;
         if (isTrayApp) return TRUE;
     }
+
     if (isManualTray) return TRUE;
 
     if (!IsWindowVisible(hwnd)) return TRUE;
@@ -982,17 +1128,29 @@ BOOL CALLBACK TaskbarEnumWindowsProc(HWND hwnd, LPARAM lParam) {
     return TRUE;
 }
 
-/* --------------------------------------------------------------------------
-   Refresh Tasks (Fixed stale tray icons dead-window scrub)
-   -------------------------------------------------------------------------- */
 static void RefreshTasks(void) {
     int i, j; RECT rc; int isHorz = (g_TbPosition == POS_BOTTOM || g_TbPosition == POS_TOP);
     int prevTrayCount = g_TrayIconCount;
     
-    g_hProcessSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    g_ProcCacheCount = 0;
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32 pe; pe.dwSize = sizeof(PROCESSENTRY32);
+        if (Process32First(hSnap, &pe)) {
+            do {
+                if (g_ProcCacheCount < 512) {
+                    g_ProcCache[g_ProcCacheCount].pid = pe.th32ProcessID;
+                    lstrcpyn(g_ProcCache[g_ProcCacheCount].exeName, pe.szExeFile, MAX_PATH);
+                    AnsiLower((LPSTR)g_ProcCache[g_ProcCacheCount].exeName);
+                    g_ProcCacheCount++;
+                }
+            } while (Process32Next(hSnap, &pe));
+        }
+        CloseHandle(hSnap);
+    }
+    
     s_EnumCount = 0; s_EnumTrayCount = 0;
     EnumWindows(TaskbarEnumWindowsProc, 0);
-    if (g_hProcessSnap && g_hProcessSnap != INVALID_HANDLE_VALUE) { CloseHandle(g_hProcessSnap); g_hProcessSnap = NULL; }
     
     for (i = 0; i < g_TaskCount; ) {
         BOOL found = FALSE;
@@ -1015,10 +1173,9 @@ static void RefreshTasks(void) {
         }
     }
     
-    /* Preserve True IPC Tray Icons (if alive), flag manual ones for deletion */
     for (i = 0; i < g_TrayIconCount; i++) {
         if (!g_TrayIcons[i].isTrueTray) g_TrayIcons[i].active = FALSE;
-        else if (!IsWindow(g_TrayIcons[i].hwnd)) g_TrayIcons[i].active = FALSE; /* Scrubs stale icons */
+        else if (!IsWindow(g_TrayIcons[i].hwnd)) g_TrayIcons[i].active = FALSE;
     }
     
     for (i = 0; i < s_EnumTrayCount; i++) {
@@ -1032,7 +1189,13 @@ static void RefreshTasks(void) {
             if (slot == -1 && g_TrayIconCount < MAX_TRAY_ICONS) { slot = g_TrayIconCount++; }
             if (slot != -1) {
                 DWORD_PTR res = 0; HICON hIcon = NULL;
-                if (SendMessageTimeout(thwnd, WM_GETICON, ICON_SMALL2, 0, SMTO_ABORTIFHUNG, 50, &res) && res) hIcon = (HICON)res;
+                
+                if (g_IconSizeSmall > 16) {
+                    if (SendMessageTimeout(thwnd, WM_GETICON, 1, 0, SMTO_ABORTIFHUNG, 50, &res) && res) hIcon = (HICON)res;
+                    if (!hIcon) hIcon = (HICON)GetClassLongPtr(thwnd, GCLP_HICON);
+                }
+                
+                if (!hIcon && SendMessageTimeout(thwnd, WM_GETICON, ICON_SMALL2, 0, SMTO_ABORTIFHUNG, 50, &res) && res) hIcon = (HICON)res;
                 if (!hIcon && SendMessageTimeout(thwnd, WM_GETICON, 0, 0, SMTO_ABORTIFHUNG, 50, &res) && res) hIcon = (HICON)res;
                 if (!hIcon && SendMessageTimeout(thwnd, WM_GETICON, 1, 0, SMTO_ABORTIFHUNG, 50, &res) && res) hIcon = (HICON)res;
                 if (!hIcon) hIcon = (HICON)GetClassLongPtr(thwnd, GCLP_HICONSM);
@@ -1097,7 +1260,6 @@ static void RefreshTasks(void) {
         }
     }
 }
-
 static void SnapToEdge(POINT pt) {
     int cx = GetSystemMetrics(SM_CXSCREEN), cy = GetSystemMetrics(SM_CYSCREEN);
     int edge = POS_BOTTOM, dBot = cy - pt.y, dTop = pt.y, dLeft = pt.x, dRight = cx - pt.x;
@@ -1124,6 +1286,10 @@ static void DoShowDesktop(void) { EnumWindows(MinimizeEnumProc, 0); }
 
 static void ApplyLayout(void) {
     int cx = GetSystemMetrics(SM_CXSCREEN), cy = GetSystemMetrics(SM_CYSCREEN), i, qlCount = g_QLActiveCount, qlW = qlCount * 40;
+    int trayCell = g_IconSizeSmall + 5;
+    int startBtnH = g_IconSizeSmall + 6; if (startBtnH < 22) startBtnH = 22;
+    int startBtnW = 74 + (g_IconSizeSmall > 16 ? (g_IconSizeSmall - 16) * 3 : 0);
+
     {
         RECT rcWork; rcWork.left = 0; rcWork.top = 0; rcWork.right = cx; rcWork.bottom = cy;
         switch (g_TbPosition) {
@@ -1141,38 +1307,38 @@ static void ApplyLayout(void) {
         case POS_RIGHT:  MoveWindow(g_hTaskbar, cx - g_TbWidthVert, 0, g_TbWidthVert, cy, TRUE); break;
     }
     if (g_TbPosition == POS_BOTTOM || g_TbPosition == POS_TOP) {
-        int tlX = 6 + START_BTN_WIDTH + 6, yOff = (g_TbHeight - 22) / 2;
-        int rows = (g_TbHeight - 6) / 21, cols, trayW, clockW;
+        int tlX = 6 + startBtnW + 6, yOff = (g_TbHeight - startBtnH) / 2;
+        int rows = (g_TbHeight - 6) / trayCell, cols, trayW, clockW;
         if (rows < 1) rows = 1; cols = (g_TrayIconCount + rows - 1) / rows; if (cols < 1) cols = 1;
         
-        trayW = (g_TrayIconCount > 0) ? (cols * 21) : 21; 
+        trayW = (g_TrayIconCount > 0) ? (cols * trayCell) : trayCell; 
         clockW = CLOCK_WIDTH + trayW + 4;
         
-        MoveWindow(g_hStartBtn, 4, yOff, START_BTN_WIDTH, 22, TRUE);
+        MoveWindow(g_hStartBtn, 4, yOff, startBtnW, startBtnH, TRUE);
         if (qlCount > 0) {
             for (i = 0; i < QUICK_LAUNCH_COUNT; i++) {
-                if (i < qlCount) { MoveWindow(g_hQuickLaunch[i], tlX + i * 40, yOff, 38, 22, TRUE); ShowWindow(g_hQuickLaunch[i], SW_SHOW); } 
+                if (i < qlCount) { MoveWindow(g_hQuickLaunch[i], tlX + i * 40, (g_TbHeight - 22)/2, 38, 22, TRUE); ShowWindow(g_hQuickLaunch[i], SW_SHOW); } 
                 else ShowWindow(g_hQuickLaunch[i], SW_HIDE);
             }
             if (g_hSearchBox) ShowWindow(g_hSearchBox, SW_HIDE);
             tlX += qlW + 6;
         } else {
             for (i = 0; i < QUICK_LAUNCH_COUNT; i++) ShowWindow(g_hQuickLaunch[i], SW_HIDE);
-            if (g_hSearchBox) { MoveWindow(g_hSearchBox, tlX, yOff, 120, 22, TRUE); ShowWindow(g_hSearchBox, SW_SHOW); tlX += 120 + 6; }
+            if (g_hSearchBox) { MoveWindow(g_hSearchBox, tlX, (g_TbHeight - 22)/2, 120, 22, TRUE); ShowWindow(g_hSearchBox, SW_SHOW); tlX += 120 + 6; }
         }
         int tlW = cx - clockW - tlX - 8; if (tlW < 50) tlW = 50;
         MoveWindow(g_hTaskList, tlX, 3, tlW, g_TbHeight - 6, TRUE);
         MoveWindow(g_hClock, cx - clockW - 4, 3, clockW, g_TbHeight - 6, TRUE);
     } else {
-        int y = 4, cols = (g_TbWidthVert - 8) / 21, rows, trayH, clockH, tlH, xOff;
+        int y = 4, cols = (g_TbWidthVert - 8) / trayCell, rows, trayH, clockH, tlH, xOff;
         if (cols < 1) cols = 1; rows = (g_TrayIconCount + cols - 1) / cols; if (rows < 1) rows = 1;
         
-        trayH = (g_TrayIconCount > 0) ? (rows * 21) : 21;
+        trayH = (g_TrayIconCount > 0) ? (rows * trayCell) : trayCell;
         clockH = CLOCK_HEIGHT + trayH;
         tlH = cy - clockH - y - 10; if (tlH < 50) tlH = 50;
-        xOff = (g_TbWidthVert - START_BTN_WIDTH) / 2; if (xOff < 4) xOff = 4;
+        xOff = (g_TbWidthVert - startBtnW) / 2; if (xOff < 4) xOff = 4;
         
-        MoveWindow(g_hStartBtn, xOff, y, START_BTN_WIDTH, 22, TRUE); y += 26;
+        MoveWindow(g_hStartBtn, xOff, y, startBtnW, startBtnH, TRUE); y += startBtnH + 4;
         if (qlCount > 0) {
             for (i = 0; i < QUICK_LAUNCH_COUNT; i++) {
                 if (i < qlCount) { MoveWindow(g_hQuickLaunch[i], (g_TbWidthVert - 38)/2, y, 38, 22, TRUE); ShowWindow(g_hQuickLaunch[i], SW_SHOW); y += 24; } 
@@ -1189,7 +1355,6 @@ static void ApplyLayout(void) {
     }
     RefreshTasks();
 }
-
 LRESULT CALLBACK TaskListProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_NCHITTEST) return HTTRANSPARENT; 
     if (msg == WM_COMMAND) { SendMessage(GetParent(hwnd), msg, wp, lp); return 0; }
@@ -1201,9 +1366,6 @@ LRESULT CALLBACK TaskListProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return CallWindowProc(OldTaskListProc, hwnd, msg, wp, lp);
 }
 
-/* --------------------------------------------------------------------------
-   Main Taskbar Procedure (Fixed Taskmgr dynamic handle copying & static OS text)
-   -------------------------------------------------------------------------- */
 LRESULT CALLBACK TaskbarProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_CREATE: {
@@ -1211,7 +1373,6 @@ LRESULT CALLBACK TaskbarProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             g_hMemODItems = GlobalAlloc(GPTR, MAX_OD_ITEMS * sizeof(ODMenuItem)); g_ODItems = (ODMenuItem*)GlobalLock(g_hMemODItems);
             g_hMemIniShortcuts = GlobalAlloc(GPTR, MAX_INI_SHORTCUTS * sizeof(IniShortcut)); g_IniShortcuts = (IniShortcut*)GlobalLock(g_hMemIniShortcuts);
             
-            /* DetectWindowsVersion() removed: g_szWinVer is now statically driven by LoadConfig() */
             srand((unsigned)time(NULL)); LoadConfig(); 
             
             UINT wmTaskbarCreated = RegisterWindowMessage("TaskbarCreated");
@@ -1263,7 +1424,6 @@ LRESULT CALLBACK TaskbarProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                     UINT nid_uCallbackMessage = *(UINT*)(data + 24);
                     HICON nid_hIcon = (HICON)(UINT_PTR)(*(DWORD*)(data + 28));
 
-                    /* Strictly map valid handles to correct 32/64 alignment */
                     if (!IsWindow(nid_hWnd) && pcds->cbData >= 48) {
                         nid_hWnd = (HWND)(UINT_PTR)(*(DWORD*)(data + 16));
                         nid_uID = *(UINT*)(data + 24);
@@ -1279,34 +1439,27 @@ LRESULT CALLBACK TaskbarProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                         for (j = 0; j < g_TrayIconCount; j++) {
                             if (g_TrayIcons[j].isTrueTray && g_TrayIcons[j].hwnd == nid_hWnd && g_TrayIcons[j].uID == nid_uID) { slot = j; break; }
                         }
-                        if (slot == -1 && msgId == NIM_ADD && g_TrayIconCount < MAX_TRAY_ICONS) slot = g_TrayIconCount++;
+                        if (slot == -1 && g_TrayIconCount < MAX_TRAY_ICONS) slot = g_TrayIconCount++;
                         if (slot != -1) {
-                            g_TrayIcons[slot].active = TRUE;
-                            g_TrayIcons[slot].isTrueTray = TRUE;
-                            g_TrayIcons[slot].hwnd = nid_hWnd;
-                            g_TrayIcons[slot].uID = nid_uID;
+                            g_TrayIcons[slot].active = TRUE; g_TrayIcons[slot].isTrueTray = TRUE; g_TrayIcons[slot].hwnd = nid_hWnd; g_TrayIcons[slot].uID = nid_uID;
                             if (nid_uFlags & NIF_MESSAGE) g_TrayIcons[slot].uCallbackMessage = nid_uCallbackMessage;
                             if (nid_uFlags & NIF_ICON) {
                                 if (g_TrayIcons[slot].hIcon) DestroyIcon(g_TrayIcons[slot].hIcon);
                                 g_TrayIcons[slot].hIcon = CopyIcon(nid_hIcon);
-                                /* Fallback: Apps like Taskmgr use unshared dynamically generated handles */
                                 if (!g_TrayIcons[slot].hIcon) g_TrayIcons[slot].hIcon = nid_hIcon; 
                             }
                         }
-                        PostMessage(g_hTaskbar, WM_USER_APPLYLAYOUT, 0, 0);
-                        return TRUE;
+                        PostMessage(g_hTaskbar, WM_USER_APPLYLAYOUT, 0, 0); return TRUE;
                     } else if (msgId == NIM_DELETE) {
                         int j;
                         for (j = 0; j < g_TrayIconCount; j++) {
                             if (g_TrayIcons[j].isTrueTray && g_TrayIcons[j].hwnd == nid_hWnd && g_TrayIcons[j].uID == nid_uID) {
                                 g_TrayIcons[j].active = FALSE;
                                 if (g_TrayIcons[j].hIcon) DestroyIcon(g_TrayIcons[j].hIcon);
-                                g_TrayIcons[j].hIcon = NULL;
-                                break;
+                                g_TrayIcons[j].hIcon = NULL; break;
                             }
                         }
-                        PostMessage(g_hTaskbar, WM_USER_APPLYLAYOUT, 0, 0);
-                        return TRUE;
+                        PostMessage(g_hTaskbar, WM_USER_APPLYLAYOUT, 0, 0); return TRUE;
                     }
                 }
             }
@@ -1363,9 +1516,22 @@ LRESULT CALLBACK TaskbarProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                     MoveToEx(hdc, textX, y - 1, NULL); LineTo(hdc, rc.right - 2, y - 1); SelectObject(hdc, hHighlight); MoveToEx(hdc, textX, y, NULL); LineTo(hdc, rc.right - 2, y);
                     SelectObject(hdc, hOldPen); DeleteObject(hShadow); DeleteObject(hHighlight);
                 } else {
-                    DrawGdiIcon(hdc, textX, rc.top + 2, item->polyIcon, 2); textX += 36; SetBkMode(hdc, TRANSPARENT);
+                    int iconSize = (g_UseSmallMenuIcons && !item->isRoot) ? g_IconSizeSmall : g_IconSizeLarge;
+                    int scale = 64 / (iconSize > 0 ? iconSize : 32);
+                    if (scale < 1) scale = 1;
+                    int yOff = rc.top + ((rc.bottom - rc.top) - iconSize) / 2;
+                    if (yOff < rc.top) yOff = rc.top;
+
+                    DrawGdiIcon(hdc, textX, yOff, item->polyIcon, scale); 
+                    textX += iconSize + 8; 
+                    SetBkMode(hdc, TRANSPARENT);
                     if (lpdis->itemState & ODS_SELECTED) SetTextColor(hdc, GetSysColor(COLOR_HIGHLIGHTTEXT)); else SetTextColor(hdc, GetSysColor(COLOR_MENUTEXT));
-                    { HFONT hOldMenuFont = SelectObject(hdc, g_hFontMenu); TextOut(hdc, textX, rc.top + 10, item->text, lstrlen(item->text)); SelectObject(hdc, hOldMenuFont); }
+                    { 
+                        HFONT hOldMenuFont = SelectObject(hdc, g_hFontMenu);
+                        RECT textRc = rc; textRc.left = textX; textRc.right -= 12;
+                        DrawText(hdc, item->text, -1, &textRc, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+                        SelectObject(hdc, hOldMenuFont); 
+                    }
                 }
             }
             return TRUE;
@@ -1375,7 +1541,16 @@ LRESULT CALLBACK TaskbarProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             LPMEASUREITEMSTRUCT lpmis = (LPMEASUREITEMSTRUCT)lParam;
             if (lpmis->CtlType == ODT_MENU) {
                 ODMenuItem* item = (ODMenuItem*)lpmis->itemData;
-                if (item) { if (item->isSeparator) { lpmis->itemWidth = 100; lpmis->itemHeight = 8; } else { lpmis->itemWidth = 120 + (item->isRoot ? 32 : 0); lpmis->itemHeight = 36; } }
+                if (item) { 
+                    if (item->isSeparator) { 
+                        lpmis->itemWidth = 100; lpmis->itemHeight = 8; 
+                    } else { 
+                        int iconSize = (g_UseSmallMenuIcons && !item->isRoot) ? g_IconSizeSmall : g_IconSizeLarge;
+                        lpmis->itemWidth = 200 + (item->isRoot ? 32 : 0); 
+                        lpmis->itemHeight = iconSize + 4;
+                        if (lpmis->itemHeight < 24) lpmis->itemHeight = 24;
+                    } 
+                }
             } else if (lpmis->CtlType == ODT_BUTTON) { lpmis->itemWidth = 38; lpmis->itemHeight = 22; }
             return TRUE;
         }
@@ -1397,6 +1572,7 @@ LRESULT CALLBACK TaskbarProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         }
 
         case WM_USER_CONTEXTMENU: {
+            if (g_ContextId[0] == '\0') return 0;
             HMENU hMenu = CreatePopupMenu(); UINT state = (g_ContextId[0] == '\0') ? MF_GRAYED : 0;
             AppendMenu(hMenu, MF_STRING | state, IDM_CTX_PROPS, "Properties"); AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
             AppendMenu(hMenu, MF_STRING, IDM_CTX_NEWFOLDER, "New Folder..."); AppendMenu(hMenu, MF_STRING, IDM_CTX_NEWSHORTCUT, "New Shortcut..."); AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
@@ -1408,18 +1584,37 @@ LRESULT CALLBACK TaskbarProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         
         case WM_USER_APPLYLAYOUT: { ApplyLayout(); return 0; }
         
+        case WM_USER_LAUNCH_FOLDER: {
+            ODMenuItem* pItem = (ODMenuItem*)lParam;
+            if (pItem && pItem->isFsFolder) {
+                char quotedPath[MAX_PATH + 2];
+                sprintf(quotedPath, "\"%s\"", pItem->targetPath);
+                ShellExecute(NULL, "open", g_szExplorerExe, quotedPath, NULL, SW_SHOWNORMAL);
+            }
+            return 0;
+        }
+
         case WM_MENUSELECT: {
             UINT idItem = LOWORD(wParam), flags = HIWORD(wParam); HMENU hMenu = (HMENU)lParam; 
+            g_HoveredFolderItem = NULL;
             if ((flags & 0xFFFF) == 0xFFFF && hMenu == NULL) {} 
             else if (!(flags & MF_SEPARATOR) && !(flags & MF_SYSMENU)) {
                 if (flags & MF_POPUP) {
+                    MENUITEMINFO mii; memset(&mii, 0, sizeof(mii)); mii.cbSize = sizeof(mii); mii.fMask = MIIM_DATA;
+                    if (GetMenuItemInfo(hMenu, idItem, TRUE, &mii)) {
+                        ODMenuItem* pItem = (ODMenuItem*)mii.dwItemData;
+                        if (pItem && pItem->isFsFolder) g_HoveredFolderItem = pItem;
+                    }
+                    
                     int i; for (i = 0; i < g_IniShortcutCount; i++) {
-                        if (g_IniShortcuts[i].isFolder && (g_IniShortcuts[i].hMenu == GetSubMenu(hMenu, idItem) || g_IniShortcuts[i].hMenu == (HMENU)(UINT_PTR)idItem)) {
+                        if (g_IniShortcuts[i].isFolder && g_IniShortcuts[i].hMenu != NULL && g_IniShortcuts[i].hMenu == GetSubMenu(hMenu, idItem)) {
                             lstrcpy(g_ContextId, g_IniShortcuts[i].id); g_ContextIsFolder = TRUE; break;
                         }
                     }
                 } else if (idItem >= IDM_START_BASE && idItem < IDM_START_BASE + MAX_START_ITEMS) {
                     int idx = idItem - IDM_START_BASE; if (idx < g_IniShortcutCount) { lstrcpy(g_ContextId, g_IniShortcuts[idx].id); g_ContextIsFolder = FALSE; }
+                } else if (idItem >= IDM_FS_BASE && idItem < IDM_FS_BASE + MAX_OD_ITEMS) {
+                    g_ContextId[0] = '\0';
                 }
             }
             return 0;
@@ -1435,6 +1630,8 @@ LRESULT CALLBACK TaskbarProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             else if (g_TbPosition == POS_LEFT && pt.x > rc.right - 5) g_bResizing = TRUE;
             else if (g_TbPosition == POS_RIGHT && pt.x < 5) g_bResizing = TRUE;
             else g_bDragging = TRUE;
+            
+            if (g_hSearchBox && IsWindowVisible(g_hSearchBox)) SetFocus(g_hSearchBox);
             
             ClientToScreen(hwnd, &pt); g_DragStartPt = pt; SetCapture(hwnd); return 0;
         }
@@ -1468,7 +1665,11 @@ LRESULT CALLBACK TaskbarProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             else if (id >= IDM_FS_BASE && id < IDM_FS_BASE + MAX_OD_ITEMS) {
                 int j; for (j = 0; j < g_ODCount; j++) {
                     if (g_ODItems[j].cmdId == id) {
-                        if (g_ODItems[j].isFsFolder) ShellExecute(NULL, "open", "e1plorer.exe", g_ODItems[j].targetPath, NULL, SW_SHOWNORMAL);
+                        if (g_ODItems[j].isFsFolder) {
+                            char quotedPath[MAX_PATH + 2];
+                            sprintf(quotedPath, "\"%s\"", g_ODItems[j].targetPath);
+                            ShellExecute(NULL, "open", g_szExplorerExe, quotedPath, NULL, SW_SHOWNORMAL);
+                        }
                         else { IniShortcut tempSh; memset(&tempSh, 0, sizeof(tempSh)); lstrcpy(tempSh.exe, g_ODItems[j].targetPath); LaunchShortcut(hwnd, &tempSh); }
                         break;
                     }
@@ -1484,10 +1685,28 @@ LRESULT CALLBACK TaskbarProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 int sel = SendMessage(g_hSearchList, LB_GETCURSEL, 0, 0);
                 if (sel != LB_ERR) {
                     int idx = SendMessage(g_hSearchList, LB_GETITEMDATA, sel, 0);
-                    if (idx >= 0 && idx < g_IniShortcutCount) {
-                        IniShortcut* sh = &g_IniShortcuts[idx];
-                        if (sh->isFolder) { ShowWindow(g_hSearchList, SW_HIDE); SetWindowText(g_hSearchBox, ""); ShowFolderMenu(g_hSearchBox, sh->id); return 0; } 
-                        else PostMessage(hwnd, WM_COMMAND, MAKEWPARAM(IDM_START_BASE + idx, 0), 0);
+                    if (idx >= 0 && idx < g_SearchCount) {
+                        if (g_SearchResults[idx].isIni) {
+                            IniShortcut* sh = &g_IniShortcuts[g_SearchResults[idx].iniIdx];
+                            if (sh->isFolder) { 
+                                ShowWindow(g_hSearchList, SW_HIDE); SetWindowText(g_hSearchBox, "");
+                                char targetPath[MAX_PATH], quotedPath[MAX_PATH + 2];
+                                if (sh->exe[0] != '\0') lstrcpy(targetPath, sh->exe);
+                                else { lstrcpy(targetPath, "C:\\"); lstrcat(targetPath, sh->name); }
+                                sprintf(quotedPath, "\"%s\"", targetPath);
+                                ShellExecute(NULL, "open", g_szExplorerExe, quotedPath, NULL, SW_SHOWNORMAL);
+                            } 
+                            else PostMessage(hwnd, WM_COMMAND, MAKEWPARAM(IDM_START_BASE + g_SearchResults[idx].iniIdx, 0), 0);
+                        } else {
+                            ShowWindow(g_hSearchList, SW_HIDE); SetWindowText(g_hSearchBox, "");
+                            if (g_SearchResults[idx].isFsFolder) {
+                                char quotedPath[MAX_PATH + 2];
+                                sprintf(quotedPath, "\"%s\"", g_SearchResults[idx].path);
+                                ShellExecute(NULL, "open", g_szExplorerExe, quotedPath, NULL, SW_SHOWNORMAL);
+                            } else {
+                                ShellExecute(NULL, "open", g_SearchResults[idx].path, NULL, NULL, SW_SHOWNORMAL);
+                            }
+                        }
                     }
                 }
                 ShowWindow(g_hSearchList, SW_HIDE); SetWindowText(g_hSearchBox, ""); return 0;
@@ -1560,9 +1779,9 @@ LRESULT CALLBACK TaskbarProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 PostMessage(g_hTaskbar, WM_USER_APPLYLAYOUT, 0, 0);
             }
             else if (id == IDM_TASK_CLOSE && g_ContextTargetWnd) SendMessage(g_ContextTargetWnd, WM_SYSCOMMAND, SC_CLOSE, 0L);
-            else if (id == IDM_CTX_PROPS) { if (g_ContextId[0] != '\0') { lstrcpy(g_EditShortcutId, g_ContextId); CreateCenteredDialog(g_hInst, hwnd, "ShortcutDlgClass", "Edit Properties", 360, 300); } }
+            else if (id == IDM_CTX_PROPS) { if (g_ContextId[0] != '\0') { lstrcpy(g_EditShortcutId, g_ContextId); CreateCenteredDialog(g_hInst, hwnd, "ShortcutDlgClass", "Edit Properties", 360, 330); } }
             else if (id == IDM_CTX_NEWFOLDER) { lstrcpy(g_ContextId, "0"); g_ContextIsFolder = TRUE; lstrcpy(g_PromptLabel, "New Folder Name:"); g_PromptValue[0] = '\0'; g_PromptMode = PROMPT_NEWFOLDER; CreateCenteredDialog(g_hInst, hwnd, "PromptDlgClass", "New Folder", 290, 170); }
-            else if (id == IDM_CTX_NEWSHORTCUT) { lstrcpy(g_ContextId, "0"); g_ContextIsFolder = TRUE; g_EditShortcutId[0] = '\0'; CreateCenteredDialog(g_hInst, hwnd, "ShortcutDlgClass", "Create Shortcut", 360, 300); }
+            else if (id == IDM_CTX_NEWSHORTCUT) { lstrcpy(g_ContextId, "0"); g_ContextIsFolder = TRUE; g_EditShortcutId[0] = '\0'; CreateCenteredDialog(g_hInst, hwnd, "ShortcutDlgClass", "Create Shortcut", 360, 330); }
             else if (id == IDM_CTX_RENAME) { int i; for (i = 0; i < g_IniShortcutCount; i++) { if (lstrcmp(g_IniShortcuts[i].id, g_ContextId) == 0) { lstrcpy(g_PromptValue, g_IniShortcuts[i].name); break; } } lstrcpy(g_PromptLabel, "New Name:"); g_PromptMode = PROMPT_RENAME; CreateCenteredDialog(g_hInst, hwnd, "PromptDlgClass", "Rename", 290, 130); }
             else if (id == IDM_CTX_DELETE) { 
                 if (g_ContextId[0] != '\0' && MessageBox(hwnd, "Delete item?", "Confirm", MB_YESNO) == IDYES) {
@@ -1858,9 +2077,6 @@ LRESULT CALLBACK TaskBtnProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     return CallWindowProc(OldTaskBtnProc, hwnd, msg, wParam, lParam);
 }
 
-/* ??????????????????????????????????????????????????????????????????????????
-   Start Button Procedure
-   ?????????????????????????????????????????????????????????????????????????? */
 LRESULT CALLBACK StartBtnProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == WM_DROPFILES) {
         HDROP hDrop = (HDROP)wParam;
@@ -1870,15 +2086,11 @@ LRESULT CALLBACK StartBtnProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             lstrcpy(g_DropTarget, path);
             
             char base[MAX_PATH], *p, *dot;
-            lstrcpy(base, path);
-            p = strrchr(base, '\\');
+            lstrcpy(base, path); p = strrchr(base, '\\');
             if (p) lstrcpy(base, p + 1);
             dot = strrchr(base, '.');
             if (dot) *dot = '\0';
-            if (base[0]) {
-                AnsiLower((LPSTR)base);
-                if (base[0] >= 'a' && base[0] <= 'z') base[0] -= 32; 
-            }
+            if (base[0]) { AnsiLower((LPSTR)base); if (base[0] >= 'a' && base[0] <= 'z') base[0] -= 32; }
             lstrcpy(g_DropName, base);
 
             lstrcpy(g_ContextId, "0");
@@ -1890,10 +2102,8 @@ LRESULT CALLBACK StartBtnProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 }
             }
             
-            g_ContextIsFolder = TRUE;
-            g_EditShortcutId[0] = '\0';
-            SetForegroundWindow(g_hTaskbar);
-            CreateCenteredDialog(g_hInst, g_hTaskbar, "ShortcutDlgClass", "Create Shortcut", 360, 300);
+            g_ContextIsFolder = TRUE; g_EditShortcutId[0] = '\0'; SetForegroundWindow(g_hTaskbar);
+            CreateCenteredDialog(g_hInst, g_hTaskbar, "ShortcutDlgClass", "Create Shortcut", 360, 330);
         }
         DragFinish(hDrop);
         return 0;
@@ -1914,15 +2124,24 @@ LRESULT CALLBACK StartBtnProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         MoveToEx(hdc, rc.right - 1, rc.top, NULL); LineTo(hdc, rc.right - 1, rc.bottom);
         SelectObject(hdc, hOldPen); DeleteObject(hShadow); DeleteObject(hHighlight);
         {
-            int lx = 6 + (isPushed ? 1 : 0), ly = ((rc.bottom - rc.top - 16) / 2) + (isPushed ? 1 : 0), half = 8;
+            int half = g_IconSizeSmall / 2; if (half < 8) half = 8;
+            int iconSize = half * 2;
+            int lx = 6 + (isPushed ? 1 : 0), ly = ((rc.bottom - rc.top - iconSize) / 2) + (isPushed ? 1 : 0);
+            
             hBlue = CreateSolidBrush(RGB(0, 0, 255)); hRed = CreateSolidBrush(RGB(255, 0, 0)); hGreen = CreateSolidBrush(RGB(0, 128, 0)); hYellow = CreateSolidBrush(RGB(255, 255, 0)); hBlack = CreatePen(PS_SOLID, 1, RGB(0, 0, 0));
             hOldPen = SelectObject(hdc, hBlack); hOldBrush = SelectObject(hdc, hBlue); Rectangle(hdc, lx, ly, lx + half + 1, ly + half + 1);
-            SelectObject(hdc, hRed); Rectangle(hdc, lx + half, ly, lx + (half*2) + 1, ly + half + 1);
-            SelectObject(hdc, hGreen); Rectangle(hdc, lx, ly + half, lx + half + 1, ly + (half*2) + 1);
-            SelectObject(hdc, hYellow); Rectangle(hdc, lx + half, ly + half, lx + (half*2) + 1, ly + (half*2) + 1);
+            SelectObject(hdc, hRed); Rectangle(hdc, lx + half, ly, lx + iconSize + 1, ly + half + 1);
+            SelectObject(hdc, hGreen); Rectangle(hdc, lx, ly + half, lx + half + 1, ly + iconSize + 1);
+            SelectObject(hdc, hYellow); Rectangle(hdc, lx + half, ly + half, lx + iconSize + 1, ly + iconSize + 1);
             SelectObject(hdc, hOldBrush); SelectObject(hdc, hOldPen);
             DeleteObject(hBlue); DeleteObject(hRed); DeleteObject(hGreen); DeleteObject(hYellow); DeleteObject(hBlack);
-            { HFONT hOldFont = SelectObject(hdc, g_hFontMenu); SetBkMode(hdc, TRANSPARENT); SetTextColor(hdc, GetSysColor(COLOR_BTNTEXT)); TextOut(hdc, lx + 22, ly + 1, "Start", 5); SelectObject(hdc, hOldFont); }
+            
+            int fontSize = 13 + (g_IconSizeSmall > 16 ? (g_IconSizeSmall - 16) / 2 : 0);
+            HFONT hFontStart = CreateFont(-fontSize, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, FF_SWISS, "Arial");
+            HFONT hOldFont = SelectObject(hdc, hFontStart);
+            SetBkMode(hdc, TRANSPARENT); SetTextColor(hdc, GetSysColor(COLOR_BTNTEXT)); 
+            TextOut(hdc, lx + iconSize + 6, ly + (half - (fontSize / 2)), "Start", 5); 
+            SelectObject(hdc, hOldFont); DeleteObject(hFontStart);
         }
         EndPaint(hwnd, &ps); return 0;
     }
@@ -1948,7 +2167,6 @@ LRESULT CALLBACK StartBtnProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     }
     return CallWindowProc(OldStartBtnProc, hwnd, msg, wParam, lParam);
 }
-
 /* ??????????????????????????????????????????????????????????????????????????
    Dialog Procedures
    ?????????????????????????????????????????????????????????????????????????? */
@@ -1967,8 +2185,28 @@ LRESULT CALLBACK HotkeyEditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 LRESULT CALLBACK SearchBoxProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_KEYDOWN) {
-        if (wp == VK_DOWN || wp == VK_UP) { SetFocus(g_hSearchList); SendMessage(g_hSearchList, WM_KEYDOWN, wp, lp); return 0; }
-        if (wp == VK_RETURN) { PostMessage(g_hTaskbar, WM_COMMAND, MAKEWPARAM(IDM_SEARCH_LIST, LBN_DBLCLK), (LPARAM)g_hSearchList); return 0; }
+        if (wp == VK_DOWN || wp == VK_UP) { 
+            int count = SendMessage(g_hSearchList, LB_GETCOUNT, 0, 0);
+            if (count > 0) {
+                int sel = SendMessage(g_hSearchList, LB_GETCURSEL, 0, 0);
+                if (wp == VK_DOWN) {
+                    sel = (sel == LB_ERR) ? 0 : sel + 1;
+                    if (sel >= count) sel = count - 1;
+                } else {
+                    sel = (sel == LB_ERR) ? count - 1 : sel - 1;
+                    if (sel < 0) sel = 0;
+                }
+                SendMessage(g_hSearchList, LB_SETCURSEL, sel, 0);
+            }
+            return 0; 
+        }
+        if (wp == VK_RETURN) {
+            if (SendMessage(g_hSearchList, LB_GETCURSEL, 0, 0) == LB_ERR && SendMessage(g_hSearchList, LB_GETCOUNT, 0, 0) > 0) {
+                SendMessage(g_hSearchList, LB_SETCURSEL, 0, 0);
+            }
+            PostMessage(g_hTaskbar, WM_COMMAND, MAKEWPARAM(IDM_SEARCH_LIST, LBN_DBLCLK), (LPARAM)g_hSearchList); 
+            return 0; 
+        }
         if (wp == VK_ESCAPE) { ShowWindow(g_hSearchList, SW_HIDE); SetWindowText(hwnd, ""); return 0; }
     }
     if (msg == WM_KEYUP && wp != VK_DOWN && wp != VK_UP && wp != VK_RETURN && wp != VK_ESCAPE) {
@@ -1977,21 +2215,35 @@ LRESULT CALLBACK SearchBoxProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_TIMER && wp == TIMER_SEARCH) {
         KillTimer(hwnd, TIMER_SEARCH);
         char buf[64]; GetWindowText(hwnd, buf, sizeof(buf)); SendMessage(g_hSearchList, LB_RESETCONTENT, 0, 0);
+        g_SearchCount = 0; 
+        
         if (buf[0]) {
             int i; char bufUpper[64]; lstrcpy(bufUpper, buf); AnsiUpper((LPSTR)bufUpper);
+            
             for (i=0; i<g_IniShortcutCount; i++) {
                 if (lstrcmp(g_IniShortcuts[i].name, "-") != 0) {
                     char nameUpper[64]; lstrcpy(nameUpper, g_IniShortcuts[i].name); AnsiUpper((LPSTR)nameUpper);
-                    if (strstr(nameUpper, bufUpper)) {
-                        int pos = SendMessage(g_hSearchList, LB_ADDSTRING, 0, (LPARAM)g_IniShortcuts[i].name);
-                        SendMessage(g_hSearchList, LB_SETITEMDATA, pos, i);
+                    if (strstr(nameUpper, bufUpper) && g_SearchCount < 200) {
+                        g_SearchResults[g_SearchCount].isIni = TRUE;
+                        g_SearchResults[g_SearchCount].iniIdx = i;
+                        lstrcpyn(g_SearchResults[g_SearchCount].display, g_IniShortcuts[i].name, 63);
+                        int pos = SendMessage(g_hSearchList, LB_ADDSTRING, 0, (LPARAM)g_SearchResults[g_SearchCount].display);
+                        SendMessage(g_hSearchList, LB_SETITEMDATA, pos, g_SearchCount);
+                        g_SearchCount++;
                     }
                 }
             }
+            
+            for (i=0; i<g_IniShortcutCount; i++) {
+                if (g_IniShortcuts[i].isFolder && g_IniShortcuts[i].exe[0] != '\0') {
+                    DoFsSearch(g_IniShortcuts[i].exe, bufUpper, g_IniShortcuts[i].isRecursive, 0);
+                }
+            }
+            
             if (SendMessage(g_hSearchList, LB_GETCOUNT, 0, 0) > 0) {
                 RECT rc; int lbH; GetWindowRect(hwnd, &rc);
                 lbH = SendMessage(g_hSearchList, LB_GETCOUNT, 0, 0) * 16 + 2; if (lbH > 200) lbH = 200;
-                SendMessage(g_hSearchList, LB_SETCURSEL, 0, 0);
+                
                 int screenH = GetSystemMetrics(SM_CYSCREEN), screenW = GetSystemMetrics(SM_CXSCREEN);
                 int sx = rc.left, sy = rc.top;
                 if (g_TbPosition == POS_BOTTOM) sy = rc.top - lbH;
@@ -2000,7 +2252,8 @@ LRESULT CALLBACK SearchBoxProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 else sx = rc.right;
                 if (sy + lbH > screenH) sy = screenH - lbH;
                 if (sy < 0) sy = 0; if (sx + 150 > screenW) sx = screenW - 150; if (sx < 0) sx = 0;
-                SetWindowPos(g_hSearchList, HWND_TOPMOST, sx, sy, 150, lbH, SWP_SHOWWINDOW);
+                
+                SetWindowPos(g_hSearchList, HWND_TOPMOST, sx, sy, 150, lbH, SWP_SHOWWINDOW | SWP_NOACTIVATE);
             } else ShowWindow(g_hSearchList, SW_HIDE);
         } else ShowWindow(g_hSearchList, SW_HIDE);
         return 0; 
@@ -2028,16 +2281,22 @@ LRESULT CALLBACK MsgFilterProc(int code, WPARAM wParam, LPARAM lParam) {
     if (code == MSGF_MENU) {
         MSG* pMsg = (MSG*)lParam;
         if (pMsg->message == WM_RBUTTONUP) { PostMessage(g_hTaskbar, WM_USER_CONTEXTMENU, 0, MAKELONG(pMsg->pt.x, pMsg->pt.y)); SendMessage(pMsg->hwnd, WM_CANCELMODE, 0, 0); return 1; }
+        if (pMsg->message == WM_LBUTTONUP) {
+            if (g_HoveredFolderItem) {
+                PostMessage(g_hTaskbar, WM_USER_LAUNCH_FOLDER, 0, (LPARAM)g_HoveredFolderItem);
+                SendMessage(pMsg->hwnd, WM_CANCELMODE, 0, 0);
+                return 1;
+            }
+        }
     }
     return CallNextHookEx(g_hMsgHook, code, wParam, lParam);
 }
-
 LRESULT CALLBACK ShortcutDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     static HWND hName, hTarget, hParams, hIcon, hMinCheck, hFolderCheck, hMapDirCheck, hParentFolder, hHotkey, hTargetLbl;
     switch(msg) {
         case WM_CREATE: {
             char name[MAX_PATH] = "", target[MAX_PATH] = "", params[MAX_PATH] = "", iconF[MAX_PATH] = "", parentId[16] = "0"; 
-            int minimized = 0, isFolder = 0, bMapDir = 0, vkCode = 0, i;
+            int minimized = 0, isFolder = 0, bMapDir = 0, vkCode = 0, isRecursive = 0, i;
             
             if (g_DropTarget[0] != '\0') {
                 lstrcpy(name, g_DropName); lstrcpy(target, g_DropTarget); lstrcpy(parentId, g_ContextId);
@@ -2049,7 +2308,9 @@ LRESULT CALLBACK ShortcutDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     if (lstrcmp(g_IniShortcuts[i].id, g_EditShortcutId) == 0) {
                         lstrcpy(name, g_IniShortcuts[i].name); lstrcpy(target, g_IniShortcuts[i].exe); lstrcpy(params, g_IniShortcuts[i].params); lstrcpy(iconF, g_IniShortcuts[i].icon);
                         lstrcpy(parentId, g_IniShortcuts[i].parentId); vkCode = atoi(g_IniShortcuts[i].hotkey);
-                        minimized = g_IniShortcuts[i].minimized; isFolder = g_IniShortcuts[i].isFolder; bMapDir = (isFolder && target[0] != '\0'); break; 
+                        minimized = g_IniShortcuts[i].minimized; isFolder = g_IniShortcuts[i].isFolder; 
+                        isRecursive = g_IniShortcuts[i].isRecursive;
+                        bMapDir = (isFolder && target[0] != '\0'); break; 
                     } 
                 }
             } else if (g_ContextId[0] != '\0') lstrcpy(parentId, g_ContextId);
@@ -2078,8 +2339,10 @@ LRESULT CALLBACK ShortcutDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             hMinCheck = CreateWindow("BUTTON", "Start Minimized", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 130, 190, 120, 20, hwnd, NULL, g_hInst, NULL);
             hFolderCheck = CreateWindow("BUTTON", "Is Folder", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 260, 190, 80, 20, hwnd, (HMENU)103, g_hInst, NULL);
             hMapDirCheck = CreateWindow("BUTTON", "Map Dir to Menu", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 130, 215, 140, 20, hwnd, (HMENU)104, g_hInst, NULL);
-            CreateWindow("BUTTON", "OK", WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON, 90, 250, 80, 24, hwnd, (HMENU)IDOK, g_hInst, NULL);
-            CreateWindow("BUTTON", "Cancel", WS_CHILD|WS_VISIBLE, 190, 250, 80, 24, hwnd, (HMENU)IDCANCEL, g_hInst, NULL);
+            hRecursiveCheck = CreateWindow("BUTTON", "Recursive Folder", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 130, 240, 140, 20, hwnd, (HMENU)105, g_hInst, NULL);
+            
+            CreateWindow("BUTTON", "OK", WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON, 90, 275, 80, 24, hwnd, (HMENU)IDOK, g_hInst, NULL);
+            CreateWindow("BUTTON", "Cancel", WS_CHILD|WS_VISIBLE, 190, 275, 80, 24, hwnd, (HMENU)IDCANCEL, g_hInst, NULL);
             
             SendMessage(hParentFolder, CB_ADDSTRING, 0, (LPARAM)"0 (Root)");
             for (i = 0; i < g_IniShortcutCount; i++) {
@@ -2100,12 +2363,13 @@ LRESULT CALLBACK ShortcutDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (minimized) SendMessage(hMinCheck, BM_SETCHECK, 1, 0); 
             SendMessage(hFolderCheck, BM_SETCHECK, isFolder, 0);
             SendMessage(hMapDirCheck, BM_SETCHECK, bMapDir, 0);
+            SendMessage(hRecursiveCheck, BM_SETCHECK, isRecursive, 0);
             
             if (isFolder) {
-                EnableWindow(hParams, FALSE); EnableWindow(hMinCheck, FALSE); EnableWindow(hHotkey, FALSE); EnableWindow(hMapDirCheck, TRUE);
+                EnableWindow(hParams, FALSE); EnableWindow(hMinCheck, FALSE); EnableWindow(hHotkey, FALSE); EnableWindow(hMapDirCheck, TRUE); EnableWindow(hRecursiveCheck, TRUE);
                 if (bMapDir) { EnableWindow(hTarget, TRUE); EnableWindow(GetDlgItem(hwnd, 101), TRUE); } 
                 else { EnableWindow(hTarget, FALSE); EnableWindow(GetDlgItem(hwnd, 101), FALSE); }
-            } else { EnableWindow(hMapDirCheck, FALSE); }
+            } else { EnableWindow(hMapDirCheck, FALSE); EnableWindow(hRecursiveCheck, FALSE); }
 
             SetFont(hwnd, NULL); SetFocus(hName); PositionDialogNearStart(hwnd); return 0;
         }
@@ -2134,11 +2398,12 @@ LRESULT CALLBACK ShortcutDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             else if (LOWORD(wp) == 103) {
                 if (SendMessage(hFolderCheck, BM_GETCHECK, 0, 0)) {
                     EnableWindow(hParams, FALSE); SetWindowText(hParams, ""); EnableWindow(hMinCheck, FALSE); SendMessage(hMinCheck, BM_SETCHECK, 0, 0);
-                    EnableWindow(hHotkey, FALSE); SetWindowText(hHotkey, ""); RemoveProp(hHotkey, "VK"); EnableWindow(hMapDirCheck, TRUE);
+                    EnableWindow(hHotkey, FALSE); SetWindowText(hHotkey, ""); RemoveProp(hHotkey, "VK"); EnableWindow(hMapDirCheck, TRUE); EnableWindow(hRecursiveCheck, TRUE);
                     if (SendMessage(hMapDirCheck, BM_GETCHECK, 0, 0)) { SetWindowText(hTargetLbl, "Dir Path:"); EnableWindow(hTarget, TRUE); EnableWindow(GetDlgItem(hwnd, 101), TRUE); } 
                     else { SetWindowText(hTargetLbl, "Target:"); EnableWindow(hTarget, FALSE); EnableWindow(GetDlgItem(hwnd, 101), FALSE); }
                 } else {
                     EnableWindow(hMapDirCheck, FALSE); SendMessage(hMapDirCheck, BM_SETCHECK, 0, 0);
+                    EnableWindow(hRecursiveCheck, FALSE); SendMessage(hRecursiveCheck, BM_SETCHECK, 0, 0);
                     SetWindowText(hTargetLbl, "Target (File):"); EnableWindow(hTarget, TRUE); EnableWindow(GetDlgItem(hwnd, 101), TRUE);
                     EnableWindow(hParams, TRUE); EnableWindow(hMinCheck, TRUE); EnableWindow(hHotkey, TRUE);
                 }
@@ -2164,6 +2429,7 @@ LRESULT CALLBACK ShortcutDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     lstrcpy(sh.parentId, parentSel[0] ? parentSel : "0"); lstrcpy(sh.name, name); lstrcpy(sh.exe, target); lstrcpy(sh.params, params); lstrcpy(sh.icon, iconF);
                     if (vkCode) sprintf(sh.hotkey, "%d", vkCode); else sh.hotkey[0] = '\0';
                     sh.minimized = SendMessage(hMinCheck, BM_GETCHECK, 0, 0) ? 1 : 0; sh.isFolder = SendMessage(hFolderCheck, BM_GETCHECK, 0, 0) ? 1 : 0;
+                    sh.isRecursive = SendMessage(hRecursiveCheck, BM_GETCHECK, 0, 0) ? 1 : 0;
                     if (sh.isFolder) { sh.params[0] = '\0'; sh.hotkey[0] = '\0'; if (!SendMessage(hMapDirCheck, BM_GETCHECK, 0, 0)) sh.exe[0] = '\0'; }
                     if (foundIdx != -1) g_IniShortcuts[foundIdx] = sh; else if (g_IniShortcutCount < MAX_INI_SHORTCUTS) g_IniShortcuts[g_IniShortcutCount++] = sh;
                     qsort(g_IniShortcuts, g_IniShortcutCount, sizeof(IniShortcut), CompareIni); g_bIniChanged = TRUE;
@@ -2175,8 +2441,6 @@ LRESULT CALLBACK ShortcutDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     return DefWindowProc(hwnd, msg, wp, lp);
 }
-
-
 LRESULT CALLBACK PromptDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     static HWND hEdit, hParentFolder;
     switch(msg) {
