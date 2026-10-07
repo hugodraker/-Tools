@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Windows Shell Configurator</title>
+    <HTA:APPLICATION 
+        ID="objShellConfig"
+        APPLICATIONNAME="ShellConfigurator"
+        BORDER="dialog"
+        BORDERSTYLE="normal"
+        CAPTION="yes"
+        MAXIMIZEBUTTON="no"
+        MINIMIZEBUTTON="yes"
+        SCROLL="no"
+        SINGLEINSTANCE="yes"
+        WIDTH="480"
+        HEIGHT="260"
+    />
+
+    <script language="VBScript">
+        Sub Window_OnLoad
+            window.resizeTo 480, 260
+            If Not IsAdmin() Then
+                ElevateHTA()
+            Else
+                LoadCurrentShell()
+            End If
+        End Sub
+
+        ' Test write access to HKLM to verify administrator privileges
+        Function IsAdmin()
+            On Error Resume Next
+            Dim oShell
+            Set oShell = CreateObject("WScript.Shell")
+            oShell.RegWrite "HKLM\SOFTWARE\AdminAccessTest\", 1, "REG_DWORD"
+            If Err.Number = 0 Then
+                oShell.RegDelete "HKLM\SOFTWARE\AdminAccessTest\"
+                IsAdmin = True
+            Else
+                IsAdmin = False
+            End If
+            Err.Clear
+        End Function
+
+        ' Relaunch mshta.exe with elevated privileges (UAC prompt)
+        Sub ElevateHTA()
+            Dim oShellApp, htaPath
+            htaPath = document.location.pathname
+            Set oShellApp = CreateObject("Shell.Application")
+            oShellApp.ShellExecute "mshta.exe", """" & htaPath & """", "", "runas", 1
+            window.close()
+        End Sub
+
+        ' Read current user shell setting
+        Sub LoadCurrentShell()
+            On Error Resume Next
+            Dim oShell, currentShell
+            Set oShell = CreateObject("WScript.Shell")
+            currentShell = oShell.RegRead("HKCU\Software\Microsoft\Windows NT\CurrentVersion\Winlogon\Shell")
+            If Err.Number <> 0 Or currentShell = "" Then
+                currentShell = "explorer.exe (Default)"
+                Err.Clear
+            End If
+            document.getElementById("currentShellTxt").innerText = currentShell
+        End Sub
+
+        ' Apply selected file as the new shell
+        Sub ChangeShell()
+            Dim filePath, oShell
+            filePath = document.getElementById("filePicker").value
+            
+            If filePath = "" Then
+                MsgBox "Please browse and select an executable file first.", 48, "No File Selected"
+                Exit Sub
+            End If
+
+            Set oShell = CreateObject("WScript.Shell")
+            
+            On Error Resume Next
+            ' Write to current user Winlogon shell key
+            oShell.RegWrite "HKCU\Software\Microsoft\Windows NT\CurrentVersion\Winlogon\Shell", filePath, "REG_SZ"
+            
+            If Err.Number = 0 Then
+                MsgBox "Shell updated successfully to:" & vbCrLf & filePath & vbCrLf & vbCrLf & "The change will take effect on the next login.", 64, "Success"
+                LoadCurrentShell()
+            Else
+                MsgBox "Failed to update registry: " & Err.Description, 16, "Error"
+            End If
+            Err.Clear
+        End Sub
+
+        ' Reset shell back to default Windows Explorer
+        Sub RestoreDefault()
+            Dim oShell
+            Set oShell = CreateObject("WScript.Shell")
+            On Error Resume Next
+            oShell.RegWrite "HKCU\Software\Microsoft\Windows NT\CurrentVersion\Winlogon\Shell", "explorer.exe", "REG_SZ"
+            If Err.Number = 0 Then
+                MsgBox "Shell restored to default (explorer.exe). Take effect on next login.", 64, "Restored"
+                LoadCurrentShell()
+            Else
+                MsgBox "Error restoring default shell: " & Err.Description, 16, "Error"
+            End If
+            Err.Clear
+        End Sub
+    </script>
+
+    <style type="text/css">
+        body {
+            font-family: "Segoe UI", Tahoma, sans-serif;
+            font-size: 12px;
+            background-color: #F4F4F4;
+            margin: 15px;
+            color: #333;
+        }
+        .section {
+            margin-bottom: 12px;
+        }
+        label {
+            font-weight: bold;
+            display: block;
+            margin-bottom: 4px;
+        }
+        #currentShellTxt {
+            font-style: italic;
+            color: #005A9E;
+        }
+        input[type="file"] {
+            width: 100%;
+            background: #FFF;
+            border: 1px solid #CCC;
+            padding: 3px;
+        }
+        .btn-container {
+            margin-top: 15px;
+        }
+        button {
+            padding: 6px 14px;
+            margin-right: 6px;
+            cursor: pointer;
+        }
+    </style>
+</head>
+<body>
+    <div class="section">
+        <label>Current Registered Shell:</label>
+        <span id="currentShellTxt">Checking...</span>
+    </div>
+
+    <div class="section">
+        <label for="filePicker">Select New Shell Executable:</label>
+        <input type="file" id="filePicker" accept=".exe" />
+    </div>
+
+    <div class="btn-container">
+        <button onclick="ChangeShell()">Apply New Shell</button>
+        <button onclick="RestoreDefault()">Restore Default (Explorer)</button>
+    </div>
+</body>
+</html>
