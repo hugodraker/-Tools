@@ -1,11 +1,15 @@
 /*
  * File: osk.c
  * Description: Win32 Native On-Screen Keyboard for Windows LiveCD / WinPE.
- *              - English QWERTY Layout.
- *              - Temporarily resizes desktop work area so windows are never obstructed.
- *              - Clickable top border to flip between Top and Bottom of screen.
- *              - Bulletproof focus tracking for Carets and CMD consoles.
- *              - Optional 'Window Mode' to float over everything.
+ *              - English QWERTY Layout with crisp Square Keys.
+ *              - Floating Mode: Grab Bar is always at the top.
+ *              - Timer-based polling engine (bypasses WinEventHook hangs).
+ *              - Explicit "Hide" button 1/4th across the grab bar to close stubborn instances.
+ *              - Starts visible immediately (Manual Override mode).
+ *              - WM_DISPLAYCHANGE hook automatically scales width on rotation.
+ *              - Clickable grab bar cycles: Dock Bottom -> Dock Top -> Floating.
+ *              - Dragging the grab bar instantly converts to Floating Mode.
+ *              - IPC Rescue: Running the exe twice forces it open.
  * License: Released into the Public Domain.
  * 
  * Compile using:
@@ -24,30 +28,43 @@
 #include <ctype.h>
 
 #define WM_USER_TRAY         (WM_USER + 1)
+#define WM_USER_SHOW_MANAGER (WM_USER + 2)
 #define ID_TRAY_EXIT         9999
 #define ID_TRAY_WINDOW_MODE  9998
 
-#define GRAB_BAR_HEIGHT 28
+#define ID_TIMER_FOCUS       1
+
+#define GRAB_BAR_HEIGHT      28
 
 // --- Globals ---
 HWND hMainWnd = NULL;
 NOTIFYICONDATA nid;
-HWINEVENTHOOK hEventHook = NULL;
 
 HFONT hFontNormal, hFontSmall;
 
-// Settings
+// Settings 
 int g_oskHeight = 320;
 BOOL g_bWindowMode = FALSE;
 BOOL g_bDockTop = FALSE;
+int g_floatingY = -1; 
 
-// State
+// State & Dragging
 BOOL g_bIsVisible = FALSE;
-BOOL g_bWorkAreaAltered = FALSE;
+BOOL g_bManualOverride = TRUE; // Start visible immediately on launch
+BOOL g_bTrayIconAdded = FALSE;
+HWND g_hSuppressedWindow = NULL;
+
 BOOL g_bShiftLock = FALSE;
 BOOL g_bCaps = FALSE;
 int g_hoverKey = -1;
 int g_downKey = -1;
+
+BOOL g_bHoverHide = FALSE; // Tracks hover state for the Hide label
+
+BOOL g_bGrabTracking = FALSE;
+BOOL g_bIsDragging = FALSE;
+POINT g_ptGrabStart;
+RECT g_rcWindowStart;
 
 // Theme Colors
 #define CLR_BG        RGB(230, 233, 237)
@@ -73,70 +90,35 @@ typedef struct {
 #define TOTAL_UNITS 150
 
 KeyDef layout[] = {
-    // Row 1
     {"`", "~", VK_OEM_3, 10, FALSE, {0}}, {"1", "!", '1', 10, FALSE, {0}}, {"2", "@", '2', 10, FALSE, {0}}, 
     {"3", "#", '3', 10, FALSE, {0}}, {"4", "$", '4', 10, FALSE, {0}}, {"5", "%", '5', 10, FALSE, {0}}, 
     {"6", "^", '6', 10, FALSE, {0}}, {"7", "&", '7', 10, FALSE, {0}}, {"8", "*", '8', 10, FALSE, {0}}, 
     {"9", "(", '9', 10, FALSE, {0}}, {"0", ")", '0', 10, FALSE, {0}}, {"-", "_", VK_OEM_MINUS, 10, FALSE, {0}}, 
     {"=", "+", VK_OEM_PLUS, 10, FALSE, {0}}, {"Backspace", "Backspace", VK_BACK, 20, TRUE, {0}},
 
-    // Row 2
     {"Tab", "Tab", VK_TAB, 15, TRUE, {0}}, {"q", "Q", 'Q', 10, FALSE, {0}}, {"w", "W", 'W', 10, FALSE, {0}}, 
     {"e", "E", 'E', 10, FALSE, {0}}, {"r", "R", 'R', 10, FALSE, {0}}, {"t", "T", 'T', 10, FALSE, {0}}, 
     {"y", "Y", 'Y', 10, FALSE, {0}}, {"u", "U", 'U', 10, FALSE, {0}}, {"i", "I", 'I', 10, FALSE, {0}}, 
     {"o", "O", 'O', 10, FALSE, {0}}, {"p", "P", 'P', 10, FALSE, {0}}, {"[", "{", VK_OEM_4, 10, FALSE, {0}}, 
     {"]", "}", VK_OEM_6, 10, FALSE, {0}}, {"\\", "|", VK_OEM_5, 15, FALSE, {0}},
 
-    // Row 3
     {"Caps", "Caps", VK_CAPITAL, 18, TRUE, {0}}, {"a", "A", 'A', 10, FALSE, {0}}, {"s", "S", 'S', 10, FALSE, {0}}, 
     {"d", "D", 'D', 10, FALSE, {0}}, {"f", "F", 'F', 10, FALSE, {0}}, {"g", "G", 'G', 10, FALSE, {0}}, 
     {"h", "H", 'H', 10, FALSE, {0}}, {"j", "J", 'J', 10, FALSE, {0}}, {"k", "K", 'K', 10, FALSE, {0}}, 
     {"l", "L", 'L', 10, FALSE, {0}}, {";", ":", VK_OEM_1, 10, FALSE, {0}}, {"'", "\"", VK_OEM_7, 10, FALSE, {0}}, 
     {"Enter", "Enter", VK_RETURN, 22, TRUE, {0}},
 
-    // Row 4
     {"Shift", "Shift", VK_SHIFT, 23, TRUE, {0}}, {"z", "Z", 'Z', 10, FALSE, {0}}, {"x", "X", 'X', 10, FALSE, {0}}, 
     {"c", "C", 'C', 10, FALSE, {0}}, {"v", "V", 'V', 10, FALSE, {0}}, {"b", "B", 'B', 10, FALSE, {0}}, 
     {"n", "N", 'N', 10, FALSE, {0}}, {"m", "M", 'M', 10, FALSE, {0}}, {",", "<", VK_OEM_COMMA, 10, FALSE, {0}}, 
     {".", ">", VK_OEM_PERIOD, 10, FALSE, {0}}, {"/", "?", VK_OEM_2, 10, FALSE, {0}}, {"Shift", "Shift", VK_RSHIFT, 27, TRUE, {0}},
 
-    // Row 5
     {"Ctrl", "Ctrl", VK_CONTROL, 15, TRUE, {0}}, {"Win", "Win", VK_LWIN, 15, TRUE, {0}}, {"Alt", "Alt", VK_MENU, 15, TRUE, {0}}, 
     {"Space", "Space", VK_SPACE, 60, FALSE, {0}}, 
     {"Alt", "Alt", VK_RMENU, 15, TRUE, {0}}, {"Menu", "Menu", VK_APPS, 15, TRUE, {0}}, {"Ctrl", "Ctrl", VK_RCONTROL, 15, TRUE, {0}}
 };
 
 int numKeys = sizeof(layout) / sizeof(KeyDef);
-
-// --- Config / INI ---
-
-void LoadConfig() {
-    char iniPath[MAX_PATH];
-    GetModuleFileNameA(NULL, iniPath, MAX_PATH);
-    char *lastSlash = strrchr(iniPath, '\\');
-    if (lastSlash) strcpy(lastSlash + 1, "osk.ini");
-    else strcpy(iniPath, ".\\osk.ini");
-
-    g_oskHeight = GetPrivateProfileIntA("Settings", "Height", 330, iniPath);
-    g_bWindowMode = GetPrivateProfileIntA("Settings", "WindowMode", 0, iniPath);
-    g_bDockTop = GetPrivateProfileIntA("Settings", "DockTop", 0, iniPath);
-}
-
-void SaveConfig() {
-    char iniPath[MAX_PATH];
-    GetModuleFileNameA(NULL, iniPath, MAX_PATH);
-    char *lastSlash = strrchr(iniPath, '\\');
-    if (lastSlash) strcpy(lastSlash + 1, "osk.ini");
-    else strcpy(iniPath, ".\\osk.ini");
-
-    char buf[16];
-    sprintf(buf, "%d", g_oskHeight);
-    WritePrivateProfileStringA("Settings", "Height", buf, iniPath);
-    sprintf(buf, "%d", g_bWindowMode);
-    WritePrivateProfileStringA("Settings", "WindowMode", buf, iniPath);
-    sprintf(buf, "%d", g_bDockTop);
-    WritePrivateProfileStringA("Settings", "DockTop", buf, iniPath);
-}
 
 // --- Custom Draw Helpers ---
 
@@ -147,12 +129,12 @@ void DrawSolidRect(HDC hdc, int x, int y, int w, int h, COLORREF col) {
     DeleteObject(br);
 }
 
-void DrawRoundRect(HDC hdc, int x, int y, int w, int h, int rad, COLORREF col) {
+void DrawSquareRect(HDC hdc, int x, int y, int w, int h, COLORREF col) {
     HBRUSH br = CreateSolidBrush(col);
-    HPEN pen = CreatePen(PS_SOLID, 1, col);
+    HPEN pen = CreatePen(PS_SOLID, 1, col); 
     HBRUSH oldBr = (HBRUSH)SelectObject(hdc, br);
     HPEN oldPen = (HPEN)SelectObject(hdc, pen);
-    RoundRect(hdc, x, y, x+w, y+h, rad, rad);
+    Rectangle(hdc, x, y, x+w, y+h);
     SelectObject(hdc, oldBr);
     SelectObject(hdc, oldPen);
     DeleteObject(br);
@@ -203,52 +185,45 @@ HICON CreateKeyboardTrayIcon() {
     return hIcon;
 }
 
-// --- Work Area & Positioning Logic ---
-
-RECT GetRealWorkArea() {
-    RECT rc;
-    SystemParametersInfo(SPI_GETWORKAREA, 0, &rc, 0);
-    
-    // If we currently hold the work area hostage, compensate to find the "true" desktop size
-    if (g_bWorkAreaAltered) {
-        if (g_bDockTop) rc.top -= g_oskHeight;
-        else rc.bottom += g_oskHeight;
-    }
-    return rc;
-}
+// --- Positioning Logic ---
 
 void PositionKeyboard() {
-    RECT wa = GetRealWorkArea();
-    int x = wa.left;
-    int w = wa.right - wa.left;
-    int y;
-
-    if (g_bWindowMode) {
-        y = g_bDockTop ? wa.top : wa.bottom - g_oskHeight;
-        SetWindowPos(hMainWnd, HWND_TOPMOST, x, y, w, g_oskHeight, SWP_NOACTIVATE | SWP_NOZORDER);
-        
-        // Restore standard work area if turning Window Mode on
-        if (g_bWorkAreaAltered) {
-            SystemParametersInfo(SPI_SETWORKAREA, 0, &wa, SPIF_SENDCHANGE);
-            g_bWorkAreaAltered = FALSE;
-        }
-    } else {
-        y = g_bDockTop ? wa.top : wa.bottom - g_oskHeight;
-        SetWindowPos(hMainWnd, HWND_TOPMOST, x, y, w, g_oskHeight, SWP_NOACTIVATE | SWP_NOZORDER);
-        
-        if (g_bIsVisible) {
-            // Shrink the work area to push maximized windows away
-            RECT newWa = wa;
-            if (g_bDockTop) newWa.top += g_oskHeight;
-            else newWa.bottom -= g_oskHeight;
-            
-            SystemParametersInfo(SPI_SETWORKAREA, 0, &newWa, SPIF_SENDCHANGE);
-            g_bWorkAreaAltered = TRUE;
-        } else if (g_bWorkAreaAltered) {
-            SystemParametersInfo(SPI_SETWORKAREA, 0, &wa, SPIF_SENDCHANGE);
-            g_bWorkAreaAltered = FALSE;
-        }
+    RECT wa;
+    SystemParametersInfo(SPI_GETWORKAREA, 0, &wa, 0);
+    
+    int w = GetSystemMetrics(SM_CXSCREEN);
+    int h = GetSystemMetrics(SM_CYSCREEN);
+    
+    // WINPE FAILSAFE: If SPI_GETWORKAREA fails or returns 0, use physical screen
+    if (wa.bottom <= 0 || wa.right <= 0) {
+        wa.left = 0; wa.top = 0;
+        wa.right = w; wa.bottom = h;
     }
+    
+    if (g_oskHeight < 180) g_oskHeight = 180;
+    if (g_oskHeight > h - 100) g_oskHeight = h - 100;
+
+    if (g_floatingY == -1) g_floatingY = wa.bottom - g_oskHeight;
+
+    int y = 0;
+    if (g_bWindowMode) {
+        y = g_floatingY; 
+    } else if (g_bDockTop) {
+        y = wa.top;
+    } else {
+        y = wa.bottom - g_oskHeight;
+    }
+
+    // Keep safely on screen bounds
+    if (y < 0) y = 0;
+    if (y > h - g_oskHeight) y = h - g_oskHeight;
+    if (g_bWindowMode) g_floatingY = y; 
+
+    SetWindowPos(hMainWnd, HWND_TOPMOST, wa.left, y, w, g_oskHeight, SWP_NOACTIVATE | SWP_NOZORDER);
+
+    // Apply strict square edge region to window
+    HRGN hRgn = CreateRectRgn(0, 0, w, g_oskHeight); 
+    SetWindowRgn(hMainWnd, hRgn, TRUE);
 }
 
 void ShowOsk() {
@@ -262,7 +237,6 @@ void ShowOsk() {
 void HideOsk() {
     if (!g_bIsVisible) return;
     g_bIsVisible = FALSE;
-    PositionKeyboard(); // Calling this while FALSE restores the work area
     ShowWindow(hMainWnd, SW_HIDE);
 }
 
@@ -272,7 +246,6 @@ BOOL IsTextInput(HWND hwnd) {
     if (!hwnd) return FALSE;
     char szClass[256] = {0};
     GetClassNameA(hwnd, szClass, 256);
-    
     for(int i=0; szClass[i]; i++) szClass[i] = tolower(szClass[i]);
 
     if (strstr(szClass, "edit") || 
@@ -280,6 +253,8 @@ BOOL IsTextInput(HWND hwnd) {
         strstr(szClass, "scintilla") || 
         strstr(szClass, "chrome") || 
         strstr(szClass, "mozilla") ||
+        strstr(szClass, "combo") || 
+        strstr(szClass, "search") || 
         strstr(szClass, "wordpad") || 
         strstr(szClass, "rich")) {
         return TRUE;
@@ -288,8 +263,23 @@ BOOL IsTextInput(HWND hwnd) {
 }
 
 void CheckFocus() {
+    if (g_bManualOverride) return; // Keep visible if user manually forced it open
+
     HWND hFg = GetForegroundWindow();
-    if (!hFg || hFg == hMainWnd) return; // Do not hide if clicking OSK itself
+    
+    // If no window is active, or if our OSK is active, don't change state
+    if (!hFg || hFg == hMainWnd) return; 
+    
+    // Clear the suppression if focus changes to a different window
+    if (g_hSuppressedWindow && hFg != g_hSuppressedWindow) {
+        g_hSuppressedWindow = NULL;
+    }
+
+    // If the current window is suppressed, keep the OSK hidden
+    if (hFg == g_hSuppressedWindow) {
+        HideOsk();
+        return;
+    }
     
     BOOL bNeedsOsk = FALSE;
     DWORD pid;
@@ -305,21 +295,6 @@ void CheckFocus() {
     
     if (bNeedsOsk) ShowOsk();
     else HideOsk();
-}
-
-void CALLBACK WinEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD dwEventThread, DWORD dwmsEventTime) {
-    if (hwnd == hMainWnd) return; 
-
-    // Instant Caret Spawn
-    if (idObject == OBJID_CARET && event == EVENT_OBJECT_SHOW) {
-        ShowOsk();
-        return;
-    }
-
-    // Instant Focus Change
-    if (event == EVENT_OBJECT_FOCUS && idObject == OBJID_CLIENT) {
-        CheckFocus();
-    }
 }
 
 // --- Input Injection ---
@@ -364,6 +339,14 @@ void SendKeystroke(int vkCode) {
     }
 }
 
+// --- Hit Testing ---
+
+BOOL IsInGrabBar(int my) {
+    // Top of OSK for Floating AND Docked Bottom. Bottom of OSK for Docked Top.
+    if (!g_bWindowMode && g_bDockTop) return (my >= g_oskHeight - GRAB_BAR_HEIGHT);
+    else return (my <= GRAB_BAR_HEIGHT);
+}
+
 // --- UI Rendering ---
 
 void PaintUI(HWND hwnd) {
@@ -382,28 +365,50 @@ void PaintUI(HWND hwnd) {
     DrawSolidRect(memDC, 0, 0, w, h, CLR_BG);
     SetBkMode(memDC, TRANSPARENT);
 
-    // Grab Bar
-    DrawSolidRect(memDC, 0, 0, w, GRAB_BAR_HEIGHT, CLR_BAR);
+    // Grab Bar Position
+    RECT grabRc = {0, 0, w, GRAB_BAR_HEIGHT};
+    if (!g_bWindowMode && g_bDockTop) {
+        grabRc.top = h - GRAB_BAR_HEIGHT;
+        grabRc.bottom = h;
+    }
+    
+    DrawSolidRect(memDC, grabRc.left, grabRc.top, w, GRAB_BAR_HEIGHT, CLR_BAR);
     SetTextColor(memDC, CLR_TEXT_MUT);
     SelectObject(memDC, hFontSmall);
-    RECT grabRc = {0, 0, w, GRAB_BAR_HEIGHT};
-    const char* barText = g_bDockTop ? "v   Click to dock to bottom   v" : "^   Click to dock to top   ^";
-    if (g_bWindowMode) barText = "Floating Window Mode";
+    
+    const char* barText = "";
+    if (!g_bWindowMode) {
+        barText = g_bDockTop ? "v   Docked Top   v" : "^   Docked Bottom   ^";
+    }
     DrawTextA(memDC, barText, -1, &grabRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
-    // Padding & Keyboard Math
-    int padX = 8, padY = GRAB_BAR_HEIGHT + 8;
+    // Render "Hide" Button at 1/4th width
+    int hideX = w / 4;
+    RECT hideRc = { hideX - 40, grabRc.top, hideX + 40, grabRc.bottom };
+    
+    if (g_bHoverHide) {
+        DrawSolidRect(memDC, hideRc.left, hideRc.top, hideRc.right - hideRc.left, GRAB_BAR_HEIGHT, RGB(180, 185, 195));
+    }
+    SetTextColor(memDC, RGB(40, 40, 40)); 
+    DrawTextA(memDC, "Hide", -1, &hideRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+    if (!g_bWindowMode && g_bDockTop) DrawSolidRect(memDC, 0, grabRc.top, w, 1, RGB(180, 185, 190));
+    else DrawSolidRect(memDC, 0, GRAB_BAR_HEIGHT - 1, w, 1, RGB(180, 185, 190));
+
+    // Keyboard Grid
+    int padX = 8, padY = 8;
     int keyMargin = 4;
     int rowCount = 5;
-    int keyH = (h - padY - 8 - (keyMargin * (rowCount - 1))) / rowCount;
+    
+    int keysAreaHeight = h - GRAB_BAR_HEIGHT - (padY * 2);
+    int keyH = (keysAreaHeight - (keyMargin * (rowCount - 1))) / rowCount;
     float unitW = (float)(w - (padX * 2)) / TOTAL_UNITS;
 
-    int curY = padY;
+    int curY = (!g_bWindowMode && g_bDockTop) ? padY : (GRAB_BAR_HEIGHT + padY);
     int rowStartKeys[] = {0, 14, 28, 41, 53, numKeys};
     
     for (int r = 0; r < rowCount; r++) {
         float curX = padX;
-        
         for (int i = rowStartKeys[r]; i < rowStartKeys[r+1]; i++) {
             float kw = (layout[i].widthUnits * unitW) - keyMargin;
             
@@ -419,18 +424,16 @@ void PaintUI(HWND hwnd) {
             if ((layout[i].vk == VK_SHIFT || layout[i].vk == VK_RSHIFT) && g_bShiftLock) kCol = CLR_ACCENT;
             if (layout[i].vk == VK_CAPITAL && g_bCaps) kCol = CLR_ACCENT;
 
-            DrawRoundRect(memDC, layout[i].rect.left, layout[i].rect.top, 
+            // Sharp Square Keys
+            DrawSquareRect(memDC, layout[i].rect.left, layout[i].rect.top, 
                          layout[i].rect.right - layout[i].rect.left, 
-                         layout[i].rect.bottom - layout[i].rect.top, 8, kCol);
+                         layout[i].rect.bottom - layout[i].rect.top, kCol);
             
             BOOL isAccent = ((layout[i].vk == VK_SHIFT || layout[i].vk == VK_RSHIFT) && g_bShiftLock) || (layout[i].vk == VK_CAPITAL && g_bCaps);
             SetTextColor(memDC, isAccent ? RGB(255, 255, 255) : CLR_TEXT);
             
-            HFONT fontToUse = (layout[i].isMod) ? hFontSmall : hFontNormal;
-            SelectObject(memDC, fontToUse);
-            
+            SelectObject(memDC, layout[i].isMod ? hFontSmall : hFontNormal);
             const char* text = (g_bShiftLock || g_bCaps) ? layout[i].shift : layout[i].norm;
-            
             RECT textRc = layout[i].rect;
             DrawTextA(memDC, text, -1, &textRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
@@ -438,9 +441,6 @@ void PaintUI(HWND hwnd) {
         }
         curY += keyH + keyMargin;
     }
-
-    // Top border outline
-    DrawSolidRect(memDC, 0, 0, w, 1, RGB(180, 185, 190));
 
     BitBlt(hdc, 0, 0, w, h, memDC, 0, 0, SRCCOPY);
     
@@ -454,14 +454,27 @@ void PaintUI(HWND hwnd) {
 LRESULT CALLBACK WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     switch (uMsg) {
         case WM_CREATE: {
-            hFontNormal = CreateFontA(22, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI");
+            hFontNormal = CreateFontA(24, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI");
             hFontSmall  = CreateFontA(16, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI");
-            SetTimer(hwnd, 1, 500, NULL); // Backup timer to poll focus state reliably
+            
+            // 300ms Timer: Smooth focus tracking 
+            SetTimer(hwnd, ID_TIMER_FOCUS, 300, NULL); 
             break;
         }
 
+        case WM_DISPLAYCHANGE: {
+            PositionKeyboard();
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
+
         case WM_TIMER:
-            CheckFocus();
+            if (wParam == ID_TIMER_FOCUS) {
+                if (!g_bTrayIconAdded) {
+                    g_bTrayIconAdded = Shell_NotifyIcon(NIM_ADD, &nid);
+                }
+                CheckFocus();
+            }
             break;
 
         case WM_PAINT:
@@ -474,10 +487,45 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
         case WM_MOUSEMOVE: {
             int mx = LOWORD(lParam);
             int my = HIWORD(lParam);
-            int oldHover = g_hoverKey;
+
+            if (g_bGrabTracking) {
+                POINT pt; GetCursorPos(&pt);
+                if (!g_bIsDragging) {
+                    // Jitter Deadzone (Touch screen compatibility)
+                    if (abs(pt.x - g_ptGrabStart.x) > 4 || abs(pt.y - g_ptGrabStart.y) > 4) {
+                        g_bIsDragging = TRUE;
+                        if (!g_bWindowMode) {
+                            // Instant snap to Floating Window Mode when dragged
+                            g_bWindowMode = TRUE;
+                            g_floatingY = g_rcWindowStart.top;
+                            PositionKeyboard();
+                        }
+                    }
+                }
+                
+                if (g_bIsDragging && g_bWindowMode) {
+                    g_floatingY = g_rcWindowStart.top + (pt.y - g_ptGrabStart.y);
+                    PositionKeyboard();
+                }
+                return 0;
+            }
+
+            // Hover logic for the Hide button
+            BOOL oldHoverHide = g_bHoverHide;
+            g_bHoverHide = FALSE;
             
+            if (IsInGrabBar(my)) {
+                int w = GetSystemMetrics(SM_CXSCREEN);
+                int hideX = w / 4;
+                if (mx >= hideX - 40 && mx <= hideX + 40) {
+                    g_bHoverHide = TRUE;
+                }
+            }
+
+            // Hover logic for keys
+            int oldHover = g_hoverKey;
             g_hoverKey = -1;
-            if (my >= GRAB_BAR_HEIGHT) {
+            if (!IsInGrabBar(my)) {
                 for (int i = 0; i < numKeys; i++) {
                     if (mx >= layout[i].rect.left && mx <= layout[i].rect.right &&
                         my >= layout[i].rect.top && my <= layout[i].rect.bottom) {
@@ -486,7 +534,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
                     }
                 }
             }
-            if (oldHover != g_hoverKey && g_downKey == -1) InvalidateRect(hwnd, NULL, FALSE);
+            
+            if (oldHoverHide != g_bHoverHide || oldHover != g_hoverKey || g_downKey != -1) {
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
             break;
         }
 
@@ -494,17 +545,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
             int mx = LOWORD(lParam);
             int my = HIWORD(lParam);
             
-            if (my < GRAB_BAR_HEIGHT) {
-                if (!g_bWindowMode) {
-                    g_bDockTop = !g_bDockTop;
-                    SaveConfig();
-                    PositionKeyboard();
-                    InvalidateRect(hwnd, NULL, FALSE);
-                } else {
-                    // Let user drag it if in floating window mode
-                    ReleaseCapture();
-                    SendMessage(hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0);
+            if (IsInGrabBar(my)) {
+                int w = GetSystemMetrics(SM_CXSCREEN);
+                int hideX = w / 4;
+                
+                // If they explicitly click "Hide", dismiss the keyboard immediately
+                if (mx >= hideX - 40 && mx <= hideX + 40) {
+                    g_bManualOverride = FALSE; // Reset override so it hides naturally
+                    g_hSuppressedWindow = GetForegroundWindow(); // Suppress the current window
+                    HideOsk();
+                    return 0;
                 }
+
+                g_bGrabTracking = TRUE;
+                g_bIsDragging = FALSE;
+                GetCursorPos(&g_ptGrabStart);
+                GetWindowRect(hwnd, &g_rcWindowStart);
+                SetCapture(hwnd);
                 return 0;
             }
 
@@ -520,6 +577,29 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
         }
 
         case WM_LBUTTONUP: {
+            if (g_bGrabTracking) {
+                g_bGrabTracking = FALSE;
+                ReleaseCapture();
+                
+                if (!g_bIsDragging) {
+                    // Click to cycle modes
+                    if (!g_bWindowMode && !g_bDockTop) {
+                        g_bDockTop = TRUE; 
+                    } else if (!g_bWindowMode && g_bDockTop) {
+                        g_bWindowMode = TRUE;
+                        RECT wa; SystemParametersInfo(SPI_GETWORKAREA, 0, &wa, 0);
+                        g_floatingY = (wa.bottom - wa.top) / 2 - (g_oskHeight / 2); // Center naturally
+                    } else {
+                        g_bWindowMode = FALSE; 
+                        g_bDockTop = FALSE; 
+                    }
+                    PositionKeyboard();
+                    InvalidateRect(hwnd, NULL, FALSE);
+                }
+                g_bIsDragging = FALSE;
+                return 0;
+            }
+
             if (g_downKey != -1) {
                 int mx = LOWORD(lParam);
                 int my = HIWORD(lParam);
@@ -548,6 +628,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
             return (hit == HTCLIENT) ? HTCLIENT : hit; 
         }
 
+        case WM_USER_SHOW_MANAGER: {
+            // IPC WAKEUP
+            g_bManualOverride = TRUE; 
+            ShowOsk();
+            if (!g_bTrayIconAdded) {
+                g_bTrayIconAdded = Shell_NotifyIcon(NIM_ADD, &nid);
+            }
+            break;
+        }
+
         case WM_USER_TRAY: {
             if (lParam == WM_RBUTTONUP) {
                 HMENU hMenu = CreatePopupMenu();
@@ -561,9 +651,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
                 DestroyMenu(hMenu);
             }
             else if (lParam == WM_LBUTTONUP) {
-                // Manual toggle
-                if (g_bIsVisible) HideOsk();
-                else ShowOsk();
+                if (g_bIsVisible) {
+                    g_bManualOverride = FALSE; 
+                    HideOsk();
+                } else {
+                    g_bManualOverride = TRUE; 
+                    ShowOsk();
+                }
             }
             break;
         }
@@ -574,7 +668,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
             }
             else if (LOWORD(wParam) == ID_TRAY_WINDOW_MODE) {
                 g_bWindowMode = !g_bWindowMode;
-                SaveConfig();
                 PositionKeyboard();
                 InvalidateRect(hwnd, NULL, FALSE);
             }
@@ -582,13 +675,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
         }
 
         case WM_DESTROY:
-            if (g_bWorkAreaAltered) {
-                RECT wa = GetRealWorkArea();
-                SystemParametersInfo(SPI_SETWORKAREA, 0, &wa, SPIF_SENDCHANGE);
-            }
             Shell_NotifyIcon(NIM_DELETE, &nid);
             DeleteObject(hFontNormal); DeleteObject(hFontSmall);
-            if (hEventHook) UnhookWinEvent(hEventHook);
             PostQuitMessage(0);
             break;
 
@@ -601,10 +689,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
 // --- Main ---
 
 int main(int argc, char *argv[]) {
+    // Single Instance Guard
     HANDLE hMutex = CreateMutexA(NULL, FALSE, "WinPE_OSK_Mutex");
-    if (GetLastError() == ERROR_ALREADY_EXISTS) return 0; 
-
-    LoadConfig();
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        HWND hExisting = FindWindowA("WinPEOSKWin11", NULL);
+        if (hExisting) PostMessageA(hExisting, WM_USER_SHOW_MANAGER, 0, 0);
+        return 0; 
+    }
 
     WNDCLASSA wc = {0};
     wc.lpfnWndProc = WndProc;
@@ -613,7 +704,7 @@ int main(int argc, char *argv[]) {
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     RegisterClassA(&wc);
 
-    // WS_EX_NOACTIVATE is CRITICAL so the keyboard doesn't steal focus from the textbox
+    // WS_EX_NOACTIVATE is CRITICAL so the keyboard doesn't steal focus
     hMainWnd = CreateWindowExA(
         WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, 
         "WinPEOSKWin11", "",
@@ -629,13 +720,11 @@ int main(int argc, char *argv[]) {
     nid.uCallbackMessage = WM_USER_TRAY;
     nid.hIcon = CreateKeyboardTrayIcon();
     wcscpy(nid.szTip, L"On-Screen Keyboard");
-    Shell_NotifyIcon(NIM_ADD, &nid);
+    
+    g_bTrayIconAdded = Shell_NotifyIcon(NIM_ADD, &nid);
 
-    // Hook Global Focus Events (0x8002 = EVENT_OBJECT_SHOW, 0x8005 = EVENT_OBJECT_FOCUS)
-    hEventHook = SetWinEventHook(0x8002, 0x8005, NULL, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
-
-    // Initial check
-    CheckFocus();
+    // Start completely visible so the user knows it launched successfully
+    ShowOsk();
 
     MSG msg;
     while (GetMessage(&msg, NULL, 0, 0)) {
