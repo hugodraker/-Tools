@@ -9,7 +9,7 @@
  *              Drag & Drop recursive imports, QEMU boot integration, Physical Cloning,
  *              Intelligent Shrink, Secure Zeroing, Compacting, Defragmentation.
  *
- * Compile: gcc -Os -s -mwindows -o vhdmaster.exe vhdmaster.c -lcomctl32 -lcomdlg32
+ * Compile: gcc -Os -s -mwindows -o vhdmaster.exe vhdmaster.c -lcomctl32 -lcomdlg32 -lole32 -lshell32
  *
  * THIS WORK IS NOT FIT FOR ANY FUNCTION OR PURPOSE, COMES WITH NO WARRANTY,
  * AND IS BEING RELEASED INTO THE PUBLIC DOMAIN.
@@ -32,6 +32,7 @@
 #include <windowsx.h>
 #include <aclapi.h>
 #include <sddl.h>
+#include <shlobj.h>
 /* ============================================================ CONSTANTS */
 #define APP_NAME        "VHD Master"
 #define APP_VERSION     "0.2"
@@ -101,29 +102,29 @@ typedef unsigned int       u32;
 typedef unsigned long long u64;
 typedef signed long long   s64;
 
-/* Add missing Windows API typedefs (around line 184 and 274) */
+/* Windows API typedefs */
 typedef BOOL (WINAPI *ConvertSecurityDescriptorToStringSecurityDescriptorW_t)(
     PSECURITY_DESCRIPTOR, DWORD, SECURITY_INFORMATION, LPWSTR *, PULONG);
 typedef HANDLE (WINAPI *FindFirstStreamW_t)(LPCWSTR, STREAM_INFO_LEVELS, LPVOID, DWORD);
 typedef BOOL (WINAPI *FindNextStreamW_t)(HANDLE, LPVOID);
 
-/* Ensure this struct is fully defined before VhdState uses it */
+/* Forward declare compression initialization for CBAK extractors */
+static int init_compression(void);
+
 typedef struct {
     u8  boot;
     u8  type;
     u32 lba_begin;
     u32 lba_count;
     int used;
-} 
-MbrPart;
+} MbrPart;
 
 typedef struct {
     char name[256];
     int  is_directory;
     u64  size;
     u64  first_cluster;
-} 
-FsEntry;
+} FsEntry;
 
 #ifndef CLONE_EXCLUSION_DEFINED
 #define CLONE_EXCLUSION_DEFINED
@@ -132,8 +133,7 @@ typedef struct {
     char suffix[128];
     int has_wildcard;
     int is_all;
-} 
-CloneExclusion;
+} CloneExclusion;
 #endif
 typedef struct {
     BOOL        isOpen;
@@ -144,20 +144,20 @@ typedef struct {
     long long   data_offset;  /* byte offset of LBA 0   */
     
     /* Dynamic (Sparse) VHD support */
-    u32         disk_type;    /* 2 = Fixed, 3 = Dynamic */
-    u32         block_size;   /* typically 2MB (2097152 bytes) */
-    u32         sec_per_block;/* block_size / 512 */
+    u32         disk_type;    /* 2 = Fixed, 3 = Dynamic, 4 = CBAK, 5 = Physical */
+    u32         block_size;   
+    u32         sec_per_block;
     u32         max_bat_entries;
     u64         bat_offset;
-    u32        *bat;          /* parsed BAT entries (sector offsets) */
-    u32         bitmap_secs;  /* sectors reserved for block allocation bitmap */
+    u32        *bat;          
+    u32         bitmap_secs;  
 
     MbrPart     parts[MAX_MBR_PARTS];
-    int         fs_mounted;   /* FAT engine attached?   */
+    int         fs_mounted;   
     u32         fs_part_lba, fs_part_nsec;
-} 
-VhdState;
+} VhdState;
 
+/* Compression API typedefs */
 typedef PVOID COMPRESSOR_HANDLE;
 typedef PVOID DECOMPRESSOR_HANDLE;
 typedef BOOL (WINAPI *CreateCompressor_t)(DWORD, PVOID, COMPRESSOR_HANDLE*);
@@ -167,15 +167,28 @@ typedef BOOL (WINAPI *CreateDecompressor_t)(DWORD, PVOID, DECOMPRESSOR_HANDLE*);
 typedef BOOL (WINAPI *Decompress_t)(DECOMPRESSOR_HANDLE, LPCVOID, SIZE_T, PVOID, SIZE_T, PSIZE_T);
 typedef BOOL (WINAPI *CloseDecompressor_t)(DECOMPRESSOR_HANDLE);
 
-static ConvertSecurityDescriptorToStringSecurityDescriptorW_t pConvertSDToStringSD = NULL;
+/* CBAK Dynamic Indexing Struct */
+typedef struct {
+    char rel_path[MAX_PATH];
+    u64  offset;
+    u64  size;
+} CbakFileRecord;
 
+static ConvertSecurityDescriptorToStringSecurityDescriptorW_t pConvertSDToStringSD = NULL;
 static FindFirstStreamW_t pFindFirstStreamW = NULL;
 static FindNextStreamW_t pFindNextStreamW = NULL;
+
 static void TraverseAndBackup(LPCWSTR rootPath, LPCWSTR currentDir, HANDLE hArchiveOut, COMPRESSOR_HANDLE hCompressor, 
                               HANDLE hMetadataOut, CloneExclusion* exclusions, int ex_count, u64* total_copied,
                               PUCHAR file_buf, PUCHAR comp_buf);
 
 /* ============================================================ GLOBALS */
+/* CBAK Dynamic Global Variables */
+static CbakFileRecord *g_cbak_records = NULL;
+static int g_cbak_record_count = 0;
+static int g_cbak_record_cap = 0;
+static char g_cbak_cur_path[MAX_PATH] = "";
+
 HWND g_hMainWnd = NULL, g_hLocalListView = NULL, g_hVhdListView = NULL;
 HWND g_hStatusBar = NULL, g_hProgressBar = NULL, g_hCancelBtn = NULL;
 HINSTANCE g_hInstance = NULL;
@@ -286,6 +299,45 @@ static u32 rd32le(const u8 *p);
 static u64 rd64le(const u8 *p);
 static u32 rd32be(const u8 *p);
 static u64 rd64be(const u8 *p);
+static int cbak_extract_record(u64 offset, const char* dest_path) {
+    if (!init_compression()) return -1;
+
+    HANDLE hIn = CreateFileA(g_vhd.path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (hIn == INVALID_HANDLE_VALUE) return -1;
+    
+    HANDLE hOut = CreateFileA(dest_path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    if (hOut == INVALID_HANDLE_VALUE) { CloseHandle(hIn); return -1; }
+    
+    SetFilePointerEx(hIn, (LARGE_INTEGER){.QuadPart = offset + 4}, NULL, FILE_BEGIN);
+    u16 pathLen; DWORD br, bw;
+    ReadFile(hIn, &pathLen, 2, &br, NULL);
+    SetFilePointer(hIn, pathLen, NULL, FILE_CURRENT);
+    u64 fSz; ReadFile(hIn, &fSz, 8, &br, NULL);
+    
+    if (fSz > 0) {  /* THE FIX: Safely bypass extraction stream generation for 0-byte items */
+        DECOMPRESSOR_HANDLE hDecomp = NULL;
+        pCreateDecompressor(COMPRESS_ALGORITHM_XPRESS, NULL, &hDecomp);
+        u8 *cbuf = (u8*)malloc(1048576 + 4096);
+        u8 *ubuf = (u8*)malloc(1048576);
+        
+        u32 cSize;
+        while (ReadFile(hIn, &cSize, 4, &br, NULL) && br == 4 && cSize > 0) {
+            ReadFile(hIn, cbuf, cSize, &br, NULL);
+            SIZE_T final_uncomp = 0;
+            if (cSize < 1048576 && pDecompress(hDecomp, cbuf, cSize, ubuf, 1048576, &final_uncomp) && final_uncomp > 0) {
+                WriteFile(hOut, ubuf, (DWORD)final_uncomp, &bw, NULL);
+            } else {
+                WriteFile(hOut, cbuf, cSize, &bw, NULL);
+            }
+        }
+        free(cbuf); free(ubuf);
+        if (hDecomp) pCloseDecompressor(hDecomp);
+    }
+    
+    CloseHandle(hIn);
+    CloseHandle(hOut);
+    return 0;
+}
 static u16 rd16le(const u8 *p) { return (u16)p[0] | ((u16)p[1]<<8); }
 
 static u32 rd32le(const u8 *p) { return (u32)p[0] | ((u32)p[1]<<8) | ((u32)p[2]<<16) | ((u32)p[3]<<24); }
@@ -509,6 +561,65 @@ static void cmd_delete_selected(HWND hwnd) {
         populate_vhd_listview();
         char msg[128]; snprintf(msg, sizeof(msg), "Deleted: %d, Failed: %d.", deleted, failed);
         SetWindowTextA(g_hStatusBar, msg);
+    }
+}
+
+static void cbak_list_dir(const char* cur_path) {
+    g_fs_entry_count = 0;
+    
+    if (strlen(cur_path) > 0 && g_fs_entry_count < FS_MAX_ENTRIES) {
+        FsEntry* fse = &g_fs_entries[g_fs_entry_count++];
+        strcpy(fse->name, "..");
+        fse->is_directory = 1;
+        fse->size = 0;
+        fse->first_cluster = 0;
+    }
+
+    char prefix[MAX_PATH];
+    if (strlen(cur_path) > 0) {
+        snprintf(prefix, sizeof(prefix), "\\%s\\", cur_path);
+    } else {
+        strcpy(prefix, "\\");
+    }
+    int prefix_len = (int)strlen(prefix);
+
+    for (int i = 0; i < g_cbak_record_count; i++) {
+        char* path = g_cbak_records[i].rel_path;
+        if (_strnicmp(path, prefix, prefix_len) == 0) {
+            char* sub = path + prefix_len;
+            char* slash = strchr(sub, '\\');
+            
+            if (slash) {
+                int dir_len = (int)(slash - sub);
+                char dir_name[256];
+                if (dir_len > 255) dir_len = 255;
+                strncpy(dir_name, sub, dir_len);
+                dir_name[dir_len] = '\0';
+
+                int exists = 0;
+                for (int k = 0; k < g_fs_entry_count; k++) {
+                    if (g_fs_entries[k].is_directory && strcmp(g_fs_entries[k].name, dir_name) == 0) {
+                        exists = 1;
+                        break;
+                    }
+                }
+                if (!exists && g_fs_entry_count < FS_MAX_ENTRIES) {
+                    FsEntry* fse = &g_fs_entries[g_fs_entry_count++];
+                    strcpy(fse->name, dir_name);
+                    fse->is_directory = 1;
+                    fse->size = 0;
+                    fse->first_cluster = 0;
+                }
+            } else {
+                if (strlen(sub) > 0 && g_fs_entry_count < FS_MAX_ENTRIES) {
+                    FsEntry* fse = &g_fs_entries[g_fs_entry_count++];
+                    strncpy(fse->name, sub, 255);
+                    fse->is_directory = 0;
+                    fse->size = g_cbak_records[i].size;
+                    fse->first_cluster = g_cbak_records[i].offset;
+                }
+            }
+        }
     }
 }
 
@@ -1139,18 +1250,36 @@ static void cmd_add_selected(HWND hwnd) {
     }
 }
 
-/* Modifies extraction to seamlessly decompress files directly from the CBAK stream */
 static void cmd_extract_selected(HWND hwnd) {
     if (g_view_mode != 1) return;
-    int sel = -1;
+    
+    /* Check if anything is actually selected before showing the dialog */
+    int sel = ListView_GetNextItem(g_hVhdListView, -1, LVNI_SELECTED);
+    if (sel == -1) return;
+    
+    /* Prompt user for extraction destination */
+    char base_dest[MAX_PATH] = "";
+    BROWSEINFOA bi = {0};
+    bi.hwndOwner = hwnd;
+    bi.lpszTitle = "Select Destination Folder for Extraction:";
+    bi.ulFlags = 0x00000041; /* BIF_RETURNONLYFSDIRS | BIF_USENEWUI */
+    
+    LPITEMIDLIST pidl = SHBrowseForFolderA(&bi);
+    if (!pidl) return; /* User cancelled the dialog */
+    
+    SHGetPathFromIDListA(pidl, base_dest);
+    CoTaskMemFree(pidl);
+
     int extracted = 0, failed = 0;
+    sel = -1; /* Reset selection cursor for the loop */
+    
     while ((sel = ListView_GetNextItem(g_hVhdListView, sel, LVNI_SELECTED)) != -1) {
         char name[256];
         ListView_GetItemText(g_hVhdListView, sel, 0, name, sizeof(name));
         if (strcmp(name, "..") == 0) continue;
         
         char dest[MAX_PATH];
-        snprintf(dest, sizeof(dest), "%s\\%s", g_current_local_path, name);
+        snprintf(dest, sizeof(dest), "%s\\%s", base_dest, name);
         
         if (g_vhd.disk_type == 4) {
             int eidx = -1;
@@ -1158,38 +1287,45 @@ static void cmd_extract_selected(HWND hwnd) {
                 if (strcmp(g_fs_entries[k].name, name) == 0) { eidx = k; break; }
             }
             if (eidx != -1) {
-                HANDLE hIn = CreateFileA(g_vhd.path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-                HANDLE hOut = CreateFileA(dest, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
-                if (hIn != INVALID_HANDLE_VALUE && hOut != INVALID_HANDLE_VALUE) {
-                    SetFilePointerEx(hIn, (LARGE_INTEGER){.QuadPart = g_fs_entries[eidx].first_cluster + 4}, NULL, FILE_BEGIN);
-                    u16 pathLen; DWORD br, bw;
-                    ReadFile(hIn, &pathLen, 2, &br, NULL);
-                    SetFilePointer(hIn, pathLen, NULL, FILE_CURRENT);
-                    u64 fSz; ReadFile(hIn, &fSz, 8, &br, NULL);
+                if (g_fs_entries[eidx].is_directory) {
+                    CreateDirectoryA(dest, NULL);
+                    char sub_prefix[MAX_PATH];
+                    if (strlen(g_cbak_cur_path) > 0)
+                        snprintf(sub_prefix, sizeof(sub_prefix), "\\%s\\%s\\", g_cbak_cur_path, g_fs_entries[eidx].name);
+                    else
+                        snprintf(sub_prefix, sizeof(sub_prefix), "\\%s\\", g_fs_entries[eidx].name);
                     
-                    DECOMPRESSOR_HANDLE hDecomp = NULL;
-                    pCreateDecompressor(COMPRESS_ALGORITHM_XPRESS, NULL, &hDecomp);
-                    u8 *cbuf = (u8*)malloc(1048576 + 4096);
-                    u8 *ubuf = (u8*)malloc(1048576);
-                    
-                    u32 cSize;
-                    while (ReadFile(hIn, &cSize, 4, &br, NULL) && br == 4 && cSize > 0) {
-                        ReadFile(hIn, cbuf, cSize, &br, NULL);
-                        SIZE_T final_uncomp = 0;
-                        if (cSize < 1048576 && pDecompress(hDecomp, cbuf, cSize, ubuf, 1048576, &final_uncomp) && final_uncomp > 0) {
-                            WriteFile(hOut, ubuf, (DWORD)final_uncomp, &bw, NULL);
-                        } else {
-                            WriteFile(hOut, cbuf, cSize, &bw, NULL);
+                    int sub_extracted = 0;
+                    for (int r = 0; r < g_cbak_record_count; r++) {
+                        if (_strnicmp(g_cbak_records[r].rel_path, sub_prefix, strlen(sub_prefix)) == 0) {
+                            char child_dest[MAX_PATH];
+                            const char* rel_sub = g_cbak_records[r].rel_path + strlen(sub_prefix);
+                            snprintf(child_dest, sizeof(child_dest), "%s\\%s", dest, rel_sub);
+                            
+                            /* Ensure parent dirs exist natively */
+                            char tmp_dir[MAX_PATH]; strcpy(tmp_dir, child_dest);
+                            char* ls = strrchr(tmp_dir, '\\');
+                            if (ls) {
+                                *ls = '\0';
+                                char* p = tmp_dir;
+                                while (*p) {
+                                    if (*p == '\\') {
+                                        *p = '\0';
+                                        CreateDirectoryA(tmp_dir, NULL);
+                                        *p = '\\';
+                                    }
+                                    p++;
+                                }
+                                CreateDirectoryA(tmp_dir, NULL);
+                            }
+                            
+                            if (cbak_extract_record(g_cbak_records[r].offset, child_dest) == 0) sub_extracted++;
                         }
                     }
-                    free(cbuf); free(ubuf);
-                    if (hDecomp) pCloseDecompressor(hDecomp);
-                    extracted++;
+                    if (sub_extracted > 0) extracted++; else failed++;
                 } else {
-                    failed++;
+                    if (cbak_extract_record(g_fs_entries[eidx].first_cluster, dest) == 0) extracted++; else failed++;
                 }
-                if (hIn != INVALID_HANDLE_VALUE) CloseHandle(hIn);
-                if (hOut != INVALID_HANDLE_VALUE) CloseHandle(hOut);
             }
         } else if (g_ntfs) {
             for (int k = 0; k < g_fs_entry_count; k++) {
@@ -1212,13 +1348,16 @@ static void cmd_extract_selected(HWND hwnd) {
             }
         }
     }
+    
     if (extracted > 0 || failed > 0) {
-        set_local_path(g_current_local_path);
-        char msg[128]; snprintf(msg, sizeof(msg), "Extracted: %d, Failed: %d.", extracted, failed);
+        /* Automatically navigate the local pane to the newly extracted folder */
+        set_local_path(base_dest);
+        
+        char msg[128]; 
+        snprintf(msg, sizeof(msg), "Extracted: %d, Failed: %d.", extracted, failed);
         SetWindowTextA(g_hStatusBar, msg);
     }
 }
-
 static void cmd_resize(HWND hwnd) {
     char buf[32];
     if (!g_vhd.isOpen) return;
@@ -2336,6 +2475,44 @@ LRESULT CALLBACK ComboDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcA(hwnd, msg, wp, lp);
 }
 static void navigate_vhd(HWND hwnd, int item) {
+    if (g_vhd.disk_type == 4) {
+        if (g_view_mode == 0) {
+            /* Drill into partition view */
+            if (g_vhd.parts[item].used) {
+                g_view_mode = 1;
+                g_cbak_cur_path[0] = '\0';
+                cbak_list_dir(g_cbak_cur_path);
+                populate_vhd_listview();
+            }
+            return;
+        } else {
+            char name[256];
+            ListView_GetItemText(g_hVhdListView, item, 0, name, sizeof(name));
+            if (strcmp(name, "..") == 0) {
+                if (g_cbak_cur_path[0] == '\0') {
+                    g_view_mode = 0; /* UNMOUNT TO PARTITIONS */
+                    populate_vhd_listview();
+                    return;
+                } else {
+                    char* last_slash = strrchr(g_cbak_cur_path, '\\');
+                    if (last_slash) *last_slash = '\0';
+                    else g_cbak_cur_path[0] = '\0';
+                }
+            } else {
+                for (int k = 0; k < g_fs_entry_count; k++) {
+                    if (strcmp(g_fs_entries[k].name, name) == 0 && g_fs_entries[k].is_directory) {
+                        if (g_cbak_cur_path[0] == '\0') strcpy(g_cbak_cur_path, name);
+                        else { strcat(g_cbak_cur_path, "\\"); strcat(g_cbak_cur_path, name); }
+                        break;
+                    }
+                }
+            }
+            cbak_list_dir(g_cbak_cur_path);
+            populate_vhd_listview();
+            return;
+        }
+    }
+
     if (g_view_mode == 0) {
         if (g_vhd.parts[item].used) {
             if (fs_mount_any(item) == 0) {
@@ -2393,7 +2570,6 @@ static void navigate_vhd(HWND hwnd, int item) {
         }
     }
 }
-
 static void navigate_local(HWND hwnd, int item) {
     char name[256], type[64];
     ListView_GetItemText(g_hLocalListView, item, 0, name, sizeof(name));
@@ -3625,7 +3801,6 @@ static void ntfs_apply_exclusions_recursive(u64 dir_ref, CloneExclusion* exclusi
     free(entries);
 }
 
-/* ============================================================ UI LISTVIEW */
 static void populate_vhd_listview(void) {
     ListView_DeleteAllItems(g_hVhdListView);
     if (!g_vhd.isOpen) return;
@@ -3649,18 +3824,30 @@ static void populate_vhd_listview(void) {
         }
     } else {
         int i = 0;
-        int is_root = 0;
-        if (g_ntfs) is_root = (g_ntfs_cur_dir == NTFS_MFT_ROOT);
-        else is_root = (g_current_dir_cluster == g_root_cluster || (g_fat_type == 16 && g_current_dir_cluster == 0));
         
-        LVITEMA lvi = {0}; lvi.mask = LVIF_TEXT; lvi.iItem = i; lvi.pszText = "..";
-        SendMessageA(g_hVhdListView, LVM_INSERTITEMA, 0, (LPARAM)&lvi);
-        LVITEMA s = {0}; s.iSubItem = 1; s.pszText = is_root ? "<UNMOUNT>" : "<DIR>";
-        SendMessageA(g_hVhdListView, LVM_SETITEMTEXTA, i, (LPARAM)&s);
-        i++;
+        if (g_vhd.disk_type == 4) {
+            /* Enable Unmounting for CBAK */
+            LVITEMA lvi = {0}; lvi.mask = LVIF_TEXT; lvi.iItem = i; lvi.pszText = "..";
+            SendMessageA(g_hVhdListView, LVM_INSERTITEMA, 0, (LPARAM)&lvi);
+            LVITEMA s = {0}; s.iSubItem = 1; 
+            s.pszText = (g_cbak_cur_path[0] == '\0') ? "<UNMOUNT>" : "<DIR>";
+            SendMessageA(g_hVhdListView, LVM_SETITEMTEXTA, i, (LPARAM)&s);
+            i++;
+        } else {
+            int is_root = 0;
+            if (g_ntfs) is_root = (g_ntfs_cur_dir == NTFS_MFT_ROOT);
+            else is_root = (g_current_dir_cluster == g_root_cluster || (g_fat_type == 16 && g_current_dir_cluster == 0));
+            
+            LVITEMA lvi = {0}; lvi.mask = LVIF_TEXT; lvi.iItem = i; lvi.pszText = "..";
+            SendMessageA(g_hVhdListView, LVM_INSERTITEMA, 0, (LPARAM)&lvi);
+            LVITEMA s = {0}; s.iSubItem = 1; s.pszText = is_root ? "<UNMOUNT>" : "<DIR>";
+            SendMessageA(g_hVhdListView, LVM_SETITEMTEXTA, i, (LPARAM)&s);
+            i++;
+        }
 
         for (int k = 0; k < g_fs_entry_count; k++) {
             if (strcmp(g_fs_entries[k].name, ".") == 0 || strcmp(g_fs_entries[k].name, "..") == 0) continue;
+            
             LVITEMA lvi2 = {0}; lvi2.mask = LVIF_TEXT; lvi2.iItem = i; lvi2.pszText = g_fs_entries[k].name;
             SendMessageA(g_hVhdListView, LVM_INSERTITEMA, 0, (LPARAM)&lvi2);
             char sz[64];
@@ -5291,19 +5478,20 @@ static void update_mbr_in_ram(void) {
     write_sec(0, mbr, 1);
 }
 
-/* ============================================================ CORE I/O OVERRIDES */
-
 static void vhd_close(void) {
     if (g_hPhysicalDrive) { CloseHandle(g_hPhysicalDrive); g_hPhysicalDrive = NULL; }
     if (g_vhd.bat) { free(g_vhd.bat); g_vhd.bat = NULL; }
     if (g_vhd.img) { free(g_vhd.img); g_vhd.img = NULL; }
+    if (g_cbak_records) { free(g_cbak_records); g_cbak_records = NULL; }
+    
+    g_cbak_record_count = 0;
+    g_cbak_record_cap = 0;
+    
     g_vhd.isOpen = FALSE; g_vhd.img_bytes = 0; g_vhd.data_offset = 0; g_vhd.cap = 0;
     g_vhd.fs_mounted = 0; g_view_mode = 0;
     g_ntfs = 0;
     UpdateWindowTitle();
 }
-
-/* Added CBAK parser into the main vhd_open sequence */
 static int vhd_open(const char* path) {
     HANDLE h; LARGE_INTEGER sz; u8 *buf; int rc;
     
@@ -5323,19 +5511,48 @@ static int vhd_open(const char* path) {
             strcpy(g_vhd.path, path);
             g_vhd.isOpen = TRUE;
             g_vhd.img_bytes = sz.QuadPart;
-            g_view_mode = 1;
-            g_fs_entry_count = 0;
+            
+            g_cbak_record_cap = 65536; 
+            g_cbak_records = (CbakFileRecord*)malloc(g_cbak_record_cap * sizeof(CbakFileRecord));
+            g_cbak_record_count = 0;
+            g_cbak_cur_path[0] = '\0';
             
             SetFilePointer(h, 4, NULL, FILE_BEGIN);
             u32 mbrSz = 0, vbrSz = 0;
-            ReadFile(h, &mbrSz, 4, &got, NULL); SetFilePointer(h, mbrSz, NULL, FILE_CURRENT);
-            ReadFile(h, &vbrSz, 4, &got, NULL); SetFilePointer(h, vbrSz, NULL, FILE_CURRENT);
+            ReadFile(h, &mbrSz, 4, &got, NULL); 
             
+            u8 mbr[512] = {0};
+            if (mbrSz == 512) ReadFile(h, mbr, 512, &got, NULL);
+            else SetFilePointer(h, mbrSz, NULL, FILE_CURRENT);
+            
+            ReadFile(h, &vbrSz, 4, &got, NULL); 
+            SetFilePointer(h, vbrSz, NULL, FILE_CURRENT);
+            
+            /* Parse MBR into partition list */
+            memset(g_vhd.parts, 0, sizeof(g_vhd.parts));
+            for (int i = 0; i < MAX_MBR_PARTS; i++) {
+                const u8 *e = mbr + 0x1BE + i * 16;
+                if (e[4] == 0) continue;
+                g_vhd.parts[i].used      = 1;
+                g_vhd.parts[i].type      = e[4];
+                g_vhd.parts[i].boot      = e[0];
+                g_vhd.parts[i].lba_begin = rd32le(e + 8);
+                g_vhd.parts[i].lba_count = rd32le(e + 12);
+            }
+            
+            /* Failsafe Virtual Partition if no MBR is found */
+            int has_part = 0;
+            for (int i = 0; i < MAX_MBR_PARTS; i++) if (g_vhd.parts[i].used) has_part = 1;
+            if (!has_part) {
+                g_vhd.parts[0].used = 1; g_vhd.parts[0].type = 0x07;
+                g_vhd.parts[0].lba_begin = 2048; g_vhd.parts[0].lba_count = (u32)(sz.QuadPart / 512);
+            }
+
             LARGE_INTEGER cur; cur.QuadPart = 0;
             SetFilePointerEx(h, cur, &cur, FILE_CURRENT);
             u64 offset = cur.QuadPart;
             
-            while (g_fs_entry_count < FS_MAX_ENTRIES) {
+            while (1) {
                 SetFilePointerEx(h, (LARGE_INTEGER){.QuadPart = offset}, NULL, FILE_BEGIN);
                 u8 marker[4]; if (!ReadFile(h, marker, 4, &got, NULL) || got != 4) break;
                 
@@ -5345,24 +5562,31 @@ static int vhd_open(const char* path) {
                     u64 fileSz = 0; ReadFile(h, &fileSz, 8, &got, NULL);
                     
                     if (memcmp(marker, "FILE", 4) == 0) {
-                        FsEntry* fse = &g_fs_entries[g_fs_entry_count++];
-                        strncpy(fse->name, get_basename(mbRelPath), 255);
-                        fse->size = fileSz;
-                        fse->first_cluster = offset; 
-                        fse->is_directory = 0;
+                        if (g_cbak_record_count >= g_cbak_record_cap) {
+                            g_cbak_record_cap *= 2;
+                            g_cbak_records = (CbakFileRecord*)realloc(g_cbak_records, g_cbak_record_cap * sizeof(CbakFileRecord));
+                        }
+                        CbakFileRecord* rec = &g_cbak_records[g_cbak_record_count++];
+                        strncpy(rec->rel_path, mbRelPath, MAX_PATH - 1);
+                        rec->rel_path[MAX_PATH - 1] = '\0';
+                        rec->offset = offset;
+                        rec->size = fileSz;
                     }
                     
-                    u32 cSize = 0;
-                    while (ReadFile(h, &cSize, 4, &got, NULL) && got == 4 && cSize > 0) {
-                        SetFilePointer(h, cSize, NULL, FILE_CURRENT);
+                    /* THE FIX: Only read stream chunks if the file actually has data */
+                    if (fileSz > 0) {
+                        u32 cSize = 0;
+                        while (ReadFile(h, &cSize, 4, &got, NULL) && got == 4 && cSize > 0) {
+                            SetFilePointer(h, cSize, NULL, FILE_CURRENT);
+                        }
                     }
+                    
                     SetFilePointerEx(h, (LARGE_INTEGER){.QuadPart = 0}, &cur, FILE_CURRENT);
                     offset = cur.QuadPart;
-                } else {
-                    break;
-                }
+                } else break;
             }
             CloseHandle(h);
+            g_view_mode = 0; /* START IN PARTITION VIEW */
             UpdateWindowTitle();
             return 0;
         }
@@ -5428,7 +5652,6 @@ static int vhd_open(const char* path) {
     UpdateWindowTitle();
     return 0;
 }
-
 static int vhd_create(const char* path, u32 size_mb) {
     u64 cap = (u64)size_mb * 1024 * 1024;
     HANDLE h = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
@@ -7244,7 +7467,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             SetWindowTextA(g_hStatusBar, "Dropped files imported successfully.");
             break;
         }
-        case WM_NOTIFY: {
+case WM_NOTIFY: {
             LPNMHDR nmh = (LPNMHDR)lParam;
             if (nmh->code == LVN_BEGINDRAG) {
                 if (nmh->idFrom == IDC_LOCAL_LIST) {
@@ -7262,6 +7485,18 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                     } else if (nmh->idFrom == IDC_LOCAL_LIST) {
                         int sel = ListView_GetNextItem(g_hLocalListView, -1, LVNI_SELECTED);
                         if (sel >= 0) navigate_local(hwnd, sel);
+                    }
+                }
+                else if (pnkd->wVKey == VK_BACK) {
+                    /* Handle Backspace navigation for both panes */
+                    if (nmh->idFrom == IDC_VHD_LIST && g_view_mode == 1) {
+                        char name[256] = "";
+                        ListView_GetItemText(g_hVhdListView, 0, 0, name, sizeof(name));
+                        if (strcmp(name, "..") == 0) navigate_vhd(hwnd, 0);
+                    } else if (nmh->idFrom == IDC_LOCAL_LIST) {
+                        char name[256] = "";
+                        ListView_GetItemText(g_hLocalListView, 0, 0, name, sizeof(name));
+                        if (strcmp(name, "..") == 0) navigate_local(hwnd, 0);
                     }
                 }
             }
