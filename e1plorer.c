@@ -622,6 +622,26 @@ LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     return DefWindowProc(hwnd, msg, wp, lp);
 }
+LRESULT CALLBACK SearchButtonSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData) {
+    if (uMsg == WM_KEYDOWN && wParam == VK_RETURN) {
+        HWND hParent = GetParent(hWnd);
+        // Pressing Enter when a button has focus triggers that specific button
+        PostMessage(hParent, WM_COMMAND, MAKEWPARAM(GetWindowLong(hWnd, GWL_ID), BN_CLICKED), (LPARAM)hWnd);
+        return 0;
+    }
+    return DefSubclassProc(hWnd, uMsg, wParam, lParam);
+}
+
+LRESULT CALLBACK SearchEditSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData) {
+    if (uMsg == WM_KEYDOWN && wParam == VK_RETURN) {
+        HWND hParent = GetParent(hWnd);
+        // Pressing Enter in any text field triggers Find Now (IDOK)
+        PostMessage(hParent, WM_COMMAND, MAKEWPARAM(IDOK, BN_CLICKED), (LPARAM)GetDlgItem(hParent, IDOK));
+        return 0; // Consume the key
+    }
+    return DefSubclassProc(hWnd, uMsg, wParam, lParam);
+}
+
 void ShowTabControls(HWND hwnd, int tab) {
     int i;
     for (i = 600; i <= 610; i++) ShowWindow(GetDlgItem(hwnd, i), tab == 0 ? SW_SHOW : SW_HIDE);
@@ -1430,7 +1450,7 @@ LRESULT CALLBACK ShortcutDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_CREATE: {
             int minimized = 0, isFolder = 0, bMapDir = 0, i; name[0] = '\0'; target[0] = '\0'; params[0] = '\0'; iconF[0] = '\0'; lstrcpy(parentId, "0");
             if (g_EditShortcutId[0] != '\0') { for (i = 0; i < g_IniShortcutCount; i++) { if (lstrcmp(g_IniShortcuts[i]->id, g_EditShortcutId) == 0) { lstrcpy(name, g_IniShortcuts[i]->name); lstrcpy(target, g_IniShortcuts[i]->exe); lstrcpy(params, g_IniShortcuts[i]->params); lstrcpy(iconF, g_IniShortcuts[i]->icon); lstrcpyn(parentId, g_IniShortcuts[i]->parentId, MAX_PATH - 1); minimized = g_IniShortcuts[i]->minimized; isFolder = g_IniShortcuts[i]->isFolder; bMapDir = (isFolder && target[0] != '\0'); break; } } } else if (g_ContextId[0] != '\0') lstrcpyn(parentId, g_ContextId, MAX_PATH - 1);
-            CreateWindow("STATIC", "Name:", WS_CHILD|WS_VISIBLE, 10, 10, 100, 20, hwnd, NULL, g_hInst, NULL); hName = CreateWindowEx(0, "EDIT", name, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_AUTOHSCROLL, 110, 10, 210, 22, hwnd, NULL, g_hInst, NULL); hTargetLbl = CreateWindow("STATIC", isFolder ? (bMapDir ? "Dir Path:" : "Target:") : "Target (File):", WS_CHILD|WS_VISIBLE, 10, 40, 100, 20, hwnd, NULL, g_hInst, NULL); hTarget = CreateWindowEx(0, "EDIT", target, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_AUTOHSCROLL, 110, 40, 150, 22, hwnd, NULL, g_hInst, NULL); CreateWindow("BUTTON", "Browse...", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 270, 40, 50, 22, hwnd, (HMENU)101, g_hInst, NULL); CreateWindow("STATIC", "Parameters:", WS_CHILD|WS_VISIBLE, 10, 70, 100, 20, hwnd, NULL, g_hInst, NULL); hParams = CreateWindowEx(0, "EDIT", params, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_AUTOHSCROLL, 110, 70, 210, 22, hwnd, NULL, g_hInst, NULL); CreateWindow("STATIC", "Icon File:", WS_CHILD|WS_VISIBLE, 10, 100, 100, 20, hwnd, NULL, g_hInst, NULL); hIcon = CreateWindowEx(0, "EDIT", iconF, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_AUTOHSCROLL, 110, 100, 150, 22, hwnd, NULL, g_hInst, NULL); CreateWindow("BUTTON", "Browse...", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 270, 100, 50, 22, hwnd, (HMENU)102, g_hInst, NULL); CreateWindow("STATIC", "Parent Folder:", WS_CHILD|WS_VISIBLE, 10, 130, 100, 20, hwnd, NULL, g_hInst, NULL); hParentFolder = CreateWindowEx(0, "COMBOBOX", "", WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL, 110, 130, 210, 150, hwnd, NULL, g_hInst, NULL); hMinCheck = CreateWindow("BUTTON", "Start Minimized", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 110, 160, 120, 20, hwnd, NULL, g_hInst, NULL); hFolderCheck = CreateWindow("BUTTON", "Is Folder", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 240, 160, 80, 20, hwnd, (HMENU)103, g_hInst, NULL); hMapDirCheck = CreateWindow("BUTTON", "Map Dir to Menu", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 110, 185, 140, 20, hwnd, (HMENU)104, g_hInst, NULL); CreateWindow("BUTTON", "OK", WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON, 80, 220, 80, 24, hwnd, (HMENU)IDOK, g_hInst, NULL); CreateWindow("BUTTON", "Cancel", WS_CHILD|WS_VISIBLE, 180, 220, 80, 24, hwnd, (HMENU)IDCANCEL, g_hInst, NULL);
+            CreateWindow("STATIC", "Name:", WS_CHILD|WS_VISIBLE, 10, 10, 100, 20, hwnd, NULL, g_hInst, NULL); hName = CreateWindowEx(0, "EDIT", name, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_AUTOHSCROLL, 110, 10, 210, 22, hwnd, NULL, g_hInst, NULL); hTargetLbl = CreateWindow("STATIC", isFolder ? (bMapDir ? "Dir Path:" : "Target:") : "Target (File):", WS_CHILD|WS_VISIBLE, 10, 40, 100, 20, hwnd, NULL, g_hInst, NULL); hTarget = CreateWindowEx(0, "EDIT", target, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_AUTOHSCROLL, 110, 40, 150, 22, hwnd, NULL, g_hInst, NULL); CreateWindow("BUTTON", "Browse...", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 265, 40, 80, 22, hwnd, (HMENU)101, g_hInst, NULL); CreateWindow("STATIC", "Parameters:", WS_CHILD|WS_VISIBLE, 10, 70, 100, 20, hwnd, NULL, g_hInst, NULL); hParams = CreateWindowEx(0, "EDIT", params, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_AUTOHSCROLL, 110, 70, 210, 22, hwnd, NULL, g_hInst, NULL); CreateWindow("STATIC", "Icon File:", WS_CHILD|WS_VISIBLE, 10, 100, 100, 20, hwnd, NULL, g_hInst, NULL); hIcon = CreateWindowEx(0, "EDIT", iconF, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_AUTOHSCROLL, 110, 100, 150, 22, hwnd, NULL, g_hInst, NULL); CreateWindow("BUTTON", "Browse...", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 265, 100, 80, 22, hwnd, (HMENU)102, g_hInst, NULL); CreateWindow("STATIC", "Parent Folder:", WS_CHILD|WS_VISIBLE, 10, 130, 100, 20, hwnd, NULL, g_hInst, NULL); hParentFolder = CreateWindowEx(0, "COMBOBOX", "", WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL, 110, 130, 210, 150, hwnd, NULL, g_hInst, NULL); hMinCheck = CreateWindow("BUTTON", "Start Minimized", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 110, 160, 120, 20, hwnd, NULL, g_hInst, NULL); hFolderCheck = CreateWindow("BUTTON", "Is Folder", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 240, 160, 80, 20, hwnd, (HMENU)103, g_hInst, NULL); hMapDirCheck = CreateWindow("BUTTON", "Map Dir to Menu", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 110, 185, 140, 20, hwnd, (HMENU)104, g_hInst, NULL); CreateWindow("BUTTON", "OK", WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON, 80, 220, 80, 24, hwnd, (HMENU)IDOK, g_hInst, NULL); CreateWindow("BUTTON", "Cancel", WS_CHILD|WS_VISIBLE, 180, 220, 80, 24, hwnd, (HMENU)IDCANCEL, g_hInst, NULL);
             SendMessage(hParentFolder, CB_ADDSTRING, 0, (LPARAM)(LPSTR)"0 (Root)"); for (i = 0; i < g_IniShortcutCount; i++) { if (g_IniShortcuts[i]->isFolder) { char buf[128]; sprintf(buf, "%s (%s)", g_IniShortcuts[i]->id, g_IniShortcuts[i]->name); SendMessage(hParentFolder, CB_ADDSTRING, 0, (LPARAM)(LPSTR)buf); } }
             for (i = 0; i < SendMessage(hParentFolder, CB_GETCOUNT, 0, 0); i++) { char buf[128]; buf[0] = '\0'; SendMessage(hParentFolder, CB_GETLBTEXT, i, (LPARAM)(LPSTR)buf); int pLen = lstrlen(parentId); if (pLen < lstrlen(buf)) { BOOL match = TRUE; int j; for (j=0; j<pLen; j++) { if (buf[j] != parentId[j]) { match = FALSE; break; } } if (match && buf[pLen] == ' ') { SendMessage(hParentFolder, CB_SETCURSEL, i, 0); break; } } } if (SendMessage(hParentFolder, CB_GETCURSEL, 0, 0) == CB_ERR) SendMessage(hParentFolder, CB_SETCURSEL, 0, 0);
             if (minimized) SendMessage(hMinCheck, BM_SETCHECK, 1, 0); SendMessage(hFolderCheck, BM_SETCHECK, isFolder, 0); SendMessage(hMapDirCheck, BM_SETCHECK, bMapDir, 0);
@@ -1442,7 +1462,6 @@ LRESULT CALLBACK ShortcutDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_CLOSE: { HWND hParent = GetParent(hwnd); EnableWindow(hParent, TRUE); DestroyWindow(hwnd); } return 0;
     } return DefWindowProc(hwnd, msg, wp, lp);
 }
-
 LRESULT CALLBACK ToolbarProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_ERASEBKGND) {
         RECT rc; HBRUSH hBr; 
@@ -2697,12 +2716,12 @@ LRESULT CALLBACK SearchWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             HMENU hEdit = CreatePopupMenu(); AppendMenu(hEdit, MF_STRING, 4015, "Select &All\tCtrl+A"); AppendMenu(hEdit, MF_STRING, 4016, "&Invert Selection"); AppendMenu(hMenu, MF_POPUP, (UINT)hEdit, "&Edit");
             HMENU hView = CreatePopupMenu(); AppendMenu(hView, MF_STRING, 4022, "Lar&ge Icons"); AppendMenu(hView, MF_STRING, 4023, "S&mall Icons"); AppendMenu(hView, MF_STRING, 4024, "&List"); AppendMenu(hView, MF_STRING|MF_CHECKED, 4025, "&Details"); AppendMenu(hMenu, MF_POPUP, (UINT)hView, "&View"); SetMenu(hwnd, hMenu); DrawMenuBar(hwnd);
             
-            /* Tab 0 Controls */
+            /* Tab 0 Controls - Adjusted Edit widths to give Browse 95px */
             CreateWindow("STATIC", "Named:", WS_CHILD|WS_VISIBLE, tX+5, tY, 60, 20, hwnd, (HMENU)600, g_hInst, NULL); 
-            CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", "*.*", WS_CHILD|WS_VISIBLE|WS_BORDER|WS_TABSTOP, tX+65, tY-2, 190, 22, hwnd, (HMENU)601, g_hInst, NULL); 
+            CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", "*.*", WS_CHILD|WS_VISIBLE|WS_BORDER|WS_TABSTOP, tX+65, tY-2, 185, 22, hwnd, (HMENU)601, g_hInst, NULL); 
             CreateWindow("STATIC", "Look in:", WS_CHILD|WS_VISIBLE, tX+5, tY+30, 60, 20, hwnd, (HMENU)602, g_hInst, NULL); 
-            CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", lstrcmp(state->pathOrId, "0") == 0 ? "Desktop" : state->pathOrId, WS_CHILD|WS_VISIBLE|WS_BORDER|WS_TABSTOP, tX+65, tY+28, 190, 22, hwnd, (HMENU)603, g_hInst, NULL); 
-            CreateWindow("BUTTON", "Browse...", WS_CHILD|WS_VISIBLE|WS_TABSTOP, tX+265, tY+28, 70, 24, hwnd, (HMENU)604, g_hInst, NULL); 
+            CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", lstrcmp(state->pathOrId, "0") == 0 ? "Desktop" : state->pathOrId, WS_CHILD|WS_VISIBLE|WS_BORDER|WS_TABSTOP, tX+65, tY+28, 185, 22, hwnd, (HMENU)603, g_hInst, NULL); 
+            CreateWindow("BUTTON", "Browse...", WS_CHILD|WS_VISIBLE|WS_TABSTOP, tX+255, tY+27, 95, 24, hwnd, (HMENU)604, g_hInst, NULL); 
             CreateWindow("BUTTON", "Include subfolders", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX|WS_TABSTOP, tX+65, tY+60, 150, 20, hwnd, (HMENU)605, g_hInst, NULL); 
             SendMessage(GetDlgItem(hwnd, 605), BM_SETCHECK, 1, 0);
 
@@ -2728,9 +2747,18 @@ LRESULT CALLBACK SearchWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             CreateWindow("STATIC", "KB", WS_CHILD, tX+260, tY+60, 30, 20, hwnd, (HMENU)807, g_hInst, NULL);
 
             /* Action Buttons */
-            CreateWindow("BUTTON", "Find Now", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_DEFPUSHBUTTON, 370, 20, 80, 24, hwnd, (HMENU)103, g_hInst, NULL); 
+            CreateWindow("BUTTON", "Find Now", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_DEFPUSHBUTTON, 370, 20, 80, 24, hwnd, (HMENU)IDOK, g_hInst, NULL); 
             CreateWindow("BUTTON", "Stop", WS_CHILD|WS_VISIBLE|WS_TABSTOP|WS_DISABLED, 370, 50, 80, 24, hwnd, (HMENU)105, g_hInst, NULL); 
             CreateWindow("BUTTON", "New Search", WS_CHILD|WS_VISIBLE|WS_TABSTOP, 370, 80, 80, 24, hwnd, (HMENU)104, g_hInst, NULL);
+
+            /* Apply Enter Key Subclasses */
+            SetWindowSubclass(GetDlgItem(hwnd, 601), SearchEditSubclassProc, 1, 0);
+            SetWindowSubclass(GetDlgItem(hwnd, 603), SearchEditSubclassProc, 1, 0);
+            SetWindowSubclass(GetDlgItem(hwnd, 803), SearchEditSubclassProc, 1, 0);
+            SetWindowSubclass(GetDlgItem(hwnd, 806), SearchEditSubclassProc, 1, 0);
+            SetWindowSubclass(GetDlgItem(hwnd, IDOK), SearchButtonSubclassProc, 1, 0);
+            SetWindowSubclass(GetDlgItem(hwnd, 104), SearchButtonSubclassProc, 1, 0);
+            SetWindowSubclass(GetDlgItem(hwnd, 105), SearchButtonSubclassProc, 1, 0);
 
             /* List Headers */
             CreateWindow("BUTTON", "Name", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, (HMENU)ID_HDR_NAME, g_hInst, NULL); 
@@ -2811,46 +2839,35 @@ LRESULT CALLBACK SearchWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     }
                 } return 0;
             }
-            if (wp == 103) {
+            if (LOWORD(wp) == IDOK) { // Mapped the Find Now command natively to IDOK
                 HWND hList = GetDlgItem(hwnd, ID_LIST); char name[MAX_PATH], path[MAX_PATH], sizeStr[32], containing[MAX_PATH]; int count = 0; 
-                HANDLE oldBlock;
-                ListItemData FAR* FAR* arr;
-                ListItemData FAR* block;
-                unsigned long filterBytes;
-                int filterType;
+                HANDLE oldBlock; ListItemData FAR* FAR* arr; ListItemData FAR* block; unsigned long filterBytes; int filterType;
                 
                 GetWindowText(GetDlgItem(hwnd, 601), name, MAX_PATH); GetWindowText(GetDlgItem(hwnd, 603), path, MAX_PATH); GetWindowText(GetDlgItem(hwnd, 803), containing, MAX_PATH); if (name[0] == '\0') lstrcpy(name, "*.*");
                 if (lstrcmpi(path, "Desktop") == 0) lstrcpy(path, "0");
                 GetWindowText(GetDlgItem(hwnd, 806), sizeStr, 32); 
-                filterBytes = (unsigned long)atol(sizeStr) * 1024; 
-                filterType = sizeStr[0] != '\0' ? SendMessage(GetDlgItem(hwnd, 805), CB_GETCURSEL, 0, 0) : -1;
+                filterBytes = (unsigned long)atol(sizeStr) * 1024; filterType = sizeStr[0] != '\0' ? SendMessage(GetDlgItem(hwnd, 805), CB_GETCURSEL, 0, 0) : -1;
                 
                 SendMessage(hList, WM_SETREDRAW, FALSE, 0); SendMessage(hList, LB_RESETCONTENT, 0, 0); 
-                
-                oldBlock = GetProp(hwnd, "BulkBlock");
-                if (oldBlock) { free((void FAR*)oldBlock); RemoveProp(hwnd, "BulkBlock"); }
+                oldBlock = GetProp(hwnd, "BulkBlock"); if (oldBlock) { free((void FAR*)oldBlock); RemoveProp(hwnd, "BulkBlock"); }
                 
                 arr = (ListItemData FAR* FAR*)malloc(SEARCH_MAX_ITEMS * sizeof(ListItemData FAR*)); 
                 block = (ListItemData FAR*)malloc(SEARCH_MAX_ITEMS * sizeof(ListItemData));
                 if (!arr || !block) { if (arr) free(arr); if (block) free(block); return 0; }
                 
-                g_bStopSearch = FALSE; EnableWindow(GetDlgItem(hwnd, 105), TRUE); EnableWindow(GetDlgItem(hwnd, 103), FALSE);
+                g_bStopSearch = FALSE; EnableWindow(GetDlgItem(hwnd, 105), TRUE); EnableWindow(GetDlgItem(hwnd, IDOK), FALSE);
                 DoRecursiveSearch(arr, block, path, name, &count, filterType, filterBytes, containing);
-                g_bStopSearch = FALSE; EnableWindow(GetDlgItem(hwnd, 105), FALSE); EnableWindow(GetDlgItem(hwnd, 103), TRUE);
+                g_bStopSearch = FALSE; EnableWindow(GetDlgItem(hwnd, 105), FALSE); EnableWindow(GetDlgItem(hwnd, IDOK), TRUE);
                 SortListItems(arr, count); LayoutListItems(hList, arr, count, state->viewMode); 
                 
-                SetProp(hwnd, "BulkBlock", (HANDLE)block);
-                free(arr);
-} else if (wp == 105) { g_bStopSearch = TRUE; EnableWindow(GetDlgItem(hwnd, 105), FALSE); EnableWindow(GetDlgItem(hwnd, 103), TRUE);
+                SetProp(hwnd, "BulkBlock", (HANDLE)block); free(arr);
+            } else if (wp == 105) { g_bStopSearch = TRUE; EnableWindow(GetDlgItem(hwnd, 105), FALSE); EnableWindow(GetDlgItem(hwnd, IDOK), TRUE);
             } else if (wp == 104) { SetWindowText(GetDlgItem(hwnd, 601), "*.*"); SendMessage(GetDlgItem(hwnd, ID_LIST), LB_RESETCONTENT, 0, 0); 
-            } else if (wp == 4028) { 
-                LoadIniShortcuts(); 
-                InvalidateRect(GetDlgItem(hwnd, ID_LIST), NULL, TRUE); 
             } else if (wp >= 4001 && wp <= 4060) { HandleListCommand(hwnd, wp, lp, state); }
             return 0;
         }
         case WM_CLOSE: {
-            if (!IsWindowEnabled(GetDlgItem(hwnd, 103))) {
+            if (!IsWindowEnabled(GetDlgItem(hwnd, IDOK))) {
                 g_bStopSearch = TRUE;
                 PostMessage(hwnd, WM_CLOSE, 0, 0); 
                 return 0;
