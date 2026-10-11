@@ -6,7 +6,8 @@
  * COMPILE INSTRUCTIONS (MinGW GCC):
  * gcc -Os -s BarcodeGen.c -o BarcodeGen.exe -lgdi32 -lcomdlg32 -lcomctl32 -mwindows
  * 
- * 2026-10-08 Hugo pdf417 does not work yet
+ * 2026-10-11 Hugo
+ * 
  * ============================================================================
  * PUBLIC DOMAIN NOTICE
  * Free and unencumbered software released into the public domain.
@@ -18,13 +19,19 @@
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include "pdf417_clusters.h"
+
 #define MAX(a,b) ((a)>(b)?(a):(b))
+
 // GUI Control IDs
 #define IDC_EDIT_DATA    101
 #define IDC_COMBO_TYPE   102
 #define IDC_BTN_COPY     103
 #define IDC_BTN_SAVE     104
 #define IDC_COMBO_SIZE   105
+#define IDC_COMBO_COLS   106
+#define IDC_COMBO_ECC    107
+
 // ============================================================================
 // RED 'X' ERROR GENERATOR
 // ============================================================================
@@ -295,20 +302,29 @@ HENHMETAFILE GenPOSTNET_EMF(const char* data) {
     DeleteObject(blackBrush); return CloseEnhMetaFile(hdcMeta);
 }
 
+// ============================================================================
+// 6. DATAMATRIX (10x10 to 52x52 + Automatic 2x2 Stacked Quad Mode)
+// ============================================================================
+
 unsigned char dm_exp[512], dm_log[256];
-int dm_grid[30*30], dm_initialized = 0;
+int dm_grid[64*64], dm_initialized = 0;
 
-// ============================================================================
-// 6. DATAMATRIX (Dynamic Size: 10x10 to 26x26 with Full Ota Corners)
-// ============================================================================
-
-typedef struct DMSize {
+struct DMSize {
     int w; 
     int data_cw; 
     int ecc_cw; 
+    int regions; // 1 = single region (10x10..26x26), 2 = 2x2 quad regions (32x32..52x52)
+    int blocks;  // RS interleaving blocks
 };
 
-struct DMSize dm_sizes[] = { {10,3,5}, {12,5,7}, {14,8,10}, {16,12,12}, {18,18,14}, {20,22,18}, {22,30,20}, {24,36,24}, {26,44,28} };
+#define DM_SIZE_COUNT 15
+struct DMSize dm_sizes[DM_SIZE_COUNT] = {
+    {10,   3,  5, 1, 1}, {12,   5,  7, 1, 1}, {14,   8, 10, 1, 1},
+    {16,  12, 12, 1, 1}, {18,  18, 14, 1, 1}, {20,  22, 18, 1, 1},
+    {22,  30, 20, 1, 1}, {24,  36, 24, 1, 1}, {26,  44, 28, 1, 1},
+    {32,  62, 36, 2, 1}, {36,  86, 42, 2, 1}, {40, 114, 48, 2, 1},
+    {44, 144, 56, 2, 1}, {48, 174, 68, 2, 1}, {52, 204, 84, 2, 2}
+};
 
 void init_dm_gf() {
     if (dm_initialized) return;
@@ -333,28 +349,19 @@ void dm_utah(int r, int c, int val) {
     dm_module(r-1, c, (val>>3)&1); dm_module(r, c-2, (val>>2)&1); dm_module(r, c-1, (val>>1)&1); dm_module(r, c, (val)&1);
 }
 
-HENHMETAFILE GenDataMatrix_EMF(const char* data, const char* size_str) {
-    init_dm_gf();
-    int target_w = 14; 
-    if (size_str && strlen(size_str) > 0) {
-        int pw, ph; if (sscanf(size_str, "%dx%d", &pw, &ph) == 2 && pw == ph) target_w = pw;
-        else return GenError_EMF();
-    }
-    
-    int size_idx = -1;
-    for (int i=0; i<9; i++) { if (dm_sizes[i].w == target_w) { size_idx = i; break; } }
-    if (size_idx == -1) return GenError_EMF(); 
-    
-    int data_cw = dm_sizes[size_idx].data_cw, ecc_cw = dm_sizes[size_idx].ecc_cw;
-    dm_nrow = target_w - 2; dm_ncol = target_w - 2;
-    
-    int len = strlen(data);
-    if (len > data_cw) return GenError_EMF();
-    
-    unsigned char wd[128] = {0};
-    for (int i = 0; i < len; i++) wd[i] = data[i] + 1;
-    
-    // Fix: Properly implement the 253-state randomizer for padding characters
+static void BuildSingleDataMatrix(const char* chunk, int len, int size_idx, int out_bitmap[64][64]) {
+    int target_w = dm_sizes[size_idx].w;
+    int data_cw  = dm_sizes[size_idx].data_cw;
+    int ecc_cw   = dm_sizes[size_idx].ecc_cw;
+    int regions  = dm_sizes[size_idx].regions;
+    int blocks   = dm_sizes[size_idx].blocks;
+
+    dm_nrow = target_w - 2 * regions;
+    dm_ncol = target_w - 2 * regions;
+
+    unsigned char wd[512] = {0};
+    for (int i = 0; i < len; i++) wd[i] = (unsigned char)chunk[i] + 1;
+
     if (len < data_cw) { 
         wd[len] = 129; 
         for (int i = len + 1; i < data_cw; i++) {
@@ -364,28 +371,30 @@ HENHMETAFILE GenDataMatrix_EMF(const char* data, const char* size_str) {
         }
     }
 
-    // Fix: Correct polynomial degree generation order
-    unsigned char g[64] = {0}; g[0] = 1;
-    for(int i = 1; i <= ecc_cw; i++) {
-        g[i] = g[i-1];
-        for(int j = i - 1; j > 0; j--) g[j] = g[j-1] ^ dm_mul(g[j], dm_exp[i]);
+    int d_per_blk = data_cw / blocks;
+    int e_per_blk = ecc_cw / blocks;
+
+    unsigned char g[128] = {0}; g[0] = 1;
+    for (int i = 1; i <= e_per_blk; i++) {
+        g[i] = g[i - 1];
+        for (int j = i - 1; j > 0; j--) g[j] = g[j - 1] ^ dm_mul(g[j], dm_exp[i]);
         g[0] = dm_mul(g[0], dm_exp[i]);
     }
     
-    // Fix: Align constant term multiplication appropriately for Reed-Solomon division
-    unsigned char ecc[64] = {0};
-    for(int i = 0; i < data_cw; i++) {
-        unsigned char fb = wd[i] ^ ecc[0];
-        for(int j = 0; j < ecc_cw - 1; j++) ecc[j] = ecc[j+1] ^ dm_mul(fb, g[ecc_cw - 1 - j]);
-        ecc[ecc_cw - 1] = dm_mul(fb, g[0]);
+    for (int b = 0; b < blocks; b++) {
+        unsigned char ecc[128] = {0};
+        for (int i = 0; i < d_per_blk; i++) {
+            unsigned char fb = wd[i * blocks + b] ^ ecc[0];
+            for (int j = 0; j < e_per_blk - 1; j++) ecc[j] = ecc[j + 1] ^ dm_mul(fb, g[e_per_blk - 1 - j]);
+            ecc[e_per_blk - 1] = dm_mul(fb, g[0]);
+        }
+        for (int i = 0; i < e_per_blk; i++) wd[data_cw + i * blocks + b] = ecc[i];
     }
-    for (int i = 0; i < ecc_cw; i++) wd[data_cw + i] = ecc[i];
 
     memset(dm_grid, -1, sizeof(dm_grid));
     int r = 4, c = 0, i = 0;
     
     while (i < data_cw + ecc_cw) {
-        // Fix: Standard compliant ISO matrix Corner Case implementations
         if (r == dm_nrow && c == 0) {
             int v = wd[i++];
             dm_module(dm_nrow-1, 0, (v>>7)&1); dm_module(dm_nrow-1, 1, (v>>6)&1); dm_module(dm_nrow-1, 2, (v>>5)&1); dm_module(0, dm_ncol-2, (v>>4)&1);
@@ -411,14 +420,12 @@ HENHMETAFILE GenDataMatrix_EMF(const char* data, const char* size_str) {
             r -= 2; c += 2; continue;
         }
 
-        // Up-Right Sweep
         do {
             if (r >= 0 && r < dm_nrow && c >= 0 && c < dm_ncol && dm_grid[r * dm_ncol + c] == -1) dm_utah(r, c, wd[i++]);
             r -= 2; c += 2;
         } while (r >= 0 && c < dm_ncol);
         r++; c += 3;
 
-        // Down-Left Sweep
         do {
             if (r >= 0 && r < dm_nrow && c >= 0 && c < dm_ncol && dm_grid[r * dm_ncol + c] == -1) dm_utah(r, c, wd[i++]);
             r += 2; c -= 2;
@@ -426,118 +433,180 @@ HENHMETAFILE GenDataMatrix_EMF(const char* data, const char* size_str) {
         r += 3; c++;
     }
 
-    // Fix: Properly handle untouched corner per ISO spec
     if (dm_grid[dm_nrow * dm_ncol - 1] == -1) {
         dm_grid[dm_nrow * dm_ncol - 1] = 1;
         dm_grid[dm_nrow * dm_ncol - dm_ncol - 2] = 0;
     }
 
-    HDC hdcMeta = CreateEnhMetaFile(NULL, NULL, NULL, "BarcodeGen\0DataMatrix\0\0");
-    HBRUSH blackBrush = CreateSolidBrush(RGB(0, 0, 0));
-    int scale = 30; 
+    int reg_w = target_w / regions;
+    int reg_data = reg_w - 2;
     for (int y = 0; y < target_w; y++) {
         for (int x = 0; x < target_w; x++) {
-            int val = (y == target_w-1 || x == 0) ? 1 : ((y == 0) ? (x % 2 == 0) : ((x == target_w-1) ? (y % 2 == 1) : dm_grid[(y - 1) * dm_ncol + (x - 1)]));
-            if (val == 1) { RECT rBox = { x * scale, y * scale, (x + 1) * scale, (y + 1) * scale }; FillRect(hdcMeta, &rBox, blackBrush); }
+            int rx = x / reg_w, ry = y / reg_w;
+            int lx = x % reg_w, ly = y % reg_w;
+            int val;
+            if (ly == reg_w - 1 || lx == 0) val = 1;
+            else if (ly == 0) val = (lx % 2 == 0);
+            else if (lx == reg_w - 1) val = (ly % 2 == 1);
+            else val = dm_grid[(ry * reg_data + (ly - 1)) * dm_ncol + (rx * reg_data + (lx - 1))];
+            out_bitmap[y][x] = (val == 1) ? 1 : 0;
         }
     }
-    DeleteObject(blackBrush); 
-    return CloseEnhMetaFile(hdcMeta);
 }
-// ============================================================================
-// 7. PDF417 ENCODER (Corrected ISO Compaction & Clustering)
-// ============================================================================
-int pdf417_clusters[3][929], pdf417_initialized = 0;
 
-HENHMETAFILE GenPDF417_EMF(const char* data) {
-    if (!pdf417_initialized) {
-        int counts[3] = {0};
-        // ISO 15438 requires evaluating 17-bit patterns in descending numerical order
-        for (int i = 0x1FFFF; i >= 0x10000; i--) {
-            if (i & 1) continue; 
-            
-            int runs[16] = {0}, run_idx = 0, current_bit = 1, len = 0, valid = 1;
-            for (int b = 16; b >= 0; b--) {
-                int bit = (i >> b) & 1; 
-                if (bit == current_bit) { 
-                    len++; 
-                    if (len > 6) { valid = 0; break; } // No run longer than 6 modules
-                } else { 
-                    if (run_idx >= 8) { valid = 0; break; } 
-                    runs[run_idx++] = len; 
-                    current_bit = bit; 
-                    len = 1; 
+HENHMETAFILE GenDataMatrix_EMF(const char* data, const char* size_str) {
+    init_dm_gf();
+    int target_w = 14; 
+    if (size_str && strlen(size_str) > 0) {
+        int pw, ph;
+        if (sscanf(size_str, "%dx%d", &pw, &ph) == 2 && pw == ph) target_w = pw;
+        else return GenError_EMF();
+    }
+    
+    int size_idx = -1;
+    for (int i = 0; i < DM_SIZE_COUNT; i++) {
+        if (dm_sizes[i].w == target_w) { size_idx = i; break; }
+    }
+    if (size_idx == -1) return GenError_EMF(); 
+    
+    int len = (int)strlen(data);
+    int data_cw = dm_sizes[size_idx].data_cw;
+    int scale = 25, qz = 2;
+
+    // 1. Single DataMatrix if payload fits the selected symbol size
+    if (len <= data_cw) {
+        int bmp[64][64] = {{0}};
+        BuildSingleDataMatrix(data, len, size_idx, bmp);
+
+        HDC hdcMeta = CreateEnhMetaFile(NULL, NULL, NULL, "BarcodeGen\0DataMatrix\0\0");
+        HBRUSH blackBrush = CreateSolidBrush(RGB(0, 0, 0));
+        HBRUSH whiteBrush = CreateSolidBrush(RGB(255, 255, 255));
+        RECT rBg = { 0, 0, (target_w + qz * 2) * scale, (target_w + qz * 2) * scale };
+        FillRect(hdcMeta, &rBg, whiteBrush);
+
+        for (int y = 0; y < target_w; y++) {
+            for (int x = 0; x < target_w; x++) {
+                if (bmp[y][x] == 1) {
+                    RECT rBox = { (x + qz) * scale, (y + qz) * scale, (x + qz + 1) * scale, (y + qz + 1) * scale };
+                    FillRect(hdcMeta, &rBox, blackBrush);
                 }
             }
-            if (!valid) continue;
-            
-            if (run_idx >= 8) valid = 0;
-            else runs[run_idx++] = len;
-            
-            if (!valid || run_idx != 8) continue;
-            
-            // Cluster evaluation: K = (b1 - b2 + b3 - b4) mod 9
-            int k = (runs[0] - runs[2] + runs[4] - runs[6]) % 9; 
-            if (k < 0) k += 9;
-            
-            if (k == 0 && counts[0] < 929) pdf417_clusters[0][counts[0]++] = i; 
-            else if (k == 3 && counts[1] < 929) pdf417_clusters[1][counts[1]++] = i; 
-            else if (k == 6 && counts[2] < 929) pdf417_clusters[2][counts[2]++] = i;
         }
-        pdf417_initialized = 1;
+        DeleteObject(blackBrush);
+        DeleteObject(whiteBrush);
+        return CloseEnhMetaFile(hdcMeta);
     }
-    
-    int cw_buf[2048] = {0}, pos = 0; 
-    int d_len = strlen(data), d_idx = 0;
-    
-    // 1. Process multiples of 6 bytes using Latch 901 (Base 900 Compaction)
-    if (d_len >= 6) {
-        cw_buf[pos++] = 901; 
-        while (d_idx + 5 < d_len) {
-            unsigned long long val = 0; 
-            for (int j = 0; j < 6; j++) val = (val << 8) | (unsigned char)data[d_idx + j];
-            int cw[5]; 
-            for (int j = 4; j >= 0; j--) { 
-                cw[j] = val % 900; 
-                val /= 900; 
+
+    // 2. Stacked 2x2 Quad Mode when payload exceeds single symbol capacity
+    // If payload exceeds 4x of the selected size, step up to the smallest size where 4x fits
+    while (size_idx < DM_SIZE_COUNT && len > dm_sizes[size_idx].data_cw * 4) {
+        size_idx++;
+    }
+    if (size_idx >= DM_SIZE_COUNT) return GenError_EMF();
+
+    target_w = dm_sizes[size_idx].w;
+    data_cw  = dm_sizes[size_idx].data_cw;
+
+    int gap = 2; // 2-module quiet zone separating the 4 stacked quadrants
+    int total_mods = qz * 2 + target_w * 2 + gap;
+
+    HDC hdcMeta = CreateEnhMetaFile(NULL, NULL, NULL, "BarcodeGen\0DataMatrix Quad\0\0");
+    HBRUSH blackBrush = CreateSolidBrush(RGB(0, 0, 0));
+    HBRUSH whiteBrush = CreateSolidBrush(RGB(255, 255, 255));
+    RECT rBg = { 0, 0, total_mods * scale, total_mods * scale };
+    FillRect(hdcMeta, &rBg, whiteBrush);
+
+    for (int q = 0; q < 4; q++) {
+        int offset = q * data_cw;
+        int chunk_len = 0;
+        if (offset < len) {
+            chunk_len = len - offset;
+            if (chunk_len > data_cw) chunk_len = data_cw;
+        }
+
+        int bmp[64][64] = {{0}};
+        BuildSingleDataMatrix(data + offset, chunk_len, size_idx, bmp);
+
+        int qx_mod = qz + (q % 2) * (target_w + gap);
+        int qy_mod = qz + (q / 2) * (target_w + gap);
+
+        for (int y = 0; y < target_w; y++) {
+            for (int x = 0; x < target_w; x++) {
+                if (bmp[y][x] == 1) {
+                    RECT rBox = {
+                        (qx_mod + x) * scale,
+                        (qy_mod + y) * scale,
+                        (qx_mod + x + 1) * scale,
+                        (qy_mod + y + 1) * scale
+                    };
+                    FillRect(hdcMeta, &rBox, blackBrush);
+                }
             }
-            for (int j = 0; j < 5; j++) cw_buf[pos++] = cw[j]; 
-            d_idx += 6;
         }
     }
+
+    DeleteObject(blackBrush);
+    DeleteObject(whiteBrush);
+    return CloseEnhMetaFile(hdcMeta);
+}
+
+// ============================================================================
+// 7. PDF417 ENCODER (Configurable Columns 1-30 & ECC Level 0-8)
+// ============================================================================
+
+HENHMETAFILE GenPDF417_EMF(const char* data, int cols, int ecc_level) {
+    if (cols <= 0) cols = 5; // "Auto" defaults to 5 columns
+    if (cols < 1 || cols > 30) return GenError_EMF();
+    if (ecc_level < 0 || ecc_level > 8) return GenError_EMF();
+
+    int cw_buf[2048] = {0}, pos = 0; 
+    int d_len = (int)strlen(data), d_idx = 0;
     
-    // 2. Process remainders (1 to 5 bytes) safely to prevent scanner corruption
-    if (d_idx < d_len) {
-        cw_buf[pos++] = 900; // Terminate 901 and revert to Text Compaction Default
-        while (d_idx < d_len) {
-            cw_buf[pos++] = 913; // Shift to Byte Compaction for ONE codeword only
-            cw_buf[pos++] = (unsigned char)data[d_idx++];
+    // Latch 924 if payload length is an exact multiple of 6; Latch 901 otherwise
+    cw_buf[pos++] = (d_len % 6 == 0) ? 924 : 901;
+    
+    // Encode full 6-byte groups into 5 base-900 codewords
+    while (d_idx + 5 < d_len) {
+        unsigned long long val = 0; 
+        for (int j = 0; j < 6; j++) val = (val << 8) | (unsigned char)data[d_idx + j];
+        int cw[5]; 
+        for (int j = 4; j >= 0; j--) { 
+            cw[j] = (int)(val % 900); 
+            val /= 900; 
         }
+        for (int j = 0; j < 5; j++) cw_buf[pos++] = cw[j]; 
+        d_idx += 6;
     }
     
-    int cols = 5, ecc_level = 1, ecc_count = 1 << (ecc_level + 1);
-    int total_words = pos + 1 + ecc_count, rows = (total_words + cols - 1) / cols;
+    // Remaining 1..5 bytes in mode 901 are encoded directly (1 byte per codeword)
+    while (d_idx < d_len) {
+        cw_buf[pos++] = (unsigned char)data[d_idx++];
+    }
+    
+    int ecc_count = 1 << (ecc_level + 1);
+    int total_words = pos + 1 + ecc_count;
+    int rows = (total_words + cols - 1) / cols;
     if (rows < 3) rows = 3; 
     if (rows > 90) return GenError_EMF();
     
     int pad_count = (rows * cols) - total_words;
-    int payload_len = pos + 1 + pad_count; // Length includes pad & self, excludes ECC
+    int payload_len = pos + 1 + pad_count; 
+    if (payload_len + ecc_count > 928) return GenError_EMF();
     
     int full_buf[4096] = {0}; 
     full_buf[0] = payload_len; 
     
     for (int i = 0; i < pos; i++) full_buf[1 + i] = cw_buf[i];
-    for (int i = 0; i < pad_count; i++) full_buf[1 + pos + i] = 900; // Pad with CW 900
+    for (int i = 0; i < pad_count; i++) full_buf[1 + pos + i] = 900; 
     
-    // RS ECC Generator Polynomial
+    // RS ECC Division Math over GF(929)
     int ecc_gen[1024] = {0}, b[1025] = {0}; b[0] = 1; int root = 1;
     for (int i = 1; i <= ecc_count; i++) { 
         root = (root * 3) % 929; 
-        for (int j = i; j > 0; j--) b[j] = (b[j] + (b[j-1] * (929 - root))) % 929; 
+        for (int j = i; j > 0; j--) b[j] = (b[j] + (b[j - 1] * (929 - root))) % 929; 
     }
     for (int i = 0; i < ecc_count; i++) ecc_gen[i] = b[i + 1];
     
-    // RS ECC Division
     int* out_ecc = &full_buf[payload_len];
     for (int i = 0; i < payload_len; i++) {
         int term = (full_buf[i] + out_ecc[0]) % 929;
@@ -548,9 +617,18 @@ HENHMETAFILE GenPDF417_EMF(const char* data) {
     }
     for (int i = 0; i < ecc_count; i++) if (out_ecc[i] != 0) out_ecc[i] = 929 - out_ecc[i];
 
+    // Graphics Render Initialization
     HDC hdcMeta = CreateEnhMetaFile(NULL, NULL, NULL, "BarcodeGen\0PDF417\0\0"); 
     HBRUSH blackBrush = CreateSolidBrush(RGB(0, 0, 0));
-    int scale_x = 10, scale_y = 30; 
+    HBRUSH whiteBrush = CreateSolidBrush(RGB(255, 255, 255));
+    
+    int scale_x = 5, scale_y = 15; // 1:3 standard PDF417 module aspect ratio
+    int qx = 2, qy = 2;            // Strict 2X Quiet Zone padding
+    int modules_per_row = 17 + 17 + (cols * 17) + 17 + 18; 
+    
+    RECT rBg = { 0, 0, (modules_per_row + qx * 2) * scale_x, (rows + qy * 2) * scale_y };
+    FillRect(hdcMeta, &rBg, whiteBrush);
+    
     int start_pattern[] = {1,1,1,1,1,1,1,1,0,1,0,1,0,1,0,0,0}; 
     int stop_pattern[]  = {1,1,1,1,1,1,1,0,1,0,0,0,1,0,1,0,0,1};
     
@@ -560,36 +638,33 @@ HENHMETAFILE GenPDF417_EMF(const char* data) {
         else if (cluster == 1) { left_ind = 30 * v + ecc_level * 3 + (rows - 1) % 3; right_ind = 30 * v + (rows - 1) / 3; } 
         else { left_ind = 30 * v + (cols - 1); right_ind = 30 * v + ecc_level * 3 + (rows - 1) % 3; }
         
-        int row_seq[32] = {0}, seq_len = 0; 
+        int row_seq[64] = {0}, seq_len = 0; 
         row_seq[seq_len++] = left_ind;
         for (int c = 0; c < cols; c++) row_seq[seq_len++] = full_buf[y * cols + c]; 
         row_seq[seq_len++] = right_ind;
         
-        // Render Start Pattern
         for (int i = 0; i < 17; i++) { 
             if (start_pattern[i]) { 
-                RECT r = { x_off * scale_x, y * scale_y, (x_off + 1) * scale_x, (y + 1) * scale_y }; 
+                RECT r = { (x_off + qx) * scale_x, (y + qy) * scale_y, (x_off + qx + 1) * scale_x, (y + qy + 1) * scale_y }; 
                 FillRect(hdcMeta, &r, blackBrush); 
             } 
             x_off++; 
         }
         
-        // Render Data Codewords
         for (int i = 0; i < seq_len; i++) {
             int pat = pdf417_clusters[cluster][row_seq[i]];
             for (int bit = 16; bit >= 0; bit--) { 
                 if ((pat >> bit) & 1) { 
-                    RECT r = { x_off * scale_x, y * scale_y, (x_off + 1) * scale_x, (y + 1) * scale_y }; 
+                    RECT r = { (x_off + qx) * scale_x, (y + qy) * scale_y, (x_off + qx + 1) * scale_x, (y + qy + 1) * scale_y }; 
                     FillRect(hdcMeta, &r, blackBrush); 
                 } 
                 x_off++; 
             }
         }
         
-        // Render Stop Pattern
         for (int i = 0; i < 18; i++) { 
             if (stop_pattern[i]) { 
-                RECT r = { x_off * scale_x, y * scale_y, (x_off + 1) * scale_x, (y + 1) * scale_y }; 
+                RECT r = { (x_off + qx) * scale_x, (y + qy) * scale_y, (x_off + qx + 1) * scale_x, (y + qy + 1) * scale_y }; 
                 FillRect(hdcMeta, &r, blackBrush); 
             } 
             x_off++; 
@@ -597,49 +672,234 @@ HENHMETAFILE GenPDF417_EMF(const char* data) {
     }
     
     DeleteObject(blackBrush); 
+    DeleteObject(whiteBrush);
     return CloseEnhMetaFile(hdcMeta);
 }
+
 // ============================================================================
-// 8. QR CODE ENCODER (Version 1)
+// 8. QR CODE ENCODER (Versions 1-10, ECC Levels L/M/Q/H, Multi-Block RS)
 // ============================================================================
 
 unsigned char qr_exp[512], qr_log[256]; int qr_initialized = 0;
 unsigned char qr_mul(unsigned char a, unsigned char b) { return (!a || !b) ? 0 : qr_exp[qr_log[a] + qr_log[b]]; }
-HENHMETAFILE GenQR_EMF(const char* text) {
-    if (!qr_initialized) { int x = 1; for(int i = 0; i < 255; i++) { qr_exp[i] = x; qr_log[x] = i; x <<= 1; if(x & 256) x ^= 0x11D; } for(int i = 255; i < 512; i++) qr_exp[i] = qr_exp[i - 255]; qr_initialized = 1; }
-    int symbol[21][21] = {0}; unsigned char rs_gen[8] = {0}; rs_gen[0] = 1;
-    for(int i = 0; i < 7; i++) { for(int j = i + 1; j > 0; j--) rs_gen[j] = rs_gen[j] ^ qr_mul(rs_gen[j-1], qr_exp[i]); }
-    unsigned char data[26] = {0}; int len = strlen(text); if (len > 17) return GenError_EMF();
+
+static const int qr_total_cw[10] = { 26, 44, 70, 100, 134, 172, 196, 242, 292, 346 };
+static const int qr_ecc_pb[10][4] = {
+    { 7, 10, 13, 17}, {10, 16, 22, 28}, {15, 26, 18, 22}, {20, 18, 26, 16}, {26, 24, 18, 22},
+    {18, 16, 24, 28}, {20, 18, 18, 26}, {24, 22, 22, 26}, {30, 22, 20, 24}, {18, 26, 24, 28}
+};
+static const int qr_blocks[10][4] = {
+    {1, 1, 1, 1}, {1, 1, 1, 1}, {1, 1, 2, 2}, {1, 2, 2, 4}, {1, 2, 4, 4},
+    {2, 4, 4, 4}, {2, 4, 6, 5}, {2, 4, 6, 6}, {2, 5, 8, 8}, {4, 5, 8, 8}
+};
+static const int qr_fmt_mask0[4] = { 0x77C4, 0x5412, 0x355F, 0x1689 }; // Mask 0 for L(0), M(1), Q(2), H(3)
+
+HENHMETAFILE GenQR_EMF(const char* text, int req_ver, int ecc_level) {
+    if (!qr_initialized) {
+        int x = 1;
+        for (int i = 0; i < 255; i++) { qr_exp[i] = x; qr_log[x] = i; x <<= 1; if (x & 256) x ^= 0x11D; }
+        for (int i = 255; i < 512; i++) qr_exp[i] = qr_exp[i - 255];
+        qr_initialized = 1;
+    }
+
+    if (ecc_level < 0) ecc_level = 0;
+    if (ecc_level > 3) ecc_level = 3; // Clamp 4..8 to Level H (3)
+
+    int len = (int)strlen(text);
+    int ver = req_ver;
+
+    if (ver <= 0) {
+        // Auto-select smallest QR version (1..10) that fits the payload
+        ver = -1;
+        for (int v = 1; v <= 10; v++) {
+            int data_cw = qr_total_cw[v - 1] - qr_ecc_pb[v - 1][ecc_level] * qr_blocks[v - 1][ecc_level];
+            int max_bytes = data_cw - ((v <= 9) ? 2 : 3);
+            if (len <= max_bytes) { ver = v; break; }
+        }
+        if (ver == -1) return GenError_EMF();
+    } else {
+        if (ver > 10) return GenError_EMF();
+        int data_cw = qr_total_cw[ver - 1] - qr_ecc_pb[ver - 1][ecc_level] * qr_blocks[ver - 1][ecc_level];
+        int max_bytes = data_cw - ((ver <= 9) ? 2 : 3);
+        if (len > max_bytes) return GenError_EMF();
+    }
+
+    int size = 17 + 4 * ver;
+    int total_cw = qr_total_cw[ver - 1];
+    int ecc_pb = qr_ecc_pb[ver - 1][ecc_level];
+    int num_blocks = qr_blocks[ver - 1][ecc_level];
+    int total_data_cw = total_cw - ecc_pb * num_blocks;
+
+    // 1. Pack Byte Mode (0100) bitstream
+    unsigned char data_cw[350] = {0};
     int bp = 0;
-    #define WRITE_BIT(val) do { if (val) data[bp/8] |= (1<<(7-(bp%8))); bp++; } while(0)
-    WRITE_BIT(0); WRITE_BIT(1); WRITE_BIT(0); WRITE_BIT(0); for(int i = 7; i >= 0; i--) WRITE_BIT((len >> i) & 1);
-    for(int i = 0; i < len; i++) { for(int j = 7; j >= 0; j--) WRITE_BIT((text[i] >> j) & 1); }
-    for(int i = 0; i < 4 && bp < 19 * 8; i++) WRITE_BIT(0); while(bp % 8 != 0) WRITE_BIT(0);
-    int pad[2] = {0xEC, 0x11}, pi = 0; while(bp < 19 * 8) { for(int j = 7; j >= 0; j--) WRITE_BIT((pad[pi] >> j) & 1); pi = 1 - pi; }
-    unsigned char ecc[7] = {0};
-    for(int i = 0; i < 19; i++) { unsigned char fb = data[i] ^ ecc[0]; for(int j = 0; j < 6; j++) ecc[j] = ecc[j+1] ^ qr_mul(fb, rs_gen[j+1]); ecc[6] = qr_mul(fb, rs_gen[7]); }
-    for(int i = 0; i < 7; i++) data[19+i] = ecc[i];
-    for(int i = 0; i < 21; i++) for(int j = 0; j < 21; j++) symbol[i][j] = -1;
-    for(int fy = 0; fy < 3; fy++) { int cy = (fy == 2) ? 14 : 0, cx = (fy == 1) ? 14 : 0;
-        for(int y = 0; y < 7; y++) for(int x = 0; x < 7; x++) { int max_dist = MAX(abs(x-3), abs(y-3)); symbol[cy+y][cx+x] = (max_dist == 2) ? 0 : 1; }
-        for(int i = 0; i < 8; i++) { if(cx == 0 && cy == 0) { symbol[7][i] = 0; symbol[i][7] = 0; } if(cx == 14 && cy == 0) { symbol[7][13+i] = 0; symbol[i][13] = 0; } if(cx == 0 && cy == 14) { symbol[13][i] = 0; symbol[13+i][7] = 0; } } }
-    for(int i = 8; i < 13; i++) { symbol[6][i] = (i%2==0); symbol[i][6] = (i%2==0); } symbol[13][8] = 1;
-    int ftx1[] = {0,1,2,3,4,5,7,8,8,8,8,8,8,8,8}, fty1[] = {8,8,8,8,8,8,8,8,7,5,4,3,2,1,0}, ftx2[] = {8,8,8,8,8,8,8,13,14,15,16,17,18,19,20}, fty2[] = {20,19,18,17,16,15,14,8,8,8,8,8,8,8,8}, fmt = 0x77C4;
-    for(int i = 0; i < 15; i++) { int b = (fmt >> (14 - i)) & 1; symbol[fty1[i]][ftx1[i]] = b; symbol[fty2[i]][ftx2[i]] = b; }
-    int x = 20, y = 20, dir = -1, bit_idx = 0;
-    while(x > 0) { if(x == 6) x--; 
-        for(int i = 0; i < 2; i++) { int cx = x - i; if(symbol[y][cx] == -1) { int b = 0; if (bit_idx < 208) b = (data[bit_idx / 8] >> (7 - (bit_idx % 8))) & 1; if ((cx + y) % 2 == 0) b ^= 1; symbol[y][cx] = b; bit_idx++; } }
-        y += dir; if(y < 0 || y > 20) { dir = -dir; y += dir; x -= 2; } }
-    HDC hdcMeta = CreateEnhMetaFile(NULL, NULL, NULL, "BarcodeGen\0QR Code\0\0"); HBRUSH blackBrush = CreateSolidBrush(RGB(0, 0, 0)); int scale = 20; 
-    for (int ry = 0; ry < 21; ry++) { for (int rx = 0; rx < 21; rx++) { if (symbol[ry][rx] == 1) { RECT rBox = { rx * scale, ry * scale, (rx + 1) * scale, (ry + 1) * scale }; FillRect(hdcMeta, &rBox, blackBrush); } } }
-    DeleteObject(blackBrush); return CloseEnhMetaFile(hdcMeta);
+    #define QR_WRITE_BIT(val) do { if (val) data_cw[bp / 8] |= (1 << (7 - (bp % 8))); bp++; } while(0)
+
+    QR_WRITE_BIT(0); QR_WRITE_BIT(1); QR_WRITE_BIT(0); QR_WRITE_BIT(0);
+    int cci_bits = (ver <= 9) ? 8 : 16;
+    for (int i = cci_bits - 1; i >= 0; i--) QR_WRITE_BIT((len >> i) & 1);
+    for (int i = 0; i < len; i++) {
+        for (int j = 7; j >= 0; j--) QR_WRITE_BIT(((unsigned char)text[i] >> j) & 1);
+    }
+    for (int i = 0; i < 4 && bp < total_data_cw * 8; i++) QR_WRITE_BIT(0);
+    while (bp % 8 != 0 && bp < total_data_cw * 8) QR_WRITE_BIT(0);
+
+    int pad[2] = {0xEC, 0x11}, pi = 0;
+    while (bp < total_data_cw * 8) {
+        for (int j = 7; j >= 0; j--) QR_WRITE_BIT((pad[pi] >> j) & 1);
+        pi = 1 - pi;
+    }
+    #undef QR_WRITE_BIT
+
+    // 2. Build RS Generator Polynomial of degree ecc_pb
+    unsigned char rs_gen[32] = {0};
+    rs_gen[0] = 1;
+    for (int i = 0; i < ecc_pb; i++) {
+        for (int j = i + 1; j > 0; j--) rs_gen[j] = rs_gen[j] ^ qr_mul(rs_gen[j - 1], qr_exp[i]);
+    }
+
+    // 3. Split into Group 1 & Group 2 blocks, compute RS ECC, and interleave
+    int g2_blocks = total_data_cw % num_blocks;
+    int g1_blocks = num_blocks - g2_blocks;
+    int g1_len = total_data_cw / num_blocks;
+    int g2_len = g1_len + 1;
+
+    unsigned char blk_data[8][128] = {{0}};
+    unsigned char blk_ecc[8][32] = {{0}};
+    int src_idx = 0;
+
+    for (int b = 0; b < num_blocks; b++) {
+        int blen = (b < g1_blocks) ? g1_len : g2_len;
+        for (int i = 0; i < blen; i++) blk_data[b][i] = data_cw[src_idx++];
+        for (int i = 0; i < blen; i++) {
+            unsigned char fb = blk_data[b][i] ^ blk_ecc[b][0];
+            for (int j = 0; j < ecc_pb - 1; j++) blk_ecc[b][j] = blk_ecc[b][j + 1] ^ qr_mul(fb, rs_gen[j + 1]);
+            blk_ecc[b][ecc_pb - 1] = qr_mul(fb, rs_gen[ecc_pb]);
+        }
+    }
+
+    unsigned char final_cw[400] = {0};
+    int out_idx = 0;
+    for (int col = 0; col < g1_len; col++) {
+        for (int b = 0; b < num_blocks; b++) final_cw[out_idx++] = blk_data[b][col];
+    }
+    if (g2_blocks > 0) {
+        for (int b = g1_blocks; b < num_blocks; b++) final_cw[out_idx++] = blk_data[b][g1_len];
+    }
+    for (int col = 0; col < ecc_pb; col++) {
+        for (int b = 0; b < num_blocks; b++) final_cw[out_idx++] = blk_ecc[b][col];
+    }
+
+    // 4. Construct QR Matrix
+    int symbol[64][64];
+    for (int y = 0; y < size; y++) for (int x = 0; x < size; x++) symbol[y][x] = -1;
+
+    // Finder patterns + separators
+    for (int fy = 0; fy < 3; fy++) {
+        int cy = (fy == 2) ? (size - 7) : 0;
+        int cx = (fy == 1) ? (size - 7) : 0;
+        for (int dy = -1; dy <= 7; dy++) {
+            for (int dx = -1; dx <= 7; dx++) {
+                int py = cy + dy, px = cx + dx;
+                if (py >= 0 && py < size && px >= 0 && px < size) {
+                    if (dy == -1 || dy == 7 || dx == -1 || dx == 7) symbol[py][px] = 0;
+                    else symbol[py][px] = (MAX(abs(dx - 3), abs(dy - 3)) == 2) ? 0 : 1;
+                }
+            }
+        }
+    }
+
+    // Alignment patterns (V2..V10)
+    if (ver >= 2) {
+        int ap_coords[3] = { 6, (ver >= 7) ? ((size - 1) / 2) : (size - 7), size - 7 };
+        int ap_cnt = (ver >= 7) ? 3 : 2;
+        for (int iy = 0; iy < ap_cnt; iy++) {
+            for (int ix = 0; ix < ap_cnt; ix++) {
+                if ((iy == 0 && ix == 0) || (iy == 0 && ix == ap_cnt - 1) || (iy == ap_cnt - 1 && ix == 0)) continue;
+                int ay = ap_coords[iy], ax = ap_coords[ix];
+                for (int dy = -2; dy <= 2; dy++) {
+                    for (int dx = -2; dx <= 2; dx++) {
+                        symbol[ay + dy][ax + dx] = (MAX(abs(dx), abs(dy)) == 1) ? 0 : 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // Timing patterns & Dark Module
+    for (int i = 8; i < size - 8; i++) {
+        symbol[6][i] = (i % 2 == 0);
+        symbol[i][6] = (i % 2 == 0);
+    }
+    symbol[size - 8][8] = 1;
+
+    // Version Information (V7..V10)
+    if (ver >= 7) {
+        int rem = ver << 12;
+        for (int i = 5; i >= 0; i--) if (rem & (1 << (i + 12))) rem ^= (0x1F25 << i);
+        int vinfo = (ver << 12) | rem;
+        for (int i = 0; i < 18; i++) {
+            int bit = (vinfo >> i) & 1;
+            symbol[size - 11 + (i % 3)][i / 3] = bit;
+            symbol[i / 3][size - 11 + (i % 3)] = bit;
+        }
+    }
+
+    // Format Information (Mask 0)
+    int ftx1[] = {0,1,2,3,4,5,7,8,8,8,8,8,8,8,8};
+    int fty1[] = {8,8,8,8,8,8,8,8,7,5,4,3,2,1,0};
+    int fmt = qr_fmt_mask0[ecc_level];
+    for (int i = 0; i < 15; i++) {
+        int b = (fmt >> (14 - i)) & 1;
+        symbol[fty1[i]][ftx1[i]] = b;
+        if (i < 7) symbol[size - 1 - i][8] = b;
+        else       symbol[8][size - 15 + i] = b;
+    }
+
+    // Zig-zag data placement with Mask 0
+    int x = size - 1, y = size - 1, dir = -1, bit_idx = 0, total_bits = total_cw * 8;
+    while (x > 0) {
+        if (x == 6) x--;
+        for (int i = 0; i < 2; i++) {
+            int cx = x - i;
+            if (symbol[y][cx] == -1) {
+                int b = 0;
+                if (bit_idx < total_bits) b = (final_cw[bit_idx / 8] >> (7 - (bit_idx % 8))) & 1;
+                if ((cx + y) % 2 == 0) b ^= 1;
+                symbol[y][cx] = b;
+                bit_idx++;
+            }
+        }
+        y += dir;
+        if (y < 0 || y >= size) { dir = -dir; y += dir; x -= 2; }
+    }
+
+    // Render EMF with 2-module white quiet zone
+    HDC hdcMeta = CreateEnhMetaFile(NULL, NULL, NULL, "BarcodeGen\0QR Code\0\0");
+    HBRUSH blackBrush = CreateSolidBrush(RGB(0, 0, 0));
+    HBRUSH whiteBrush = CreateSolidBrush(RGB(255, 255, 255));
+    int scale = 20, qz = 2;
+    RECT rBg = { 0, 0, (size + qz * 2) * scale, (size + qz * 2) * scale };
+    FillRect(hdcMeta, &rBg, whiteBrush);
+
+    for (int ry = 0; ry < size; ry++) {
+        for (int rx = 0; rx < size; rx++) {
+            if (symbol[ry][rx] == 1) {
+                RECT rBox = { (rx + qz) * scale, (ry + qz) * scale, (rx + qz + 1) * scale, (ry + qz + 1) * scale };
+                FillRect(hdcMeta, &rBox, blackBrush);
+            }
+        }
+    }
+    DeleteObject(blackBrush);
+    DeleteObject(whiteBrush);
+    return CloseEnhMetaFile(hdcMeta);
 }
 
 // ============================================================================
 // ROUTING & SCALING LOGIC
 // ============================================================================
 
-HENHMETAFILE CreateBarcodeEMF(int type, const char* data, const char* size_str) {
+HENHMETAFILE CreateBarcodeEMF(int type, const char* data, const char* size_str, int cols_or_ver, int ecc_level) {
     if (!data || strlen(data) == 0) return GenError_EMF();
     switch(type) {
         case 0: return GenUPC_EMF(data);
@@ -650,8 +910,8 @@ HENHMETAFILE CreateBarcodeEMF(int type, const char* data, const char* size_str) 
         case 5: return GenCodabar_EMF(data);
         case 6: return GenPOSTNET_EMF(data);
         case 7: return GenDataMatrix_EMF(data, size_str);
-        case 8: return GenPDF417_EMF(data);
-        case 9: return GenQR_EMF(data);
+        case 8: return GenPDF417_EMF(data, cols_or_ver, ecc_level);
+        case 9: return GenQR_EMF(data, cols_or_ver, ecc_level);
     }
     return GenError_EMF();
 }
@@ -679,17 +939,21 @@ void DrawEMFScaled(HDC hdc, HENHMETAFILE hMeta, RECT rcTarget) {
 // ============================================================================
 
 HENHMETAFILE hCurrentEMF = NULL;
-
 RECT rcPreview = { 15, 110, 470, 360 };
 
 void UpdatePreview(HWND hwnd) {
-    char data[256] = {0}, size_str[32] = {0};
-    GetDlgItemText(hwnd, IDC_EDIT_DATA, data, 255);
+    char data[1024] = {0}, size_str[32] = {0}, cols_str[16] = {0}, ecc_str[16] = {0};
+    GetDlgItemText(hwnd, IDC_EDIT_DATA, data, 1023);
     GetDlgItemText(hwnd, IDC_COMBO_SIZE, size_str, 31);
+    GetDlgItemText(hwnd, IDC_COMBO_COLS, cols_str, 15);
+    GetDlgItemText(hwnd, IDC_COMBO_ECC, ecc_str, 15);
     int type = SendDlgItemMessage(hwnd, IDC_COMBO_TYPE, CB_GETCURSEL, 0, 0);
+
+    int cols_or_ver = (strlen(cols_str) > 0) ? atoi(cols_str) : 0; // "Auto" -> 0
+    int ecc_level   = (strlen(ecc_str) > 0)  ? atoi(ecc_str)  : 1;
     
     if (hCurrentEMF) { DeleteEnhMetaFile(hCurrentEMF); hCurrentEMF = NULL; }
-    hCurrentEMF = CreateBarcodeEMF(type, data, size_str);
+    hCurrentEMF = CreateBarcodeEMF(type, data, size_str, cols_or_ver, ecc_level);
     InvalidateRect(hwnd, &rcPreview, TRUE);
 }
 
@@ -697,19 +961,37 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch(msg) {
         case WM_CREATE: {
             CreateWindow("STATIC", "Payload Data:", WS_CHILD | WS_VISIBLE, 15, 15, 100, 20, hwnd, NULL, NULL, NULL);
-            CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", "TOOLKIT", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 120, 15, 200, 22, hwnd, (HMENU)IDC_EDIT_DATA, NULL, NULL);
+            CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", "TOOLKIT", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 140, 15, 200, 22, hwnd, (HMENU)IDC_EDIT_DATA, NULL, NULL);
             
             CreateWindow("STATIC", "Format:", WS_CHILD | WS_VISIBLE, 15, 45, 100, 20, hwnd, NULL, NULL, NULL);
-            HWND hCombo = CreateWindow("COMBOBOX", NULL, WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL, 120, 43, 200, 250, hwnd, (HMENU)IDC_COMBO_TYPE, NULL, NULL);
-            const char* items[] = { "UPC-A", "EAN-13", "Code 39", "Code 128 (Sub B)", "ITF-14", "Codabar", "POSTNET", "DataMatrix", "PDF417", "QR Code (V1)" };
+            HWND hCombo = CreateWindow("COMBOBOX", NULL, WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL, 140, 43, 200, 250, hwnd, (HMENU)IDC_COMBO_TYPE, NULL, NULL);
+            const char* items[] = { "UPC-A", "EAN-13", "Code 39", "Code 128 (Sub B)", "ITF-14", "Codabar", "POSTNET", "DataMatrix (Single / Quad)", "PDF417", "QR Code (V1-V10)" };
             for(int i = 0; i < 10; i++) SendMessage(hCombo, CB_ADDSTRING, 0, (LPARAM)items[i]);
-            SendMessage(hCombo, CB_SETCURSEL, 7, 0); 
+            SendMessage(hCombo, CB_SETCURSEL, 7, 0); // Default to DataMatrix
             
-            CreateWindow("STATIC", "Size (e.g. 14x14):", WS_CHILD | WS_VISIBLE, 15, 75, 120, 20, hwnd, NULL, NULL, NULL);
-            HWND hComboSize = CreateWindow("COMBOBOX", NULL, WS_CHILD | WS_VISIBLE | CBS_DROPDOWN | WS_VSCROLL, 140, 73, 100, 200, hwnd, (HMENU)IDC_COMBO_SIZE, NULL, NULL);
-            const char* sizes[] = { "10x10", "12x12", "14x14", "16x16", "18x18", "20x20", "22x22", "24x24", "26x26" };
-            for(int i = 0; i < 9; i++) SendMessage(hComboSize, CB_ADDSTRING, 0, (LPARAM)sizes[i]);
+            CreateWindow("STATIC", "DM Size:", WS_CHILD | WS_VISIBLE, 15, 75, 60, 20, hwnd, NULL, NULL, NULL);
+            HWND hComboSize = CreateWindow("COMBOBOX", NULL, WS_CHILD | WS_VISIBLE | CBS_DROPDOWN | WS_VSCROLL, 78, 73, 82, 250, hwnd, (HMENU)IDC_COMBO_SIZE, NULL, NULL);
+            const char* sizes[] = {
+                "10x10", "12x12", "14x14", "16x16", "18x18", "20x20", "22x22", "24x24", "26x26",
+                "32x32", "36x36", "40x40", "44x44", "48x48", "52x52"
+            };
+            for(int i = 0; i < DM_SIZE_COUNT; i++) SendMessage(hComboSize, CB_ADDSTRING, 0, (LPARAM)sizes[i]);
             SendMessage(hComboSize, CB_SETCURSEL, 2, 0); 
+
+            CreateWindow("STATIC", "Cols / Ver:", WS_CHILD | WS_VISIBLE, 172, 75, 75, 20, hwnd, NULL, NULL, NULL);
+            HWND hComboCols = CreateWindow("COMBOBOX", NULL, WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL, 248, 73, 68, 250, hwnd, (HMENU)IDC_COMBO_COLS, NULL, NULL);
+            SendMessage(hComboCols, CB_ADDSTRING, 0, (LPARAM)"Auto");
+            for(int i = 1; i <= 30; i++) {
+                char buf[8]; sprintf(buf, "%d", i);
+                SendMessage(hComboCols, CB_ADDSTRING, 0, (LPARAM)buf);
+            }
+            SendMessage(hComboCols, CB_SETCURSEL, 0, 0); // Default "Auto"
+
+            CreateWindow("STATIC", "ECC:", WS_CHILD | WS_VISIBLE, 328, 75, 35, 20, hwnd, NULL, NULL, NULL);
+            HWND hComboEcc = CreateWindow("COMBOBOX", NULL, WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL, 365, 73, 95, 250, hwnd, (HMENU)IDC_COMBO_ECC, NULL, NULL);
+            const char* ecc_labels[] = { "0 (QR: L)", "1 (QR: M)", "2 (QR: Q)", "3 (QR: H)", "4", "5", "6", "7", "8" };
+            for(int i = 0; i <= 8; i++) SendMessage(hComboEcc, CB_ADDSTRING, 0, (LPARAM)ecc_labels[i]);
+            SendMessage(hComboEcc, CB_SETCURSEL, 1, 0); // Default ECC 1
 
             CreateWindow("BUTTON", "Copy to Clipboard", WS_CHILD | WS_VISIBLE, 340, 14, 130, 24, hwnd, (HMENU)IDC_BTN_COPY, NULL, NULL);
             CreateWindow("BUTTON", "Save as EMF", WS_CHILD | WS_VISIBLE, 340, 46, 130, 24, hwnd, (HMENU)IDC_BTN_SAVE, NULL, NULL);
@@ -722,7 +1004,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             int height = HIWORD(lParam);
             SetWindowPos(GetDlgItem(hwnd, IDC_EDIT_DATA), NULL, 140, 15, width - 280, 22, SWP_NOZORDER);
             SetWindowPos(GetDlgItem(hwnd, IDC_COMBO_TYPE), NULL, 140, 43, width - 280, 250, SWP_NOZORDER);
-            SetWindowPos(GetDlgItem(hwnd, IDC_COMBO_SIZE), NULL, 140, 73, 100, 250, SWP_NOZORDER);
             SetWindowPos(GetDlgItem(hwnd, IDC_BTN_COPY), NULL, width - 130, 14, 115, 24, SWP_NOZORDER);
             SetWindowPos(GetDlgItem(hwnd, IDC_BTN_SAVE), NULL, width - 130, 46, 115, 24, SWP_NOZORDER);
             rcPreview.left = 15; rcPreview.top = 110; rcPreview.right = width - 15; rcPreview.bottom = height - 15;
@@ -736,6 +1017,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 PostMessage(hwnd, WM_COMMAND, MAKEWPARAM(IDC_COMBO_SIZE, CBN_EDITCHANGE), (LPARAM)GetDlgItem(hwnd, IDC_COMBO_SIZE));
             }
             if (LOWORD(wParam) == IDC_COMBO_TYPE && HIWORD(wParam) == CBN_SELCHANGE) UpdatePreview(hwnd);
+            if (LOWORD(wParam) == IDC_COMBO_COLS && HIWORD(wParam) == CBN_SELCHANGE) UpdatePreview(hwnd);
+            if (LOWORD(wParam) == IDC_COMBO_ECC  && HIWORD(wParam) == CBN_SELCHANGE) UpdatePreview(hwnd);
             
             if (LOWORD(wParam) == IDC_BTN_COPY) {
                 if (hCurrentEMF && OpenClipboard(hwnd)) {
@@ -774,7 +1057,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 }
 
 // ============================================================================
-// MAIN ENTRY POINT (Updated CLI Parsing with Optional Size Support)
+// MAIN ENTRY POINT (CLI & GUI)
 // ============================================================================
 
 int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
@@ -783,7 +1066,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
         freopen("CONOUT$", "w", stdout);
         
         if (__argc < 3) {
-            printf("\nUsage: BarcodeGen.exe <data> -t:<type> [-s:<size>] [-o:<output.emf>]\n");
+            printf("\nUsage: BarcodeGen.exe <data> -t:<type> [-s:<size>] [-c:<cols/ver>] [-e:<ecc>] [-o:<output.emf>]\n");
             printf("Types: upc, ean, code39, code128, itf14, codabar, postnet, datamatrix, pdf417, qr\n\n");
             return 1;
         }
@@ -792,6 +1075,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
         char type[32] = {0}; 
         char size_str[32] = {0}; 
         char output_file[260] = {0};
+        int cols_or_ver = 0, ecc_level = 1;
 
         for (int i = 1; i < __argc; i++) {
             if (strncmp(__argv[i], "-t:", 3) == 0) {
@@ -799,6 +1083,12 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
             } 
             else if (strncmp(__argv[i], "-s:", 3) == 0) {
                 strncpy(size_str, __argv[i] + 3, sizeof(size_str) - 1);
+            } 
+            else if (strncmp(__argv[i], "-c:", 3) == 0) {
+                cols_or_ver = atoi(__argv[i] + 3);
+            } 
+            else if (strncmp(__argv[i], "-e:", 3) == 0) {
+                ecc_level = atoi(__argv[i] + 3);
             } 
             else if (strncmp(__argv[i], "-o:", 3) == 0) {
                 strncpy(output_file, __argv[i] + 3, sizeof(output_file) - 1);
@@ -830,8 +1120,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
             return 1; 
         }
 
-        // Pass the optional size_str parameter to the generator
-        HENHMETAFILE hMeta = CreateBarcodeEMF(type_idx, data, size_str);
+        HENHMETAFILE hMeta = CreateBarcodeEMF(type_idx, data, size_str, cols_or_ver, ecc_level);
         if (hMeta) {
             if (strlen(output_file) > 0) {
                 HENHMETAFILE hSave = CopyEnhMetaFile(hMeta, output_file);
