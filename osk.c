@@ -56,6 +56,8 @@ HWND g_hSuppressedWindow = NULL;
 
 BOOL g_bShiftLock = FALSE;
 BOOL g_bCaps = FALSE;
+BOOL g_bRightCtrlLock = FALSE; 
+BOOL g_bRightAltLock = FALSE;
 int g_hoverKey = -1;
 int g_downKey = -1;
 
@@ -301,20 +303,34 @@ void CheckFocus() {
 
 void SendKeystroke(int vkCode) {
     BOOL bNeedShift = g_bShiftLock;
+    BOOL bNeedRCtrl = g_bRightCtrlLock;
+    BOOL bNeedRAlt = g_bRightAltLock;
 
     if (g_bCaps && vkCode >= 'A' && vkCode <= 'Z') {
         bNeedShift = !bNeedShift;
     }
 
     int inputsCount = 0;
-    INPUT inputs[4] = {0};
+    INPUT inputs[8] = {0}; // Increased to 8 to prevent buffer overflow with multiple modifiers
 
+    // 1. Press Modifiers Down
+    if (bNeedRCtrl && vkCode != VK_RCONTROL) {
+        inputs[inputsCount].type = INPUT_KEYBOARD;
+        inputs[inputsCount].ki.wVk = VK_RCONTROL;
+        inputsCount++;
+    }
+    if (bNeedRAlt && vkCode != VK_RMENU) {
+        inputs[inputsCount].type = INPUT_KEYBOARD;
+        inputs[inputsCount].ki.wVk = VK_RMENU;
+        inputsCount++;
+    }
     if (bNeedShift && vkCode != VK_SHIFT && vkCode != VK_LSHIFT && vkCode != VK_RSHIFT) {
         inputs[inputsCount].type = INPUT_KEYBOARD;
         inputs[inputsCount].ki.wVk = VK_SHIFT;
         inputsCount++;
     }
 
+    // 2. Press and Release Target Key
     inputs[inputsCount].type = INPUT_KEYBOARD;
     inputs[inputsCount].ki.wVk = vkCode;
     inputsCount++;
@@ -324,17 +340,44 @@ void SendKeystroke(int vkCode) {
     inputs[inputsCount].ki.dwFlags = KEYEVENTF_KEYUP;
     inputsCount++;
 
+    // 3. Release Modifiers Up
     if (bNeedShift && vkCode != VK_SHIFT && vkCode != VK_LSHIFT && vkCode != VK_RSHIFT) {
         inputs[inputsCount].type = INPUT_KEYBOARD;
         inputs[inputsCount].ki.wVk = VK_SHIFT;
         inputs[inputsCount].ki.dwFlags = KEYEVENTF_KEYUP;
         inputsCount++;
     }
+    if (bNeedRAlt && vkCode != VK_RMENU) {
+        inputs[inputsCount].type = INPUT_KEYBOARD;
+        inputs[inputsCount].ki.wVk = VK_RMENU;
+        inputs[inputsCount].ki.dwFlags = KEYEVENTF_KEYUP;
+        inputsCount++;
+    }
+    if (bNeedRCtrl && vkCode != VK_RCONTROL) {
+        inputs[inputsCount].type = INPUT_KEYBOARD;
+        inputs[inputsCount].ki.wVk = VK_RCONTROL;
+        inputs[inputsCount].ki.dwFlags = KEYEVENTF_KEYUP;
+        inputsCount++;
+    }
 
     SendInput(inputsCount, inputs, sizeof(INPUT));
 
+    // 4. Clear Modifiers
+    BOOL bNeedsInvalidate = FALSE;
     if (g_bShiftLock && vkCode != VK_SHIFT && vkCode != VK_LSHIFT && vkCode != VK_RSHIFT && vkCode != VK_CAPITAL) {
         g_bShiftLock = FALSE;
+        bNeedsInvalidate = TRUE;
+    }
+    if (g_bRightCtrlLock && vkCode != VK_RCONTROL) {
+        g_bRightCtrlLock = FALSE;
+        bNeedsInvalidate = TRUE;
+    }
+    if (g_bRightAltLock && vkCode != VK_RMENU) {
+        g_bRightAltLock = FALSE;
+        bNeedsInvalidate = TRUE;
+    }
+
+    if (bNeedsInvalidate) {
         InvalidateRect(hMainWnd, NULL, FALSE);
     }
 }
@@ -423,13 +466,19 @@ void PaintUI(HWND hwnd) {
             
             if ((layout[i].vk == VK_SHIFT || layout[i].vk == VK_RSHIFT) && g_bShiftLock) kCol = CLR_ACCENT;
             if (layout[i].vk == VK_CAPITAL && g_bCaps) kCol = CLR_ACCENT;
+            if (layout[i].vk == VK_RCONTROL && g_bRightCtrlLock) kCol = CLR_ACCENT;
+            if (layout[i].vk == VK_RMENU && g_bRightAltLock) kCol = CLR_ACCENT;
 
             // Sharp Square Keys
             DrawSquareRect(memDC, layout[i].rect.left, layout[i].rect.top, 
                          layout[i].rect.right - layout[i].rect.left, 
                          layout[i].rect.bottom - layout[i].rect.top, kCol);
             
-            BOOL isAccent = ((layout[i].vk == VK_SHIFT || layout[i].vk == VK_RSHIFT) && g_bShiftLock) || (layout[i].vk == VK_CAPITAL && g_bCaps);
+            BOOL isAccent = ((layout[i].vk == VK_SHIFT || layout[i].vk == VK_RSHIFT) && g_bShiftLock) || 
+                            (layout[i].vk == VK_CAPITAL && g_bCaps) ||
+                            (layout[i].vk == VK_RCONTROL && g_bRightCtrlLock) ||
+                            (layout[i].vk == VK_RMENU && g_bRightAltLock);
+            
             SetTextColor(memDC, isAccent ? RGB(255, 255, 255) : CLR_TEXT);
             
             SelectObject(memDC, layout[i].isMod ? hFontSmall : hFontNormal);
@@ -613,6 +662,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
                         g_bShiftLock = !g_bShiftLock;
                     } else if (vk == VK_CAPITAL) {
                         g_bCaps = !g_bCaps;
+                    } else if (vk == VK_RCONTROL) {
+                        g_bRightCtrlLock = !g_bRightCtrlLock;
+                    } else if (vk == VK_RMENU) {
+                        g_bRightAltLock = !g_bRightAltLock;
                     } else {
                         SendKeystroke(vk);
                     }
