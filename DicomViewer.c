@@ -15,6 +15,10 @@
  *  Build:
  *   gcc DicomViewer.c -o DicomViewer.exe -mwindows -lshell32 -lcomctl32
  *  -municode
+ *  2026 Hugo
+ *  
+ *  THIS WORK IS NOT FIT FOR ANY FUNCTION OR PURPOSE, COMES WITH NO WARRANTY,
+ *  AND IS BEING RELEASED INTO THE PUBLIC DOMAIN.
  * ============================================================================ */
 
 #ifndef UNICODE
