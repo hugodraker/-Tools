@@ -2,7 +2,9 @@
  * AI LLAMA test 02 - OpenCL GPU Accelerated + Native Bubble Text Selection
  *
  * COMPILATION INSTRUCTIONS (64-bit GCC/MinGW):
- *   gcc "ai02.c" -Os -s -o "ai02.exe" -mwindows -lgdi32 -lshell32 -lcomdlg32 -lm
+ *   gcc "ai02.c" -Os -s -o "ai02.exe" -mwindows -Wl,--large-address-aware -lgdi32 -lshell32 -lcomdlg32 -lm
+ *
+ *  2026 HUGO
  *
  * THIS WORK IS NOT FIT FOR ANY FUNCTION OR PURPOSE, COMES WITH NO WARRANTY,
  * AND IS BEING RELEASED INTO THE PUBLIC DOMAIN.
@@ -19,7 +21,6 @@
 #include <commdlg.h>
 #include <stdarg.h>
 #include <time.h>
-
 #define MAX_MSGS     500
 #define ID_EDIT      101
 #define ID_COMBO     102
@@ -288,16 +289,12 @@ cl_mem get_or_upload_gpu_weight(const float* w, size_t bytes) {
     return buf;
 }
 
-// ============================================================================
-// GLOBAL UI & NATIVE BUBBLE SELECTION STATE
-// ============================================================================
 typedef struct {
-    char text[32768];
+    char text[262144];
     int msg_type;
     RECT hit_box;
     RECT text_box;
 } ChatMsg;
-
 ChatMsg chat_log[MAX_MSGS];
 int msg_count = 0;
 int scroll_y = 0;
@@ -323,6 +320,8 @@ char* file_map_ptr = NULL;
 char* safe_tensors_data = NULL;
 char* json_header = NULL;
 
+volatile int stop_generation = 0;
+
 #define FETCH_TENS(ptr, name, elems) do { \
     ptr = fetch_tensor(name, elems); \
     if (!ptr) { \
@@ -332,7 +331,7 @@ char* json_header = NULL;
         return 0; \
     } \
 } while(0)
-
+#define IDM_STOP_OUTPUT 2009
 float fp16_to_fp32(uint16_t h) {
     uint32_t sign = (h >> 15) & 1;
     uint32_t exp = (h >> 10) & 0x1F;
@@ -626,6 +625,7 @@ void PickColor(HWND hwnd, COLORREF* current_color, const char* key) {
 
 void handle_menu_cmd(HWND hwnd, int cmd) {
     if (cmd == IDM_SAVE_PDF) save_chat_to_pdf(hwnd);
+    else if (cmd == IDM_STOP_OUTPUT) stop_generation = 1;
     else if (cmd == IDM_SET_COLOR_U) PickColor(hwnd, &color_user, "User");
     else if (cmd == IDM_SET_COLOR_AI) PickColor(hwnd, &color_ai, "AI");
     else if (cmd == IDM_CLEAR_CHAT) { msg_count = 0; scroll_y = 0; InvalidateRect(hwnd, NULL, TRUE); }
@@ -767,6 +767,10 @@ void show_bubble_context_menu(HWND hwnd, int msg_idx, POINT screen_pt) {
     AppendMenuA(hMenu, MF_STRING, IDM_SEL_ALL, "Select All in Bubble\tCtrl+A");
     
     AppendMenuA(hMenu, MF_SEPARATOR, 0, NULL);
+    if (is_generating) {
+        AppendMenuA(hMenu, MF_STRING, IDM_STOP_OUTPUT, "Stop Output");
+        AppendMenuA(hMenu, MF_SEPARATOR, 0, NULL);
+    }
     AppendMenuA(hMenu, MF_STRING, IDM_SAVE_PDF, "Save Chat to PDF");
     AppendMenuA(hMenu, MF_STRING, IDM_SET_COLOR_U, "Set User Bubble Color...");
     AppendMenuA(hMenu, MF_STRING, IDM_SET_COLOR_AI, "Set AI Bubble Color...");
@@ -793,14 +797,14 @@ void show_bubble_context_menu(HWND hwnd, int msg_idx, POINT screen_pt) {
     }
 }
 
-// ============================================================================
-// TOKENIZER & SAFETENSORS PARSER
-// ============================================================================
 int encode_text_segment(const char* text, int* tokens, int count, int max_tokens) {
-    char bpe_buf[4096];
-    int b_idx = 0;
+    size_t len = strlen(text);
+    size_t bpe_cap = len * 3 + 10;
+    char* bpe_buf = (char*)malloc(bpe_cap);
+    if (!bpe_buf) return count;
 
-    for (int i = 0; text[i] != '\0' && b_idx < 4090; i++) {
+    int b_idx = 0;
+    for (int i = 0; text[i] != '\0' && b_idx < bpe_cap - 6; i++) {
         if (text[i] == ' ') {
             if (uses_g_prefix) {
                 bpe_buf[b_idx++] = (char)0xC4; bpe_buf[b_idx++] = (char)0xA0;
@@ -842,9 +846,9 @@ int encode_text_segment(const char* text, int* tokens, int count, int max_tokens
             pos++;
         }
     }
+    free(bpe_buf);
     return count;
 }
-
 int find_token_id(const char* str) {
     for (int i = 0; i < vocab_size; i++) {
         if (vocab_map[i].str && strcmp(vocab_map[i].str, str) == 0) return i;
@@ -1518,13 +1522,17 @@ int tokenize_greedy(const char* text, int* tokens, int max_seq, int max_gen) {
     } else {
         int bos = find_token_id("<s>");
         if (bos != -1) tokens[count++] = bos;
-        char prompt_buf[4096];
-        snprintf(prompt_buf, sizeof(prompt_buf), "User: %s\nAssistant:", text);
-        count = encode_text_segment(prompt_buf, tokens, count, prompt_budget);
+        
+        size_t pbuf_size = strlen(text) + 256;
+        char* prompt_buf = malloc(pbuf_size);
+        if (prompt_buf) {
+            snprintf(prompt_buf, pbuf_size, "User: %s\nAssistant:", text);
+            count = encode_text_segment(prompt_buf, tokens, count, prompt_budget);
+            free(prompt_buf);
+        }
     }
     return count;
 }
-
 void detokenize_bpe(const char* src, char* dst) {
     char* start = dst;
     while (*src && (dst - start) < 250) {
@@ -1545,7 +1553,7 @@ void detokenize_bpe(const char* src, char* dst) {
 
 void probe_gpu_hardware(void) {
     if (!use_gpu) {
-        add_message("Hardware Configuration:\nGPU Acceleration Disabled in settings.ini (Running on CPU).", MSG_SYS_OK);
+        add_message("Hardware Configuration:\nGPU Acceleration Disabled in ai02.ini (Running on CPU).", MSG_SYS_OK);
         return;
     }
     if (init_opencl_gpu()) {
@@ -1565,6 +1573,7 @@ DWORD WINAPI GenerationThread(LPVOID lpParam) {
     add_message("", MSG_AI);
 
     load_ini_parameters();
+    stop_generation = 0;
 
     int cur_max_gen = param_max_gen_tokens;
     if (cur_max_gen <= 0) cur_max_gen = 80;
@@ -1598,6 +1607,7 @@ DWORD WINAPI GenerationThread(LPVOID lpParam) {
     }
 
     for (int pos = 0; pos < seq_len + cur_max_gen; pos++) {
+        if (stop_generation) break;
         if (pos >= cur_seq_len_cap - 1) break;
         int current_token = tokens[pos];
         if (current_token < 0 || current_token >= vocab_size) current_token = 0;
@@ -1752,7 +1762,7 @@ void init_ini_and_combo(HWND hwnd) {
     GetModuleFileNameA(NULL, ini_path, MAX_PATH);
     char *last_slash = strrchr(ini_path, '\\');
     if (last_slash) *(last_slash + 1) = '\0';
-    strcat(ini_path, "settings.ini");
+    strcat(ini_path, "ai02.ini");
 
     if (GetFileAttributesA(ini_path) == INVALID_FILE_ATTRIBUTES) {
         WritePrivateProfileStringA("Hardware", "UseGPU", "1", ini_path);
@@ -1813,9 +1823,6 @@ LRESULT CALLBACK EditSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
     return CallWindowProc(OldEditProc, hwnd, msg, wParam, lParam);
 }
 
-// ============================================================================
-// CHAT VIEWPORT WINDOW PROCEDURE (WITH NATIVE CHARACTER DRAG-SELECTION)
-// ============================================================================
 LRESULT CALLBACK ChatViewProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     switch (uMsg) {
         case WM_LBUTTONDOWN: {
@@ -1934,6 +1941,10 @@ LRESULT CALLBACK ChatViewProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam
                 show_bubble_context_menu(hwnd, hit, screen_pt);
             } else {
                 HMENU hMenu = CreatePopupMenu();
+                if (is_generating) {
+                    AppendMenuA(hMenu, MF_STRING, IDM_STOP_OUTPUT, "Stop Output");
+                    AppendMenuA(hMenu, MF_SEPARATOR, 0, NULL);
+                }
                 AppendMenuA(hMenu, MF_STRING, IDM_SAVE_PDF, "Save Chat to PDF");
                 AppendMenuA(hMenu, MF_SEPARATOR, 0, NULL);
                 AppendMenuA(hMenu, MF_STRING, IDM_SET_COLOR_U, "Set User Bubble Color...");
@@ -2091,7 +2102,6 @@ LRESULT CALLBACK ChatViewProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam
     }
     return DefWindowProc(hwnd, uMsg, wParam, lParam);
 }
-
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     switch (uMsg) {
         case WM_CREATE: {
@@ -2135,10 +2145,33 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             DragQueryFileA(hDrop, 0, filepath, MAX_PATH);
             DragFinish(hDrop);
 
-            add_message("Loading model weights into RAM & GPU VRAM...", MSG_SYS_OK);
-            is_loading_model = 1;
-            char* path_copy = strdup(filepath);
-            CreateThread(NULL, 0, BackgroundLoadThread, path_copy, 0, NULL);
+            DWORD attr = GetFileAttributesA(filepath);
+            if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
+                FILE *f = fopen(filepath, "rb");
+                if (f) {
+                    fseek(f, 0, SEEK_END);
+                    long fsize = ftell(f);
+                    fseek(f, 0, SEEK_SET);
+                    
+                    long read_size = fsize < 260000 ? fsize : 260000; 
+                    char *buf = malloc(read_size + 256);
+                    if (buf) {
+                        int prefix_len = snprintf(buf, 256, "Attached file %s:\n\n", filepath);
+                        fread(buf + prefix_len, 1, read_size, f);
+                        buf[prefix_len + read_size] = '\0';
+                        add_message(buf, MSG_USER);
+                        free(buf);
+                    }
+                    fclose(f);
+                } else {
+                    add_message("Error: Could not read attached file.", MSG_SYS_ERR);
+                }
+            } else {
+                add_message("Loading model weights into RAM & GPU VRAM...", MSG_SYS_OK);
+                is_loading_model = 1;
+                char* path_copy = strdup(filepath);
+                CreateThread(NULL, 0, BackgroundLoadThread, path_copy, 0, NULL);
+            }
             return 0;
         }
 
@@ -2188,7 +2221,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
     }
     return DefWindowProc(hwnd, uMsg, wParam, lParam);
 }
-
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
     WNDCLASS wcChat = {0};
     wcChat.style = CS_DBLCLKS;
