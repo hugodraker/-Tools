@@ -50,7 +50,6 @@ xlsx_edit.exe data.xlsx < script.txt
 #include <ctype.h>
 #include <windows.h>
 #include <io.h>
-
 #define MINIZ_IMPLEMENTATION
 #include "miniz.h"
 // ============================================================================
@@ -835,9 +834,10 @@ int create_new_xlsx(const char *filename, WorkbookEdits *wb) {
                    "<Override PartName=\"/xl/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml\"/>");
 
     sb_append(&wb_xml, "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
-                       "<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" "
-                       "xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">"
-                       "<sheets>");
+                   "<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" "
+                   "xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">"
+                   "<workbookPr fullCalcOnLoad=\"1\"/>"
+                   "<sheets>");
 
     sb_append(&wb_rels, "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
                         "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
@@ -932,6 +932,36 @@ int modify_existing_xlsx(const char *filename, WorkbookEdits *wb) {
             continue;
         }
 
+        if (_stricmp(st.m_filename, "xl/workbook.xml") == 0) {
+            size_t wb_len = 0;
+            char *wb_xml = (char *)mz_zip_reader_extract_to_heap(&rzip, i, &wb_len, 0);
+            wb_xml = (char *)realloc(wb_xml, wb_len + 1);
+            wb_xml[wb_len] = '\0';
+
+            StrBuf sb_wb;
+            sb_init(&sb_wb);
+            char *calcPr = strstr(wb_xml, "<calcPr ");
+            
+            if (calcPr) {
+                sb_append_n(&sb_wb, wb_xml, calcPr - wb_xml);
+                sb_append(&sb_wb, "<calcPr fullCalcOnLoad=\"1\" ");
+                sb_append(&sb_wb, calcPr + 8);
+            } else {
+                char *end_tag = strstr(wb_xml, "</workbook>");
+                if (end_tag) {
+                    sb_append_n(&sb_wb, wb_xml, end_tag - wb_xml);
+                    sb_append(&sb_wb, "<calcPr fullCalcOnLoad=\"1\"/></workbook>");
+                } else {
+                    sb_append(&sb_wb, wb_xml);
+                }
+            }
+            
+            mz_zip_writer_add_mem(&wzip, st.m_filename, sb_wb.data, sb_wb.len, MZ_DEFAULT_COMPRESSION);
+            sb_free(&sb_wb);
+            free(wb_xml);
+            continue;
+        }
+
         int matched_sheet = -1;
         for (size_t s = 0; s < wb->count; s++) {
             if (target_paths[s][0] && _stricmp(st.m_filename, target_paths[s]) == 0) {
@@ -974,7 +1004,6 @@ int modify_existing_xlsx(const char *filename, WorkbookEdits *wb) {
     }
     return 1;
 }
-
 // ============================================================================
 // Main Entry Point
 // ============================================================================
