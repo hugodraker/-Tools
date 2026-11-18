@@ -31,7 +31,6 @@
 #define IDS_STATUS       301
 #define TIMER_FILTER_LEFT  1001
 #define TIMER_FILTER_RIGHT 1002
-
 typedef enum {
     T_OTHER = 0,
     T_PROC = 1,
@@ -191,113 +190,113 @@ void FreeChunks(Chunk** head) {
     *head = NULL;
 }
 
-void ClassifyChunk(const char* buf, ChunkType* outType, char* outName, int* isProc) {
-    *outType = T_OTHER;
-    outName[0] = '\0';
-    *isProc = 0;
-
-    int len = strlen(buf);
-    char* clean = (char*)malloc(len + 1);
-    CleanBlock(buf, clean);
-
-    char* p = clean;
-    while(*p && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) p++;
-
-    char* pOpen = strchr(p, '(');
-    char* pBrace = strchr(p, '{');
-    char* pSemi = strchr(p, ';');
-    
-    // Updated isStructStart for Java class/interface support
-    int isStructStart = (strncmp(p, "typedef struct", 14) == 0 || strncmp(p, "struct ", 7) == 0 ||
-                         strncmp(p, "enum ", 5) == 0 || strncmp(p, "union ", 6) == 0 ||
-                         strncmp(p, "typedef enum", 12) == 0 || strncmp(p, "typedef union", 13) == 0 ||
-                         strncmp(p, "class ", 6) == 0 || strstr(p, " class ") != NULL || strstr(p, "\nclass ") != NULL ||
-                         strncmp(p, "interface ", 10) == 0 || strstr(p, " interface ") != NULL || strstr(p, "\ninterface ") != NULL ||
-                         strncmp(p, "@interface ", 11) == 0);
-
-    if(strncmp(p, "#define", 7) == 0) {
-        *outType = T_DEFINE;
-        *isProc = 1;
-        char* n = p + 7;
-        while(*n == ' ' || *n == '\t') n++;
-        int i=0;
-        while(n[i] && (isalnum((unsigned char)n[i]) || n[i] == '_') && i<254) { outName[i] = n[i]; i++; }
-        outName[i]='\0';
-    } else if(isStructStart && (!pOpen || (pBrace && pBrace < pOpen))) {
-        *outType = T_STRUCT;
-        *isProc = 1;
-        char* search = strstr(p, "struct ");
-        if(!search) search = strstr(p, "enum ");
-        if(!search) search = strstr(p, "union ");
-        if(!search) search = strstr(p, "class ");
-        if(!search) search = strstr(p, "interface ");
-        if(!search) search = strstr(p, "@interface ");
-        if(search) {
-            while (*search && *search != ' ' && *search != '\t' && *search != '\n' && *search != '\r') search++;
-            while(*search == ' ' || *search == '\t' || *search == '\r' || *search == '\n') search++;
-            int i=0;
-            while(search[i] && (isalnum((unsigned char)search[i]) || search[i] == '_') && i<254) { outName[i] = search[i]; i++; }
-            outName[i]='\0';
-        }
-        if(outName[0] == '\0' && pBrace) {
-            char* lastBrace = strrchr(p, '}');
-            if(lastBrace) {
-                char* after = lastBrace + 1;
-                while(*after == ' ' || *after == '\t' || *after == '\r' || *after == '\n') after++;
-                int i=0;
-                while(after[i] && (isalnum((unsigned char)after[i]) || after[i] == '_') && i<254) { outName[i] = after[i]; i++; }
-                outName[i]='\0';
-            }
-        }
-        if(outName[0] == '\0') strcpy(outName, "unnamed_struct");
-    } else if(pBrace && pOpen && pOpen < pBrace) {
-        *outType = T_PROC;
-        *isProc = 1;
-        char* n = pOpen - 1;
-        while(n > p && (*n == ' ' || *n == '\t' || *n == '\n' || *n == '\r')) n--;
-        char* end = n;
-        while(n >= p && (isalnum((unsigned char)*n) || *n == '_')) n--;
-        n++;
-        int slen = end - n + 1;
-        if(slen>0 && slen<255) { strncpy(outName, n, slen); outName[slen]='\0'; }
-    } else if(pSemi && pOpen && pOpen < pSemi && !pBrace) {
-        *outType = T_PROTO;
-        *isProc = 1;
-        char* n = pOpen - 1;
-        while(n > p && (*n == ' ' || *n == '\t' || *n == '\n' || *n == '\r')) n--;
-        char* end = n;
-        while(n >= p && (isalnum((unsigned char)*n) || *n == '_')) n--;
-        n++;
-        int slen = end - n + 1;
-        if(slen>0 && slen<255) { strncpy(outName, n, slen); outName[slen]='\0'; }
-    } else if(pSemi && !pBrace) {
-        if(strncmp(p, "return ", 7) != 0 && strncmp(p, "goto ", 5) != 0 && strncmp(p, "break;", 6) != 0 && strncmp(p, "continue;", 9) != 0) {
-            *outType = T_VAR;
-            *isProc = 1;
-            char* semi = pSemi;
-            char* n = semi - 1;
-            char* eq = strchr(p, '=');
-            if (eq && eq < semi) n = eq - 1;
-
-            while(n > p && (*n == ' ' || *n == '\t' || *n == '\n' || *n == '\r')) n--;
-            
-            // Skip backwards over potential Java array brackets
-            while (n > p && *n == ']') {
-                while (n > p && *n != '[') n--;
-                if (n > p) n--;
-                while(n > p && (*n == ' ' || *n == '\t' || *n == '\n' || *n == '\r')) n--;
-            }
-
-            char* end = n;
-            while(n >= p && (isalnum((unsigned char)*n) || *n == '_')) n--;
-            n++;
-            int slen = end - n + 1;
-            if(slen>0 && slen<255) { strncpy(outName, n, slen); outName[slen]='\0'; }
-        }
-    }
-    free(clean);
-}
-
+void ClassifyChunk(const char* buf, ChunkType* outType, char* outName, int* isProc) {
+    *outType = T_OTHER;
+    outName[0] = '\0';
+    *isProc = 0;
+
+    int len = strlen(buf);
+    char* clean = (char*)malloc(len + 1);
+    CleanBlock(buf, clean);
+
+    char* p = clean;
+    while(*p && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) p++;
+
+    char* pOpen = strchr(p, '(');
+    char* pBrace = strchr(p, '{');
+    char* pSemi = strchr(p, ';');
+    char* pEq = strchr(p, '=');
+    
+    // Updated isStructStart for Java class/interface support
+    int isStructStart = (strncmp(p, "typedef struct", 14) == 0 || strncmp(p, "struct ", 7) == 0 ||
+                         strncmp(p, "enum ", 5) == 0 || strncmp(p, "union ", 6) == 0 ||
+                         strncmp(p, "typedef enum", 12) == 0 || strncmp(p, "typedef union", 13) == 0 ||
+                         strncmp(p, "class ", 6) == 0 || strstr(p, " class ") != NULL || strstr(p, "\nclass ") != NULL ||
+                         strncmp(p, "interface ", 10) == 0 || strstr(p, " interface ") != NULL || strstr(p, "\ninterface ") != NULL ||
+                         strncmp(p, "@interface ", 11) == 0);
+
+    if(strncmp(p, "#define", 7) == 0) {
+        *outType = T_DEFINE;
+        *isProc = 1;
+        char* n = p + 7;
+        while(*n == ' ' || *n == '\t') n++;
+        int i=0;
+        while(n[i] && (isalnum((unsigned char)n[i]) || n[i] == '_') && i<254) { outName[i] = n[i]; i++; }
+        outName[i]='\0';
+    } else if(isStructStart && (!pOpen || (pBrace && pBrace < pOpen))) {
+        *outType = T_STRUCT;
+        *isProc = 1;
+        char* search = strstr(p, "struct ");
+        if(!search) search = strstr(p, "enum ");
+        if(!search) search = strstr(p, "union ");
+        if(!search) search = strstr(p, "class ");
+        if(!search) search = strstr(p, "interface ");
+        if(!search) search = strstr(p, "@interface ");
+        if(search) {
+            while (*search && *search != ' ' && *search != '\t' && *search != '\n' && *search != '\r') search++;
+            while(*search == ' ' || *search == '\t' || *search == '\r' || *search == '\n') search++;
+            int i=0;
+            while(search[i] && (isalnum((unsigned char)search[i]) || search[i] == '_') && i<254) { outName[i] = search[i]; i++; }
+            outName[i]='\0';
+        }
+        if(outName[0] == '\0' && pBrace) {
+            char* lastBrace = strrchr(p, '}');
+            if(lastBrace) {
+                char* after = lastBrace + 1;
+                while(*after == ' ' || *after == '\t' || *after == '\r' || *after == '\n') after++;
+                int i=0;
+                while(after[i] && (isalnum((unsigned char)after[i]) || after[i] == '_') && i<254) { outName[i] = after[i]; i++; }
+                outName[i]='\0';
+            }
+        }
+        if(outName[0] == '\0') strcpy(outName, "unnamed_struct");
+    } else if(pBrace && pOpen && pOpen < pBrace) {
+        *outType = T_PROC;
+        *isProc = 1;
+        char* n = pOpen - 1;
+        while(n > p && (*n == ' ' || *n == '\t' || *n == '\n' || *n == '\r')) n--;
+        char* end = n;
+        while(n >= p && (isalnum((unsigned char)*n) || *n == '_')) n--;
+        n++;
+        int slen = end - n + 1;
+        if(slen>0 && slen<255) { strncpy(outName, n, slen); outName[slen]='\0'; }
+    } else if(pSemi && pOpen && pOpen < pSemi && !pBrace) {
+        *outType = T_PROTO;
+        *isProc = 1;
+        char* n = pOpen - 1;
+        while(n > p && (*n == ' ' || *n == '\t' || *n == '\n' || *n == '\r')) n--;
+        char* end = n;
+        while(n >= p && (isalnum((unsigned char)*n) || *n == '_')) n--;
+        n++;
+        int slen = end - n + 1;
+        if(slen>0 && slen<255) { strncpy(outName, n, slen); outName[slen]='\0'; }
+    } else if(pSemi && (!pBrace || (pEq && pEq < pBrace))) {
+        if(strncmp(p, "return ", 7) != 0 && strncmp(p, "goto ", 5) != 0 && strncmp(p, "break;", 6) != 0 && strncmp(p, "continue;", 9) != 0) {
+            *outType = T_VAR;
+            *isProc = 1;
+            char* semi = pSemi;
+            char* n = semi - 1;
+            char* eq = pEq;
+            if (eq && eq < semi) n = eq - 1;
+
+            while(n > p && (*n == ' ' || *n == '\t' || *n == '\n' || *n == '\r')) n--;
+            
+            // Skip backwards over potential Java array brackets
+            while (n > p && *n == ']') {
+                while (n > p && *n != '[') n--;
+                if (n > p) n--;
+                while(n > p && (*n == ' ' || *n == '\t' || *n == '\n' || *n == '\r')) n--;
+            }
+
+            char* end = n;
+            while(n >= p && (isalnum((unsigned char)*n) || *n == '_')) n--;
+            n++;
+            int slen = end - n + 1;
+            if(slen>0 && slen<255) { strncpy(outName, n, slen); outName[slen]='\0'; }
+        }
+    }
+    free(clean);
+}
 void ExtractAndAddChunk(Chunk** head, Chunk** tail, const char* fullText, int start, int end) {
     if(start >= end) return;
     while(start < end && (fullText[start] == ' ' || fullText[start] == '\t' || fullText[start] == '\r' || fullText[start] == '\n')) start++;
