@@ -84,6 +84,44 @@ char g_FilterRight[256] = {0};
 char mruList[20][MAX_PATH];
 int mruCount = 0;
 
+int IsRegexStart(const char* s, int i) {
+    if (s[i] != '/' || s[i+1] == '/' || s[i+1] == '*' || s[i+1] == '\0' || s[i+1] == '\r' || s[i+1] == '\n') return 0;
+    int k = i - 1;
+    while (k >= 0 && (s[k] == ' ' || s[k] == '\t' || s[k] == '\r' || s[k] == '\n')) k--;
+    if (k < 0) return 1;
+    char c = s[k];
+    if (strchr("([{,;:=!?&|+-*%^~<>", c) != NULL) return 1;
+    if (isalnum((unsigned char)c) || c == '_') {
+        int end = k;
+        while (k >= 0 && (isalnum((unsigned char)s[k]) || s[k] == '_')) k--;
+        int wlen = end - k;
+        const char* w = s + k + 1;
+        if ((wlen == 6 && strncmp(w, "return", 6) == 0) ||
+            (wlen == 4 && strncmp(w, "case", 4) == 0) ||
+            (wlen == 4 && strncmp(w, "else", 4) == 0) ||
+            (wlen == 5 && strncmp(w, "throw", 5) == 0) ||
+            (wlen == 2 && strncmp(w, "in", 2) == 0) ||
+            (wlen == 2 && strncmp(w, "of", 2) == 0)) return 1;
+    }
+    return 0;
+}
+
+int MatchJsRegexEnd(const char* s, int i) {
+    int j = i + 1;
+    int inClass = 0;
+    while (s[j] && s[j] != '\r' && s[j] != '\n') {
+        if (s[j] == '\\' && s[j+1] && s[j+1] != '\r' && s[j+1] != '\n') {
+            j += 2;
+            continue;
+        }
+        if (s[j] == '[') inClass = 1;
+        else if (s[j] == ']') inClass = 0;
+        else if (s[j] == '/' && !inClass) return j;
+        j++;
+    }
+    return -1;
+}
+
 // Case-insensitive substring search
 const char* str_istr(const char* haystack, const char* needle) {
     if (!*needle) return haystack;
@@ -130,34 +168,71 @@ const char* GetRealName(const char* displayName) {
     return p;
 }
 
-void CleanBlock(const char* in, char* out) {
-    int i = 0, j = 0;
-    int inSingle = 0, inMulti = 0, inStr = 0, inChar = 0;
-    while(in[i]) {
-        if(!inStr && !inChar && !inSingle && !inMulti) {
-            if(in[i] == '/' && in[i+1] == '/') { inSingle = 1; i+=2; continue; }
-            if(in[i] == '/' && in[i+1] == '*') { inMulti = 1; i+=2; continue; }
-            if(in[i] == '"') { inStr = 1; out[j++] = in[i++]; continue; }
-            if(in[i] == '\'') { inChar = 1; out[j++] = in[i++]; continue; }
-            out[j++] = in[i++];
-        } else if(inSingle) {
-            if(in[i] == '\n') { inSingle = 0; out[j++] = '\n'; }
-            i++;
-        } else if(inMulti) {
-            if(in[i] == '*' && in[i+1] == '/') { inMulti = 0; i+=2; }
-            else i++;
-        } else if(inStr) {
-            if(in[i] == '\\' && in[i+1]) { i += 2; }
-            else if(in[i] == '"') { inStr = 0; out[j++] = in[i++]; }
-            else { i++; }
-        } else if(inChar) {
-            if(in[i] == '\\' && in[i+1]) { i += 2; }
-            else if(in[i] == '\'') { inChar = 0; out[j++] = in[i++]; }
-            else { i++; }
-        }
-    }
-    out[j] = '\0';
-}
+void CleanBlock(const char* in, char* out) {
+    int i = 0, j = 0;
+    int inSingle = 0, inMulti = 0, inStr = 0, inChar = 0, inBacktick = 0;
+    int braceLevel = 0;
+    int tplBraceStack[64];
+    int tplDepth = 0;
+
+    while(in[i]) {
+        if(!inStr && !inChar && !inSingle && !inMulti && !inBacktick) {
+            if(in[i] == '/' && in[i+1] == '/') { inSingle = 1; i+=2; continue; }
+            if(in[i] == '/' && in[i+1] == '*') { inMulti = 1; i+=2; continue; }
+            if(in[i] == '/' && IsRegexStart(in, i)) {
+                int rEnd = MatchJsRegexEnd(in, i);
+                if (rEnd != -1) {
+                    out[j++] = ' ';
+                    i = rEnd + 1;
+                    continue;
+                }
+            }
+            if(in[i] == '"') { inStr = 1; out[j++] = in[i++]; continue; }
+            if(in[i] == '\'') { inChar = 1; out[j++] = in[i++]; continue; }
+            if(in[i] == '`') { inBacktick = 1; out[j++] = in[i++]; continue; }
+            if(in[i] == '{') { braceLevel++; out[j++] = in[i++]; continue; }
+            if(in[i] == '}') {
+                if (tplDepth > 0 && braceLevel - 1 == tplBraceStack[tplDepth - 1]) {
+                    braceLevel--;
+                    tplDepth--;
+                    inBacktick = 1;
+                    i++;
+                    continue;
+                }
+                if (braceLevel > 0) braceLevel--;
+                out[j++] = in[i++];
+                continue;
+            }
+            out[j++] = in[i++];
+        } else if(inSingle) {
+            if(in[i] == '\n') { inSingle = 0; out[j++] = '\n'; }
+            i++;
+        } else if(inMulti) {
+            if(in[i] == '*' && in[i+1] == '/') { inMulti = 0; i+=2; }
+            else i++;
+        } else if(inStr) {
+            if(in[i] == '\\' && in[i+1]) { i += 2; }
+            else if(in[i] == '"') { inStr = 0; out[j++] = in[i++]; }
+            else { i++; }
+        } else if(inChar) {
+            if(in[i] == '\\' && in[i+1]) { i += 2; }
+            else if(in[i] == '\'') { inChar = 0; out[j++] = in[i++]; }
+            else { i++; }
+        } else if(inBacktick) {
+            if(in[i] == '\\' && in[i+1]) { i += 2; }
+            else if(in[i] == '$' && in[i+1] == '{' && tplDepth < 64) {
+                tplBraceStack[tplDepth++] = braceLevel;
+                braceLevel++;
+                inBacktick = 0;
+                i += 2;
+            }
+            else if(in[i] == '`') { inBacktick = 0; out[j++] = in[i++]; }
+            else { i++; }
+        }
+    }
+    out[j] = '\0';
+}
+
 char* my_strdup(const char* s) {
     char* d = (char*)malloc(strlen(s) + 1);
     if (d) strcpy(d, s);
@@ -202,12 +277,16 @@ void ClassifyChunk(const char* buf, ChunkType* outType, char* outName, int* isPr
     char* p = clean;
     while(*p && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) p++;
 
+    if (*p == '\0' || *p == '}') {
+        free(clean);
+        return;
+    }
+
     char* pOpen = strchr(p, '(');
     char* pBrace = strchr(p, '{');
     char* pSemi = strchr(p, ';');
     char* pEq = strchr(p, '=');
     
-    // Updated isStructStart for Java class/interface support
     int isStructStart = (strncmp(p, "typedef struct", 14) == 0 || strncmp(p, "struct ", 7) == 0 ||
                          strncmp(p, "enum ", 5) == 0 || strncmp(p, "union ", 6) == 0 ||
                          strncmp(p, "typedef enum", 12) == 0 || strncmp(p, "typedef union", 13) == 0 ||
@@ -250,7 +329,7 @@ void ClassifyChunk(const char* buf, ChunkType* outType, char* outName, int* isPr
             }
         }
         if(outName[0] == '\0') strcpy(outName, "unnamed_struct");
-    } else if(pBrace && pOpen && pOpen < pBrace) {
+    } else if(pBrace && pOpen && pOpen < pBrace && (!pEq || pOpen < pEq)) {
         *outType = T_PROC;
         *isProc = 1;
         char* n = pOpen - 1;
@@ -260,7 +339,7 @@ void ClassifyChunk(const char* buf, ChunkType* outType, char* outName, int* isPr
         n++;
         int slen = end - n + 1;
         if(slen>0 && slen<255) { strncpy(outName, n, slen); outName[slen]='\0'; }
-    } else if(pSemi && pOpen && pOpen < pSemi && !pBrace) {
+    } else if(pSemi && pOpen && pOpen < pSemi && !pBrace && (!pEq || pOpen < pEq)) {
         *outType = T_PROTO;
         *isProc = 1;
         char* n = pOpen - 1;
@@ -281,7 +360,6 @@ void ClassifyChunk(const char* buf, ChunkType* outType, char* outName, int* isPr
 
             while(n > p && (*n == ' ' || *n == '\t' || *n == '\n' || *n == '\r')) n--;
             
-            // Skip backwards over potential Java array brackets
             while (n > p && *n == ']') {
                 while (n > p && *n != '[') n--;
                 if (n > p) n--;
@@ -295,8 +373,15 @@ void ClassifyChunk(const char* buf, ChunkType* outType, char* outName, int* isPr
             if(slen>0 && slen<255) { strncpy(outName, n, slen); outName[slen]='\0'; }
         }
     }
+
+    if (outName[0] == '\0') {
+        *isProc = 0;
+        *outType = T_OTHER;
+    }
+
     free(clean);
 }
+
 void ExtractAndAddChunk(Chunk** head, Chunk** tail, const char* fullText, int start, int end) {
     if(start >= end) return;
     while(start < end && (fullText[start] == ' ' || fullText[start] == '\t' || fullText[start] == '\r' || fullText[start] == '\n')) start++;
@@ -336,129 +421,173 @@ void ExtractAndAddChunk(Chunk** head, Chunk** tail, const char* fullText, int st
     else { *head = *tail = c; }
 }
 
-Chunk* ParseTextToChunks(const char* text) {
-    Chunk* head = NULL;
-    Chunk* tail = NULL;
-
-    int len = strlen(text);
-    int i = 0, blockStart = 0, braceLevel = 0;
-    int inSingle = 0, inMulti = 0, inStr = 0, inChar = 0;
-    int inPreproc = 0;
-    int sawParenBeforeBrace = 0;
-    int baseBraceLevel = 0;
-    int isJava = 0;
-    
-    if (szCurrentFile[0]) {
-        size_t fLen = strlen(szCurrentFile);
-        if (fLen > 5 && _stricmp(szCurrentFile + fLen - 5, ".java") == 0) isJava = 1;
-    }
-
-    while(i < len) {
-        if(!inStr && !inChar && !inSingle && !inMulti) {
-            if(text[i] == '/' && text[i+1] == '/') { inSingle = 1; i+=2; continue; }
-            if(text[i] == '/' && text[i+1] == '*') { inMulti = 1; i+=2; continue; }
-            if(text[i] == '"') { inStr = 1; i++; continue; }
-            if(text[i] == '\'') { inChar = 1; i++; continue; }
-
-            if(text[i] == '#' && braceLevel == 0 && !inPreproc) {
-                int isStart = 1;
-                for(int k = i-1; k >= blockStart; k--) {
-                    if(text[k] == '\n') break;
-                    if(text[k] != ' ' && text[k] != '\t') { isStart = 0; break; }
-                }
-                if(isStart) inPreproc = 1;
-            }
-
-            if(inPreproc) {
-                if(text[i] == '\n') {
-                    if(i > 0 && text[i-1] != '\\' && (i < 2 || text[i-2] != '\\' || text[i-1] != '\r')) {
-                        inPreproc = 0;
-                        int endIdx = i + 1;
-                        ExtractAndAddChunk(&head, &tail, text, blockStart, endIdx);
-                        blockStart = endIdx;
-                        sawParenBeforeBrace = 0;
-                    }
-                }
-            } else {
-                if(text[i] == '(' && braceLevel == baseBraceLevel) {
-                    sawParenBeforeBrace = 1;
-                } else if(text[i] == '{') {
-                    if (braceLevel == 0) {
-                        int isWrapper = 0;
-                        char* block = (char*)malloc(i - blockStart + 1);
-                        strncpy(block, text + blockStart, i - blockStart);
-                        block[i - blockStart] = '\0';
-                        if (strstr(block, "class ") || strstr(block, "interface ") || strstr(block, "@interface ") || (isJava && strstr(block, "enum "))) {
-                            isWrapper = 1;
-                        }
-                        free(block);
-
-                        if (isWrapper) {
-                            braceLevel++;
-                            int endIdx = i + 1;
-                            ExtractAndAddChunk(&head, &tail, text, blockStart, endIdx);
-                            blockStart = endIdx;
-                            baseBraceLevel = 1;
-                            sawParenBeforeBrace = 0;
-                            i = endIdx - 1;
-                            i++; 
-                            continue;
-                        }
-                    }
-                    braceLevel++;
-                } else if(text[i] == '}') {
-                    braceLevel--;
-                    if(braceLevel == baseBraceLevel) {
-                        int endIdx = i + 1;
-                        if(!sawParenBeforeBrace && baseBraceLevel == 0) {
-                            while(endIdx < len && text[endIdx] != ';') endIdx++;
-                            if(endIdx < len && text[endIdx] == ';') endIdx++;
-                        } else {
-                            while(endIdx < len && (text[endIdx] == ' ' || text[endIdx] == '\t' || text[endIdx] == '\r' || text[endIdx] == '\n')) endIdx++;
-                            if(endIdx < len && text[endIdx] == ';') endIdx++;
-                        }
-                        while(endIdx < len && (text[endIdx] == '\r' || text[endIdx] == '\n')) endIdx++;
-
-                        ExtractAndAddChunk(&head, &tail, text, blockStart, endIdx);
-                        blockStart = endIdx;
-                        sawParenBeforeBrace = 0;
-                        i = endIdx - 1;
-                    } else if (braceLevel == 0 && baseBraceLevel == 1) {
-                        // Just closed the class wrapper block itself
-                        int endIdx = i + 1;
-                        while(endIdx < len && (text[endIdx] == '\r' || text[endIdx] == '\n')) endIdx++;
-                        ExtractAndAddChunk(&head, &tail, text, blockStart, endIdx);
-                        blockStart = endIdx;
-                        baseBraceLevel = 0;
-                        sawParenBeforeBrace = 0;
-                        i = endIdx - 1;
-                    }
-                } else if(text[i] == ';' && braceLevel == baseBraceLevel) {
-                    int endIdx = i + 1;
-                    while(endIdx < len && (text[endIdx] == '\r' || text[endIdx] == '\n' || text[endIdx] == ' ' || text[endIdx] == '\t')) endIdx++;
-                    ExtractAndAddChunk(&head, &tail, text, blockStart, endIdx);
-                    blockStart = endIdx;
-                    sawParenBeforeBrace = 0;
-                    i = endIdx - 1;
-                }
-            }
-        } else if(inSingle) {
-            if(text[i] == '\n') inSingle = 0;
-        } else if(inMulti) {
-            if(text[i] == '*' && text[i+1] == '/') { inMulti = 0; i++; }
-        } else if(inStr) {
-            if(text[i] == '\\' && text[i+1]) i++;
-            else if(text[i] == '"') inStr = 0;
-        } else if(inChar) {
-            if(text[i] == '\\' && text[i+1]) i++;
-            else if(text[i] == '\'') inChar = 0;
-        }
-        i++;
-    }
-    if(blockStart < len) ExtractAndAddChunk(&head, &tail, text, blockStart, len);
-    return head;
-}
-
+Chunk* ParseTextToChunks(const char* text) {
+    Chunk* head = NULL;
+    Chunk* tail = NULL;
+
+    int len = strlen(text);
+    int i = 0, blockStart = 0, braceLevel = 0;
+    int inSingle = 0, inMulti = 0, inStr = 0, inChar = 0, inBacktick = 0;
+    int tplBraceStack[64];
+    int tplDepth = 0;
+    int inPreproc = 0;
+    int sawParenBeforeBrace = 0;
+    int baseBraceLevel = 0;
+    int isJava = 0;
+    
+    if (szCurrentFile[0]) {
+        size_t fLen = strlen(szCurrentFile);
+        if (fLen > 5 && _stricmp(szCurrentFile + fLen - 5, ".java") == 0) isJava = 1;
+    }
+
+    while(i < len) {
+        if(!inStr && !inChar && !inSingle && !inMulti && !inBacktick) {
+            if(text[i] == '/' && text[i+1] == '/') { inSingle = 1; i+=2; continue; }
+            if(text[i] == '/' && text[i+1] == '*') { inMulti = 1; i+=2; continue; }
+            if(text[i] == '/' && IsRegexStart(text, i)) {
+                int rEnd = MatchJsRegexEnd(text, i);
+                if (rEnd != -1) {
+                    i = rEnd + 1;
+                    continue;
+                }
+            }
+            if(text[i] == '"') { inStr = 1; i++; continue; }
+            if(text[i] == '\'') { inChar = 1; i++; continue; }
+            if(text[i] == '`') { inBacktick = 1; i++; continue; }
+
+            if(text[i] == '#' && braceLevel == 0 && !inPreproc) {
+                int isStart = 1;
+                for(int k = i-1; k >= blockStart; k--) {
+                    if(text[k] == '\n') break;
+                    if(text[k] != ' ' && text[k] != '\t') { isStart = 0; break; }
+                }
+                if(isStart) inPreproc = 1;
+            }
+
+            if(inPreproc) {
+                if(text[i] == '\n') {
+                    if(i > 0 && text[i-1] != '\\' && (i < 2 || text[i-2] != '\\' || text[i-1] != '\r')) {
+                        inPreproc = 0;
+                        int endIdx = i + 1;
+                        ExtractAndAddChunk(&head, &tail, text, blockStart, endIdx);
+                        blockStart = endIdx;
+                        sawParenBeforeBrace = 0;
+                    }
+                }
+            } else {
+                if(text[i] == '(' && braceLevel == baseBraceLevel) {
+                    sawParenBeforeBrace = 1;
+                } else if(text[i] == '{') {
+                    if (braceLevel == 0) {
+                        int isWrapper = 0;
+                        int bLen = i - blockStart;
+                        char* block = (char*)malloc(bLen + 1);
+                        char* cleanBlock = (char*)malloc(bLen + 1);
+                        strncpy(block, text + blockStart, bLen);
+                        block[bLen] = '\0';
+                        CleanBlock(block, cleanBlock);
+
+                        int isIIFE = 0;
+                        char* pFunc = strstr(cleanBlock, "(function");
+                        if (pFunc) {
+                            char nextCh = pFunc[9];
+                            if (nextCh == ' ' || nextCh == '\t' || nextCh == '\r' || nextCh == '\n' || nextCh == '(') {
+                                isIIFE = 1;
+                            }
+                        }
+                        if (!isIIFE && strstr(cleanBlock, "(()") && strstr(cleanBlock, "=>")) {
+                            isIIFE = 1;
+                        }
+
+                        if (strstr(cleanBlock, "class ") || strstr(cleanBlock, "interface ") ||
+                            strstr(cleanBlock, "@interface ") || (isJava && strstr(cleanBlock, "enum ")) || isIIFE) {
+                            isWrapper = 1;
+                        }
+                        free(block);
+                        free(cleanBlock);
+
+                        if (isWrapper) {
+                            braceLevel++;
+                            int endIdx = i + 1;
+                            ExtractAndAddChunk(&head, &tail, text, blockStart, endIdx);
+                            blockStart = endIdx;
+                            baseBraceLevel = 1;
+                            sawParenBeforeBrace = 0;
+                            i = endIdx - 1;
+                            i++; 
+                            continue;
+                        }
+                    }
+                    braceLevel++;
+                } else if(text[i] == '}') {
+                    if (tplDepth > 0 && braceLevel - 1 == tplBraceStack[tplDepth - 1]) {
+                        braceLevel--;
+                        tplDepth--;
+                        inBacktick = 1;
+                        i++;
+                        continue;
+                    }
+                    braceLevel--;
+                    if(braceLevel == baseBraceLevel) {
+                        int endIdx = i + 1;
+                        if(!sawParenBeforeBrace && baseBraceLevel == 0) {
+                            while(endIdx < len && text[endIdx] != ';') endIdx++;
+                            if(endIdx < len && text[endIdx] == ';') endIdx++;
+                        } else {
+                            while(endIdx < len && (text[endIdx] == ' ' || text[endIdx] == '\t' || text[endIdx] == '\r' || text[endIdx] == '\n')) endIdx++;
+                            if(endIdx < len && text[endIdx] == ';') endIdx++;
+                        }
+                        while(endIdx < len && (text[endIdx] == '\r' || text[endIdx] == '\n')) endIdx++;
+
+                        ExtractAndAddChunk(&head, &tail, text, blockStart, endIdx);
+                        blockStart = endIdx;
+                        sawParenBeforeBrace = 0;
+                        i = endIdx - 1;
+                    } else if (braceLevel == 0 && baseBraceLevel == 1) {
+                        int endIdx = i + 1;
+                        while(endIdx < len && (text[endIdx] == ' ' || text[endIdx] == '\t' || text[endIdx] == ')' || text[endIdx] == '(' || text[endIdx] == ';')) endIdx++;
+                        while(endIdx < len && (text[endIdx] == '\r' || text[endIdx] == '\n')) endIdx++;
+                        ExtractAndAddChunk(&head, &tail, text, blockStart, endIdx);
+                        blockStart = endIdx;
+                        baseBraceLevel = 0;
+                        sawParenBeforeBrace = 0;
+                        i = endIdx - 1;
+                    }
+                } else if(text[i] == ';' && braceLevel == baseBraceLevel) {
+                    int endIdx = i + 1;
+                    while(endIdx < len && (text[endIdx] == '\r' || text[endIdx] == '\n' || text[endIdx] == ' ' || text[endIdx] == '\t')) endIdx++;
+                    ExtractAndAddChunk(&head, &tail, text, blockStart, endIdx);
+                    blockStart = endIdx;
+                    sawParenBeforeBrace = 0;
+                    i = endIdx - 1;
+                }
+            }
+        } else if(inSingle) {
+            if(text[i] == '\n') inSingle = 0;
+        } else if(inMulti) {
+            if(text[i] == '*' && text[i+1] == '/') { inMulti = 0; i++; }
+        } else if(inStr) {
+            if(text[i] == '\\' && text[i+1]) i++;
+            else if(text[i] == '"') inStr = 0;
+        } else if(inChar) {
+            if(text[i] == '\\' && text[i+1]) i++;
+            else if(text[i] == '\'') inChar = 0;
+        } else if(inBacktick) {
+            if(text[i] == '\\' && text[i+1]) i++;
+            else if(text[i] == '$' && text[i+1] == '{' && tplDepth < 64) {
+                tplBraceStack[tplDepth++] = braceLevel;
+                braceLevel++;
+                inBacktick = 0;
+                i++;
+            }
+            else if(text[i] == '`') inBacktick = 0;
+        }
+        i++;
+    }
+    if(blockStart < len) ExtractAndAddChunk(&head, &tail, text, blockStart, len);
+    return head;
+}
+
 void PopulateList(HWND hList, Chunk* head) {
     const char* filter = (hList == hListLeft) ? g_FilterLeft : g_FilterRight;
     
@@ -671,105 +800,103 @@ void OnBrowse() {
     }
 }
 
-int UpdateProcInLeft(Chunk* sourceChunk) {
-    Chunk* l = g_LeftChunks;
-    while (l) {
-        if (l->isProc && l->type == sourceChunk->type && strcmp(l->name, sourceChunk->name) == 0) break;
-        l = l->next;
-    }
-
-    if (l) {
-        if (strcmp(l->text, sourceChunk->text) == 0) return 0; 
-        free(l->text);
-        l->text = safe_strdup_newline(sourceChunk->text);
-        return 1;
-    } else {
-        Chunk* nc = (Chunk*)malloc(sizeof(Chunk));
-        nc->isProc = sourceChunk->isProc;
-        nc->type = sourceChunk->type;
-        nc->isAdded = 1; 
-        nc->lineNum = 0;
-        strcpy(nc->name, sourceChunk->name);
-        nc->text = safe_strdup_newline(sourceChunk->text);
-        nc->next = NULL;
-        EnsureCRLF(nc);
-
-        if (nc->type == T_PROC) {
-            char cNew = nc->name[0];
-            if (cNew >= 'A' && cNew <= 'Z') cNew += 32;
-
-            Chunk* curr = g_LeftChunks;
-            Chunk* prev = NULL;
-            int inserted = 0;
-
-            while(curr && curr->type != T_PROC) { prev = curr; curr = curr->next; }
-            Chunk* groupStart = curr;
-            Chunk* groupPrev = prev;
-
-            while (curr) {
-                if (curr->type == T_PROC) {
-                    char cCurr = curr->name[0];
-                    if (cCurr >= 'A' && cCurr <= 'Z') cCurr += 32;
-
-                    if (cCurr >= cNew) {
-                        nc->next = groupStart;
-                        if (groupPrev) groupPrev->next = nc;
-                        else g_LeftChunks = nc; 
-                        inserted = 1; break;
-                    }
-                    groupPrev = curr;
-                    groupStart = curr->next;
-                }
-                prev = curr;
-                curr = curr->next;
-            }
-
-            if (!inserted) {
-                Chunk* tail = g_LeftChunks;
-                Chunk* pPrev = NULL;
-                if (tail) { 
-                    while(tail->next) { pPrev = tail; tail = tail->next; }
-                    
-                    int isJustBrace = 0;
-                    char* t = tail->text;
-                    if (t) {
-                        while (*t && (*t == ' ' || *t == '\t' || *t == '\r' || *t == '\n')) t++;
-                        if (*t == '}' && *(t+1) == '\0') isJustBrace = 1;
-                        else if (*t == '}' && (*(t+1) == '\r' || *(t+1) == '\n')) isJustBrace = 1;
-                    }
-                    
-                    if (isJustBrace && pPrev) {
-                        nc->next = tail;
-                        pPrev->next = nc;
-                    } else {
-                        tail->next = nc; 
-                    }
-                } 
-                else g_LeftChunks = nc;
-            }
-        } else {
-            Chunk* curr = g_LeftChunks;
-            Chunk* lastOfKind = NULL;
-            while (curr) {
-                if (curr->type == nc->type) lastOfKind = curr;
-                curr = curr->next;
-            }
-
-            if (lastOfKind) {
-                nc->next = lastOfKind->next;
-                lastOfKind->next = nc;
-            } else {
-                Chunk* p = g_LeftChunks;
-                Chunk* prev = NULL;
-                while(p && p->type != T_PROC) { prev = p; p = p->next; }
-                if(prev) { nc->next = prev->next; prev->next = nc; }
-                else { nc->next = g_LeftChunks; g_LeftChunks = nc; }
-            }
-        }
-        return 2;
-    }
-}
-
+int UpdateProcInLeft(Chunk* sourceChunk) {
+    Chunk* l = g_LeftChunks;
+    while (l) {
+        if (l->isProc && l->type == sourceChunk->type && strcmp(l->name, sourceChunk->name) == 0) break;
+        l = l->next;
+    }
+
+    if (l) {
+        if (strcmp(l->text, sourceChunk->text) == 0) return 0; 
+        free(l->text);
+        l->text = safe_strdup_newline(sourceChunk->text);
+        return 1;
+    } else {
+        Chunk* nc = (Chunk*)malloc(sizeof(Chunk));
+        nc->isProc = sourceChunk->isProc;
+        nc->type = sourceChunk->type;
+        nc->isAdded = 1; 
+        nc->lineNum = 0;
+        strcpy(nc->name, sourceChunk->name);
+        nc->text = safe_strdup_newline(sourceChunk->text);
+        nc->next = NULL;
+        EnsureCRLF(nc);
+
+        if (nc->type == T_PROC) {
+            char cNew = nc->name[0];
+            if (cNew >= 'A' && cNew <= 'Z') cNew += 32;
+
+            Chunk* curr = g_LeftChunks;
+            Chunk* prev = NULL;
+            int inserted = 0;
+
+            while(curr && curr->type != T_PROC) { prev = curr; curr = curr->next; }
+            Chunk* groupStart = curr;
+            Chunk* groupPrev = prev;
+
+            while (curr) {
+                if (curr->type == T_PROC) {
+                    char cCurr = curr->name[0];
+                    if (cCurr >= 'A' && cCurr <= 'Z') cCurr += 32;
+
+                    if (cCurr >= cNew) {
+                        nc->next = groupStart;
+                        if (groupPrev) groupPrev->next = nc;
+                        else g_LeftChunks = nc; 
+                        inserted = 1; break;
+                    }
+                    groupPrev = curr;
+                    groupStart = curr->next;
+                }
+                prev = curr;
+                curr = curr->next;
+            }
+
+            if (!inserted) {
+                Chunk* tail = g_LeftChunks;
+                Chunk* pPrev = NULL;
+                if (tail) { 
+                    while(tail->next) { pPrev = tail; tail = tail->next; }
+                    
+                    int isJustBrace = 0;
+                    char* t = tail->text;
+                    if (t) {
+                        while (*t && (*t == ' ' || *t == '\t' || *t == '\r' || *t == '\n')) t++;
+                        if (*t == '}' && (*(t+1) == '\0' || *(t+1) == '\r' || *(t+1) == '\n' || *(t+1) == ')' || *(t+1) == ';')) isJustBrace = 1;
+                    }
+                    
+                    if (isJustBrace && pPrev) {
+                        nc->next = tail;
+                        pPrev->next = nc;
+                    } else {
+                        tail->next = nc; 
+                    }
+                } 
+                else g_LeftChunks = nc;
+            }
+        } else {
+            Chunk* curr = g_LeftChunks;
+            Chunk* lastOfKind = NULL;
+            while (curr) {
+                if (curr->type == nc->type) lastOfKind = curr;
+                curr = curr->next;
+            }
+
+            if (lastOfKind) {
+                nc->next = lastOfKind->next;
+                lastOfKind->next = nc;
+            } else {
+                Chunk* p = g_LeftChunks;
+                Chunk* prev = NULL;
+                while(p && p->type != T_PROC) { prev = p; p = p->next; }
+                if(prev) { nc->next = prev->next; prev->next = nc; }
+                else { nc->next = g_LeftChunks; g_LeftChunks = nc; }
+            }
+        }
+        return 2;
+    }
+}
 void OnPasteAndReplace() {
     ReloadLeftList();
     ReloadRightList();
