@@ -19,23 +19,18 @@
 #ifndef UNICODE
 #define UNICODE
 #endif
-
 #include <windows.h>
 #include <shellapi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
-
 #define WM_USER_TRAY         (WM_USER + 1)
 #define WM_USER_SHOW_MANAGER (WM_USER + 2)
 #define ID_TRAY_EXIT         9999
 #define ID_TRAY_WINDOW_MODE  9998
-
 #define ID_TIMER_FOCUS       1
-
 #define GRAB_BAR_HEIGHT      28
-
 // --- Globals ---
 HWND hMainWnd = NULL;
 NOTIFYICONDATA nid;
@@ -78,7 +73,6 @@ RECT g_rcWindowStart;
 #define CLR_TEXT      RGB(20, 20, 20)
 #define CLR_TEXT_MUT  RGB(100, 100, 100)
 #define CLR_ACCENT    RGB(0, 120, 212)
-
 // --- Keyboard Layout ---
 typedef struct {
     const char* norm;
@@ -89,38 +83,58 @@ typedef struct {
     RECT rect; 
 } KeyDef;
 
-#define TOTAL_UNITS 150
-
+// --- Updated Keyboard Layout ---
+#define TOTAL_UNITS 160
+// --- Additional Defines & Globals ---
+#define ID_TRAY_DOCK_BOTTOM  9997
+#define ID_TRAY_DOCK_TOP     9996
+#define ID_TRAY_H_SMALL      9995
+#define ID_TRAY_H_MED        9994
+#define ID_TRAY_H_LARGE      9993
+#define VK_OSK_FN            0x1001
+#define VK_OSK_SETTINGS      0x1002
 KeyDef layout[] = {
-    {"`", "~", VK_OEM_3, 10, FALSE, {0}}, {"1", "!", '1', 10, FALSE, {0}}, {"2", "@", '2', 10, FALSE, {0}}, 
-    {"3", "#", '3', 10, FALSE, {0}}, {"4", "$", '4', 10, FALSE, {0}}, {"5", "%", '5', 10, FALSE, {0}}, 
-    {"6", "^", '6', 10, FALSE, {0}}, {"7", "&", '7', 10, FALSE, {0}}, {"8", "*", '8', 10, FALSE, {0}}, 
-    {"9", "(", '9', 10, FALSE, {0}}, {"0", ")", '0', 10, FALSE, {0}}, {"-", "_", VK_OEM_MINUS, 10, FALSE, {0}}, 
-    {"=", "+", VK_OEM_PLUS, 10, FALSE, {0}}, {"Backspace", "Backspace", VK_BACK, 20, TRUE, {0}},
+    // Row 0 (15 keys, 160 units)
+    {"Esc", "Esc", VK_ESCAPE, 10, TRUE, {0}}, {"`", "~", VK_OEM_3, 10, FALSE, {0}}, {"1", "!", '1', 10, FALSE, {0}},
+    {"2", "@", '2', 10, FALSE, {0}}, {"3", "#", '3', 10, FALSE, {0}}, {"4", "$", '4', 10, FALSE, {0}},
+    {"5", "%", '5', 10, FALSE, {0}}, {"6", "^", '6', 10, FALSE, {0}}, {"7", "&", '7', 10, FALSE, {0}},
+    {"8", "*", '8', 10, FALSE, {0}}, {"9", "(", '9', 10, FALSE, {0}}, {"0", ")", '0', 10, FALSE, {0}},
+    {"-", "_", VK_OEM_MINUS, 10, FALSE, {0}}, {"=", "+", VK_OEM_PLUS, 10, FALSE, {0}}, {"Backspace", "Backspace", VK_BACK, 20, TRUE, {0}},
 
-    {"Tab", "Tab", VK_TAB, 15, TRUE, {0}}, {"q", "Q", 'Q', 10, FALSE, {0}}, {"w", "W", 'W', 10, FALSE, {0}}, 
-    {"e", "E", 'E', 10, FALSE, {0}}, {"r", "R", 'R', 10, FALSE, {0}}, {"t", "T", 'T', 10, FALSE, {0}}, 
-    {"y", "Y", 'Y', 10, FALSE, {0}}, {"u", "U", 'U', 10, FALSE, {0}}, {"i", "I", 'I', 10, FALSE, {0}}, 
-    {"o", "O", 'O', 10, FALSE, {0}}, {"p", "P", 'P', 10, FALSE, {0}}, {"[", "{", VK_OEM_4, 10, FALSE, {0}}, 
-    {"]", "}", VK_OEM_6, 10, FALSE, {0}}, {"\\", "|", VK_OEM_5, 15, FALSE, {0}},
+    // Row 1 (14 keys, 160 units)
+    {"Tab", "Tab", VK_TAB, 20, TRUE, {0}}, {"q", "Q", 'Q', 10, FALSE, {0}}, {"w", "W", 'W', 10, FALSE, {0}},
+    {"e", "E", 'E', 10, FALSE, {0}}, {"r", "R", 'R', 10, FALSE, {0}}, {"t", "T", 'T', 10, FALSE, {0}},
+    {"y", "Y", 'Y', 10, FALSE, {0}}, {"u", "U", 'U', 10, FALSE, {0}}, {"i", "I", 'I', 10, FALSE, {0}},
+    {"o", "O", 'O', 10, FALSE, {0}}, {"p", "P", 'P', 10, FALSE, {0}}, {"[", "{", VK_OEM_4, 10, FALSE, {0}},
+    {"]", "}", VK_OEM_6, 10, FALSE, {0}}, {"\\", "|", VK_OEM_5, 20, FALSE, {0}},
 
-    {"Caps", "Caps", VK_CAPITAL, 18, TRUE, {0}}, {"a", "A", 'A', 10, FALSE, {0}}, {"s", "S", 'S', 10, FALSE, {0}}, 
-    {"d", "D", 'D', 10, FALSE, {0}}, {"f", "F", 'F', 10, FALSE, {0}}, {"g", "G", 'G', 10, FALSE, {0}}, 
-    {"h", "H", 'H', 10, FALSE, {0}}, {"j", "J", 'J', 10, FALSE, {0}}, {"k", "K", 'K', 10, FALSE, {0}}, 
-    {"l", "L", 'L', 10, FALSE, {0}}, {";", ":", VK_OEM_1, 10, FALSE, {0}}, {"'", "\"", VK_OEM_7, 10, FALSE, {0}}, 
-    {"Enter", "Enter", VK_RETURN, 22, TRUE, {0}},
+    // Row 2 (13 keys, 160 units)
+    {"Caps", "Caps", VK_CAPITAL, 22, TRUE, {0}}, {"a", "A", 'A', 10, FALSE, {0}}, {"s", "S", 'S', 10, FALSE, {0}},
+    {"d", "D", 'D', 10, FALSE, {0}}, {"f", "F", 'F', 10, FALSE, {0}}, {"g", "G", 'G', 10, FALSE, {0}},
+    {"h", "H", 'H', 10, FALSE, {0}}, {"j", "J", 'J', 10, FALSE, {0}}, {"k", "K", 'K', 10, FALSE, {0}},
+    {"l", "L", 'L', 10, FALSE, {0}}, {";", ":", VK_OEM_1, 10, FALSE, {0}}, {"'", "\"", VK_OEM_7, 10, FALSE, {0}},
+    {"Enter", "Enter", VK_RETURN, 28, TRUE, {0}},
 
-    {"Shift", "Shift", VK_SHIFT, 23, TRUE, {0}}, {"z", "Z", 'Z', 10, FALSE, {0}}, {"x", "X", 'X', 10, FALSE, {0}}, 
-    {"c", "C", 'C', 10, FALSE, {0}}, {"v", "V", 'V', 10, FALSE, {0}}, {"b", "B", 'B', 10, FALSE, {0}}, 
-    {"n", "N", 'N', 10, FALSE, {0}}, {"m", "M", 'M', 10, FALSE, {0}}, {",", "<", VK_OEM_COMMA, 10, FALSE, {0}}, 
-    {".", ">", VK_OEM_PERIOD, 10, FALSE, {0}}, {"/", "?", VK_OEM_2, 10, FALSE, {0}}, {"Shift", "Shift", VK_RSHIFT, 27, TRUE, {0}},
+    // Row 3 (13 keys, 160 units)
+    {"Shift", "Shift", VK_SHIFT, 24, TRUE, {0}}, {"z", "Z", 'Z', 10, FALSE, {0}}, {"x", "X", 'X', 10, FALSE, {0}},
+    {"c", "C", 'C', 10, FALSE, {0}}, {"v", "V", 'V', 10, FALSE, {0}}, {"b", "B", 'B', 10, FALSE, {0}},
+    {"n", "N", 'N', 10, FALSE, {0}}, {"m", "M", 'M', 10, FALSE, {0}}, {",", "<", VK_OEM_COMMA, 10, FALSE, {0}},
+    {".", ">", VK_OEM_PERIOD, 10, FALSE, {0}}, {"/", "?", VK_OEM_2, 10, FALSE, {0}}, {"^", "^", VK_UP, 12, TRUE, {0}},
+    {"Shift", "Shift", VK_RSHIFT, 24, TRUE, {0}},
 
-    {"Ctrl", "Ctrl", VK_CONTROL, 15, TRUE, {0}}, {"Win", "Win", VK_LWIN, 15, TRUE, {0}}, {"Alt", "Alt", VK_MENU, 15, TRUE, {0}}, 
-    {"Space", "Space", VK_SPACE, 60, FALSE, {0}}, 
-    {"Alt", "Alt", VK_RMENU, 15, TRUE, {0}}, {"Menu", "Menu", VK_APPS, 15, TRUE, {0}}, {"Ctrl", "Ctrl", VK_RCONTROL, 15, TRUE, {0}}
+    // Row 4 (11 keys, 160 units)
+    {"Ctrl", "Ctrl", VK_CONTROL, 12, TRUE, {0}}, {"Fn", "Fn", VK_OSK_FN, 11, TRUE, {0}}, {"Win", "Win", VK_LWIN, 11, TRUE, {0}},
+    {"Alt", "Alt", VK_MENU, 11, TRUE, {0}}, {"Space", "Space", VK_SPACE, 44, FALSE, {0}},
+    {"Alt", "Alt", VK_RMENU, 11, TRUE, {0}}, {"Ctrl", "Ctrl", VK_RCONTROL, 12, TRUE, {0}},
+    {"<", "<", VK_LEFT, 12, TRUE, {0}}, {"v", "v", VK_DOWN, 12, TRUE, {0}}, {">", ">", VK_RIGHT, 12, TRUE, {0}},
+    {"Set", "Set", VK_OSK_SETTINGS, 12, TRUE, {0}}
 };
 
 int numKeys = sizeof(layout) / sizeof(KeyDef);
+
+BOOL g_bFnLock = FALSE;
+BOOL g_bHoverPaste = FALSE;
+BOOL g_bHasClipboard = FALSE;
 
 // --- Custom Draw Helpers ---
 
@@ -228,6 +242,44 @@ void PositionKeyboard() {
     SetWindowRgn(hMainWnd, hRgn, TRUE);
 }
 
+void ShowSettingsMenu(HWND hwnd, POINT pt) {
+    HMENU hMenu = CreatePopupMenu();
+    AppendMenuA(hMenu, MF_STRING | ((!g_bWindowMode && !g_bDockTop) ? MF_CHECKED : MF_UNCHECKED), ID_TRAY_DOCK_BOTTOM, "Dock Bottom");
+    AppendMenuA(hMenu, MF_STRING | ((!g_bWindowMode && g_bDockTop) ? MF_CHECKED : MF_UNCHECKED), ID_TRAY_DOCK_TOP, "Dock Top");
+    AppendMenuA(hMenu, MF_STRING | (g_bWindowMode ? MF_CHECKED : MF_UNCHECKED), ID_TRAY_WINDOW_MODE, "Floating Mode");
+    AppendMenuA(hMenu, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(hMenu, MF_STRING | (g_oskHeight == 240 ? MF_CHECKED : MF_UNCHECKED), ID_TRAY_H_SMALL, "Height: Compact (240px)");
+    AppendMenuA(hMenu, MF_STRING | (g_oskHeight == 320 ? MF_CHECKED : MF_UNCHECKED), ID_TRAY_H_MED, "Height: Normal (320px)");
+    AppendMenuA(hMenu, MF_STRING | (g_oskHeight == 400 ? MF_CHECKED : MF_UNCHECKED), ID_TRAY_H_LARGE, "Height: Tall (400px)");
+    AppendMenuA(hMenu, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(hMenu, MF_STRING, ID_TRAY_EXIT, "Exit Keyboard");
+
+    SetForegroundWindow(hwnd);
+    TrackPopupMenu(hMenu, TPM_BOTTOMALIGN | TPM_RIGHTALIGN, pt.x, pt.y, 0, hwnd, NULL);
+    DestroyMenu(hMenu);
+}
+
+// --- Updated & New Helpers ---
+
+void SendPasteClipboard() {
+    INPUT inputs[4] = {0};
+    inputs[0].type = INPUT_KEYBOARD;
+    inputs[0].ki.wVk = VK_CONTROL;
+
+    inputs[1].type = INPUT_KEYBOARD;
+    inputs[1].ki.wVk = 'V';
+
+    inputs[2].type = INPUT_KEYBOARD;
+    inputs[2].ki.wVk = 'V';
+    inputs[2].ki.dwFlags = KEYEVENTF_KEYUP;
+
+    inputs[3].type = INPUT_KEYBOARD;
+    inputs[3].ki.wVk = VK_CONTROL;
+    inputs[3].ki.dwFlags = KEYEVENTF_KEYUP;
+
+    SendInput(4, inputs, sizeof(INPUT));
+}
+
 void ShowOsk() {
     if (g_bIsVisible) return;
     g_bIsVisible = TRUE;
@@ -299,8 +351,6 @@ void CheckFocus() {
     else HideOsk();
 }
 
-// --- Input Injection ---
-
 void SendKeystroke(int vkCode) {
     BOOL bNeedShift = g_bShiftLock;
     BOOL bNeedRCtrl = g_bRightCtrlLock;
@@ -310,8 +360,13 @@ void SendKeystroke(int vkCode) {
         bNeedShift = !bNeedShift;
     }
 
+    DWORD extFlag = 0;
+    if (vkCode == VK_UP || vkCode == VK_DOWN || vkCode == VK_LEFT || vkCode == VK_RIGHT) {
+        extFlag = KEYEVENTF_EXTENDEDKEY;
+    }
+
     int inputsCount = 0;
-    INPUT inputs[8] = {0}; // Increased to 8 to prevent buffer overflow with multiple modifiers
+    INPUT inputs[8] = {0};
 
     // 1. Press Modifiers Down
     if (bNeedRCtrl && vkCode != VK_RCONTROL) {
@@ -333,11 +388,12 @@ void SendKeystroke(int vkCode) {
     // 2. Press and Release Target Key
     inputs[inputsCount].type = INPUT_KEYBOARD;
     inputs[inputsCount].ki.wVk = vkCode;
+    inputs[inputsCount].ki.dwFlags = extFlag;
     inputsCount++;
 
     inputs[inputsCount].type = INPUT_KEYBOARD;
     inputs[inputsCount].ki.wVk = vkCode;
-    inputs[inputsCount].ki.dwFlags = KEYEVENTF_KEYUP;
+    inputs[inputsCount].ki.dwFlags = extFlag | KEYEVENTF_KEYUP;
     inputsCount++;
 
     // 3. Release Modifiers Up
@@ -390,12 +446,10 @@ BOOL IsInGrabBar(int my) {
     else return (my <= GRAB_BAR_HEIGHT);
 }
 
-// --- UI Rendering ---
-
 void PaintUI(HWND hwnd) {
     PAINTSTRUCT ps;
     HDC hdc = BeginPaint(hwnd, &ps);
-    
+
     RECT rc;
     GetClientRect(hwnd, &rc);
     int w = rc.right;
@@ -404,7 +458,7 @@ void PaintUI(HWND hwnd) {
     HDC memDC = CreateCompatibleDC(hdc);
     HBITMAP memBitmap = CreateCompatibleBitmap(hdc, w, h);
     SelectObject(memDC, memBitmap);
-    
+
     DrawSolidRect(memDC, 0, 0, w, h, CLR_BG);
     SetBkMode(memDC, TRANSPARENT);
 
@@ -414,11 +468,11 @@ void PaintUI(HWND hwnd) {
         grabRc.top = h - GRAB_BAR_HEIGHT;
         grabRc.bottom = h;
     }
-    
+
     DrawSolidRect(memDC, grabRc.left, grabRc.top, w, GRAB_BAR_HEIGHT, CLR_BAR);
     SetTextColor(memDC, CLR_TEXT_MUT);
     SelectObject(memDC, hFontSmall);
-    
+
     const char* barText = "";
     if (!g_bWindowMode) {
         barText = g_bDockTop ? "v   Docked Top   v" : "^   Docked Bottom   ^";
@@ -428,12 +482,23 @@ void PaintUI(HWND hwnd) {
     // Render "Hide" Button at 1/4th width
     int hideX = w / 4;
     RECT hideRc = { hideX - 40, grabRc.top, hideX + 40, grabRc.bottom };
-    
+
     if (g_bHoverHide) {
         DrawSolidRect(memDC, hideRc.left, hideRc.top, hideRc.right - hideRc.left, GRAB_BAR_HEIGHT, RGB(180, 185, 195));
     }
-    SetTextColor(memDC, RGB(40, 40, 40)); 
+    SetTextColor(memDC, RGB(40, 40, 40));
     DrawTextA(memDC, "Hide", -1, &hideRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+    // Render "Paste Clipboard" Button at 3/4th width when clipboard has content
+    if (g_bHasClipboard) {
+        int pasteX = (w * 3) / 4;
+        RECT pasteRc = { pasteX - 65, grabRc.top, pasteX + 65, grabRc.bottom };
+        if (g_bHoverPaste) {
+            DrawSolidRect(memDC, pasteRc.left, pasteRc.top, pasteRc.right - pasteRc.left, GRAB_BAR_HEIGHT, RGB(180, 185, 195));
+        }
+        SetTextColor(memDC, CLR_ACCENT);
+        DrawTextA(memDC, "Paste Clipboard", -1, &pasteRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
 
     if (!g_bWindowMode && g_bDockTop) DrawSolidRect(memDC, 0, grabRc.top, w, 1, RGB(180, 185, 190));
     else DrawSolidRect(memDC, 0, GRAB_BAR_HEIGHT - 1, w, 1, RGB(180, 185, 190));
@@ -442,47 +507,47 @@ void PaintUI(HWND hwnd) {
     int padX = 8, padY = 8;
     int keyMargin = 4;
     int rowCount = 5;
-    
+
     int keysAreaHeight = h - GRAB_BAR_HEIGHT - (padY * 2);
     int keyH = (keysAreaHeight - (keyMargin * (rowCount - 1))) / rowCount;
     float unitW = (float)(w - (padX * 2)) / TOTAL_UNITS;
 
     int curY = (!g_bWindowMode && g_bDockTop) ? padY : (GRAB_BAR_HEIGHT + padY);
-    int rowStartKeys[] = {0, 14, 28, 41, 53, numKeys};
-    
+    int rowStartKeys[] = {0, 15, 29, 42, 55, numKeys};
+    static const char* fnLabels[12] = {"F1","F2","F3","F4","F5","F6","F7","F8","F9","F10","F11","F12"};
+
     for (int r = 0; r < rowCount; r++) {
         float curX = padX;
         for (int i = rowStartKeys[r]; i < rowStartKeys[r+1]; i++) {
             float kw = (layout[i].widthUnits * unitW) - keyMargin;
-            
+
             layout[i].rect.left = (int)curX;
             layout[i].rect.top = curY;
             layout[i].rect.right = (int)(curX + kw);
             layout[i].rect.bottom = curY + keyH;
-            
+
             COLORREF kCol = layout[i].isMod ? CLR_KEY_MOD : CLR_KEY_BG;
             if (i == g_downKey) kCol = CLR_KEY_DOWN;
             else if (i == g_hoverKey) kCol = CLR_KEY_HOVER;
-            
-            if ((layout[i].vk == VK_SHIFT || layout[i].vk == VK_RSHIFT) && g_bShiftLock) kCol = CLR_ACCENT;
-            if (layout[i].vk == VK_CAPITAL && g_bCaps) kCol = CLR_ACCENT;
-            if (layout[i].vk == VK_RCONTROL && g_bRightCtrlLock) kCol = CLR_ACCENT;
-            if (layout[i].vk == VK_RMENU && g_bRightAltLock) kCol = CLR_ACCENT;
 
-            // Sharp Square Keys
-            DrawSquareRect(memDC, layout[i].rect.left, layout[i].rect.top, 
-                         layout[i].rect.right - layout[i].rect.left, 
-                         layout[i].rect.bottom - layout[i].rect.top, kCol);
-            
-            BOOL isAccent = ((layout[i].vk == VK_SHIFT || layout[i].vk == VK_RSHIFT) && g_bShiftLock) || 
+            BOOL isAccent = ((layout[i].vk == VK_SHIFT || layout[i].vk == VK_RSHIFT) && g_bShiftLock) ||
                             (layout[i].vk == VK_CAPITAL && g_bCaps) ||
                             (layout[i].vk == VK_RCONTROL && g_bRightCtrlLock) ||
-                            (layout[i].vk == VK_RMENU && g_bRightAltLock);
-            
+                            (layout[i].vk == VK_RMENU && g_bRightAltLock) ||
+                            (layout[i].vk == VK_OSK_FN && g_bFnLock);
+
+            if (isAccent) kCol = CLR_ACCENT;
+
+            DrawSquareRect(memDC, layout[i].rect.left, layout[i].rect.top,
+                         layout[i].rect.right - layout[i].rect.left,
+                         layout[i].rect.bottom - layout[i].rect.top, kCol);
+
             SetTextColor(memDC, isAccent ? RGB(255, 255, 255) : CLR_TEXT);
-            
-            SelectObject(memDC, layout[i].isMod ? hFontSmall : hFontNormal);
-            const char* text = (g_bShiftLock || g_bCaps) ? layout[i].shift : layout[i].norm;
+
+            BOOL isFnKey = (g_bFnLock && i >= 2 && i <= 13);
+            SelectObject(memDC, (layout[i].isMod || isFnKey) ? hFontSmall : hFontNormal);
+            const char* text = isFnKey ? fnLabels[i - 2] : ((g_bShiftLock || g_bCaps) ? layout[i].shift : layout[i].norm);
+
             RECT textRc = layout[i].rect;
             DrawTextA(memDC, text, -1, &textRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
@@ -492,22 +557,19 @@ void PaintUI(HWND hwnd) {
     }
 
     BitBlt(hdc, 0, 0, w, h, memDC, 0, 0, SRCCOPY);
-    
+
     DeleteObject(memBitmap);
     DeleteDC(memDC);
     EndPaint(hwnd, &ps);
 }
-
-// --- Window Procedure ---
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     switch (uMsg) {
         case WM_CREATE: {
             hFontNormal = CreateFontA(24, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI");
             hFontSmall  = CreateFontA(16, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI");
-            
-            // 300ms Timer: Smooth focus tracking 
-            SetTimer(hwnd, ID_TIMER_FOCUS, 300, NULL); 
+            g_bHasClipboard = (IsClipboardFormatAvailable(CF_UNICODETEXT) || IsClipboardFormatAvailable(CF_TEXT));
+            SetTimer(hwnd, ID_TIMER_FOCUS, 300, NULL);
             break;
         }
 
@@ -522,6 +584,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
                 if (!g_bTrayIconAdded) {
                     g_bTrayIconAdded = Shell_NotifyIcon(NIM_ADD, &nid);
                 }
+                BOOL hasClip = (IsClipboardFormatAvailable(CF_UNICODETEXT) || IsClipboardFormatAvailable(CF_TEXT));
+                if (hasClip != g_bHasClipboard) {
+                    g_bHasClipboard = hasClip;
+                    if (!g_bHasClipboard) g_bHoverPaste = FALSE;
+                    InvalidateRect(hwnd, NULL, FALSE);
+                }
                 CheckFocus();
             }
             break;
@@ -531,7 +599,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
             return 0;
 
         case WM_ERASEBKGND:
-            return 1; 
+            return 1;
 
         case WM_MOUSEMOVE: {
             int mx = LOWORD(lParam);
@@ -540,18 +608,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
             if (g_bGrabTracking) {
                 POINT pt; GetCursorPos(&pt);
                 if (!g_bIsDragging) {
-                    // Jitter Deadzone (Touch screen compatibility)
                     if (abs(pt.x - g_ptGrabStart.x) > 4 || abs(pt.y - g_ptGrabStart.y) > 4) {
                         g_bIsDragging = TRUE;
                         if (!g_bWindowMode) {
-                            // Instant snap to Floating Window Mode when dragged
                             g_bWindowMode = TRUE;
                             g_floatingY = g_rcWindowStart.top;
                             PositionKeyboard();
                         }
                     }
                 }
-                
+
                 if (g_bIsDragging && g_bWindowMode) {
                     g_floatingY = g_rcWindowStart.top + (pt.y - g_ptGrabStart.y);
                     PositionKeyboard();
@@ -559,15 +625,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
                 return 0;
             }
 
-            // Hover logic for the Hide button
+            // Hover logic for Grab Bar buttons (Hide & Paste Clipboard)
             BOOL oldHoverHide = g_bHoverHide;
+            BOOL oldHoverPaste = g_bHoverPaste;
             g_bHoverHide = FALSE;
-            
+            g_bHoverPaste = FALSE;
+
             if (IsInGrabBar(my)) {
-                int w = GetSystemMetrics(SM_CXSCREEN);
+                RECT rc; GetClientRect(hwnd, &rc);
+                int w = rc.right;
                 int hideX = w / 4;
+                int pasteX = (w * 3) / 4;
                 if (mx >= hideX - 40 && mx <= hideX + 40) {
                     g_bHoverHide = TRUE;
+                } else if (g_bHasClipboard && mx >= pasteX - 65 && mx <= pasteX + 65) {
+                    g_bHoverPaste = TRUE;
                 }
             }
 
@@ -583,8 +655,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
                     }
                 }
             }
-            
-            if (oldHoverHide != g_bHoverHide || oldHover != g_hoverKey || g_downKey != -1) {
+
+            if (oldHoverHide != g_bHoverHide || oldHoverPaste != g_bHoverPaste || oldHover != g_hoverKey || g_downKey != -1) {
                 InvalidateRect(hwnd, NULL, FALSE);
             }
             break;
@@ -593,16 +665,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
         case WM_LBUTTONDOWN: {
             int mx = LOWORD(lParam);
             int my = HIWORD(lParam);
-            
+
             if (IsInGrabBar(my)) {
-                int w = GetSystemMetrics(SM_CXSCREEN);
+                RECT rc; GetClientRect(hwnd, &rc);
+                int w = rc.right;
                 int hideX = w / 4;
-                
-                // If they explicitly click "Hide", dismiss the keyboard immediately
+                int pasteX = (w * 3) / 4;
+
                 if (mx >= hideX - 40 && mx <= hideX + 40) {
-                    g_bManualOverride = FALSE; // Reset override so it hides naturally
-                    g_hSuppressedWindow = GetForegroundWindow(); // Suppress the current window
+                    g_bManualOverride = FALSE;
+                    g_hSuppressedWindow = GetForegroundWindow();
                     HideOsk();
+                    return 0;
+                }
+
+                if (g_bHasClipboard && mx >= pasteX - 65 && mx <= pasteX + 65) {
+                    SendPasteClipboard();
                     return 0;
                 }
 
@@ -629,18 +707,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
             if (g_bGrabTracking) {
                 g_bGrabTracking = FALSE;
                 ReleaseCapture();
-                
+
                 if (!g_bIsDragging) {
-                    // Click to cycle modes
                     if (!g_bWindowMode && !g_bDockTop) {
-                        g_bDockTop = TRUE; 
+                        g_bDockTop = TRUE;
                     } else if (!g_bWindowMode && g_bDockTop) {
                         g_bWindowMode = TRUE;
                         RECT wa; SystemParametersInfo(SPI_GETWORKAREA, 0, &wa, 0);
-                        g_floatingY = (wa.bottom - wa.top) / 2 - (g_oskHeight / 2); // Center naturally
+                        g_floatingY = (wa.bottom - wa.top) / 2 - (g_oskHeight / 2);
                     } else {
-                        g_bWindowMode = FALSE; 
-                        g_bDockTop = FALSE; 
+                        g_bWindowMode = FALSE;
+                        g_bDockTop = FALSE;
                     }
                     PositionKeyboard();
                     InvalidateRect(hwnd, NULL, FALSE);
@@ -652,12 +729,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
             if (g_downKey != -1) {
                 int mx = LOWORD(lParam);
                 int my = HIWORD(lParam);
-                
+
                 if (mx >= layout[g_downKey].rect.left && mx <= layout[g_downKey].rect.right &&
                     my >= layout[g_downKey].rect.top && my <= layout[g_downKey].rect.bottom) {
-                    
+
                     int vk = layout[g_downKey].vk;
-                    
+
                     if (vk == VK_SHIFT || vk == VK_RSHIFT) {
                         g_bShiftLock = !g_bShiftLock;
                     } else if (vk == VK_CAPITAL) {
@@ -666,6 +743,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
                         g_bRightCtrlLock = !g_bRightCtrlLock;
                     } else if (vk == VK_RMENU) {
                         g_bRightAltLock = !g_bRightAltLock;
+                    } else if (vk == VK_OSK_FN) {
+                        g_bFnLock = !g_bFnLock;
+                    } else if (vk == VK_OSK_SETTINGS) {
+                        POINT pt = { layout[g_downKey].rect.right, layout[g_downKey].rect.top };
+                        ClientToScreen(hwnd, &pt);
+                        g_downKey = -1;
+                        InvalidateRect(hwnd, NULL, FALSE);
+                        ShowSettingsMenu(hwnd, pt);
+                        return 0;
+                    } else if (g_bFnLock && g_downKey >= 2 && g_downKey <= 13) {
+                        SendKeystroke(VK_F1 + (g_downKey - 2));
                     } else {
                         SendKeystroke(vk);
                     }
@@ -677,13 +765,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
         }
 
         case WM_NCHITTEST: {
-            LRESULT hit = DefWindowProc(hwnd, uMsg, wParam, lParam);
-            return (hit == HTCLIENT) ? HTCLIENT : hit; 
+            LRESULT hit = DefWindowProcA(hwnd, uMsg, wParam, lParam);
+            return (hit == HTCLIENT) ? HTCLIENT : hit;
         }
 
         case WM_USER_SHOW_MANAGER: {
-            // IPC WAKEUP
-            g_bManualOverride = TRUE; 
+            g_bManualOverride = TRUE;
             ShowOsk();
             if (!g_bTrayIconAdded) {
                 g_bTrayIconAdded = Shell_NotifyIcon(NIM_ADD, &nid);
@@ -693,22 +780,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
 
         case WM_USER_TRAY: {
             if (lParam == WM_RBUTTONUP) {
-                HMENU hMenu = CreatePopupMenu();
-                AppendMenuA(hMenu, MF_STRING | (g_bWindowMode ? MF_CHECKED : MF_UNCHECKED), ID_TRAY_WINDOW_MODE, "Window Mode");
-                AppendMenuA(hMenu, MF_SEPARATOR, 0, NULL);
-                AppendMenuA(hMenu, MF_STRING, ID_TRAY_EXIT, "Exit Keyboard");
-                
                 POINT pt; GetCursorPos(&pt);
-                SetForegroundWindow(hwnd);
-                TrackPopupMenu(hMenu, TPM_BOTTOMALIGN | TPM_RIGHTALIGN, pt.x, pt.y, 0, hwnd, NULL);
-                DestroyMenu(hMenu);
+                ShowSettingsMenu(hwnd, pt);
             }
             else if (lParam == WM_LBUTTONUP) {
                 if (g_bIsVisible) {
-                    g_bManualOverride = FALSE; 
+                    g_bManualOverride = FALSE;
                     HideOsk();
                 } else {
-                    g_bManualOverride = TRUE; 
+                    g_bManualOverride = TRUE;
                     ShowOsk();
                 }
             }
@@ -716,13 +796,42 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
         }
 
         case WM_COMMAND: {
-            if (LOWORD(wParam) == ID_TRAY_EXIT) {
-                DestroyWindow(hwnd);
-            }
-            else if (LOWORD(wParam) == ID_TRAY_WINDOW_MODE) {
-                g_bWindowMode = !g_bWindowMode;
-                PositionKeyboard();
-                InvalidateRect(hwnd, NULL, FALSE);
+            switch (LOWORD(wParam)) {
+                case ID_TRAY_EXIT:
+                    DestroyWindow(hwnd);
+                    break;
+                case ID_TRAY_WINDOW_MODE:
+                    g_bWindowMode = !g_bWindowMode;
+                    PositionKeyboard();
+                    InvalidateRect(hwnd, NULL, FALSE);
+                    break;
+                case ID_TRAY_DOCK_BOTTOM:
+                    g_bWindowMode = FALSE;
+                    g_bDockTop = FALSE;
+                    PositionKeyboard();
+                    InvalidateRect(hwnd, NULL, FALSE);
+                    break;
+                case ID_TRAY_DOCK_TOP:
+                    g_bWindowMode = FALSE;
+                    g_bDockTop = TRUE;
+                    PositionKeyboard();
+                    InvalidateRect(hwnd, NULL, FALSE);
+                    break;
+                case ID_TRAY_H_SMALL:
+                    g_oskHeight = 240;
+                    PositionKeyboard();
+                    InvalidateRect(hwnd, NULL, FALSE);
+                    break;
+                case ID_TRAY_H_MED:
+                    g_oskHeight = 320;
+                    PositionKeyboard();
+                    InvalidateRect(hwnd, NULL, FALSE);
+                    break;
+                case ID_TRAY_H_LARGE:
+                    g_oskHeight = 400;
+                    PositionKeyboard();
+                    InvalidateRect(hwnd, NULL, FALSE);
+                    break;
             }
             break;
         }
@@ -734,20 +843,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
             break;
 
         default:
-            return DefWindowProc(hwnd, uMsg, wParam, lParam);
-    }
-    return 0;
+            return DefWindowProcA(hwnd, uMsg, wParam, lParam);
 }
-
-// --- Main ---
-
+}
 int main(int argc, char *argv[]) {
     // Single Instance Guard
     HANDLE hMutex = CreateMutexA(NULL, FALSE, "WinPE_OSK_Mutex");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         HWND hExisting = FindWindowA("WinPEOSKWin11", NULL);
         if (hExisting) PostMessageA(hExisting, WM_USER_SHOW_MANAGER, 0, 0);
-        return 0; 
+        return 0;
     }
 
     WNDCLASSA wc = {0};
@@ -759,30 +864,31 @@ int main(int argc, char *argv[]) {
 
     // WS_EX_NOACTIVATE is CRITICAL so the keyboard doesn't steal focus
     hMainWnd = CreateWindowExA(
-        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, 
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
         "WinPEOSKWin11", "",
-        WS_POPUP, 
+        WS_POPUP,
         0, 0, GetSystemMetrics(SM_CXSCREEN), g_oskHeight,
         NULL, NULL, GetModuleHandle(NULL), NULL);
 
+    if (!hMainWnd) return 1;
+
     memset(&nid, 0, sizeof(NOTIFYICONDATA));
-    nid.cbSize = sizeof(NOTIFYICONDATA); 
+    nid.cbSize = sizeof(NOTIFYICONDATA);
     nid.hWnd = hMainWnd;
-    nid.uID = 4; 
+    nid.uID = 4;
     nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = WM_USER_TRAY;
     nid.hIcon = CreateKeyboardTrayIcon();
     wcscpy(nid.szTip, L"On-Screen Keyboard");
-    
+
     g_bTrayIconAdded = Shell_NotifyIcon(NIM_ADD, &nid);
 
-    // Start completely visible so the user knows it launched successfully
     ShowOsk();
 
     MSG msg;
-    while (GetMessage(&msg, NULL, 0, 0)) {
+    while (GetMessageA(&msg, NULL, 0, 0) > 0) {
         TranslateMessage(&msg);
-        DispatchMessage(&msg);
+        DispatchMessageA(&msg);
     }
 
     return 0;
